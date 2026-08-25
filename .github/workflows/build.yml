@@ -7,6 +7,10 @@ on:
         description: "Build and push only the :code image (skip the ~42 GB model layers)"
         type: boolean
         default: false
+      promote_tag:
+        description: "Recovery: promote an existing staging tag straight to :latest (e.g. staging-4). Skips build and append entirely."
+        type: string
+        default: ""
   push:
     branches:
       - main
@@ -14,6 +18,11 @@ on:
 permissions:
   contents: read
   packages: write
+
+# The append chain reuses fixed staging tags, so two runs must never overlap.
+concurrency:
+  group: build-blackwell-serverless
+  cancel-in-progress: false
 
 env:
   REGISTRY: ghcr.io
@@ -27,6 +36,7 @@ jobs:
   # ------------------------------------------------------------------------------------
   build-code:
     runs-on: ubuntu-latest
+    if: ${{ inputs.promote_tag == '' || inputs.promote_tag == null }}
     outputs:
       code_ref: ${{ steps.push.outputs.code_ref }}
     steps:
@@ -73,7 +83,9 @@ jobs:
   # ------------------------------------------------------------------------------------
   append-models:
     needs: build-code
-    if: ${{ inputs.skip_models != true }}
+    # `needs` already skips this when build-code is skipped (promote mode), but state it
+    # outright so the intent does not depend on that implicit behaviour.
+    if: ${{ inputs.skip_models != true && (inputs.promote_tag == '' || inputs.promote_tag == null) }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -140,7 +152,11 @@ jobs:
             case "$name" in ''|\#*) continue ;; esac
             step=$((step + 1))
             layer="${WORK}/${name}.tar"
-            staging="${IMAGE}:staging-${{ github.run_id }}-${step}"
+            # Fixed (not run-scoped) staging tags: GHCR does not support manifest deletion
+            # over the registry API, so run-scoped tags would accumulate forever. Reusing
+            # the same names overwrites them instead. The workflow-level concurrency group
+            # guarantees no two runs race on them.
+            staging="${IMAGE}:staging-${step}"
 
             echo "::group::[${step}/4] ${name} -> /${dest}"
             python3 scripts/build_model_layer.py \
@@ -169,34 +185,16 @@ jobs:
           CODE_REF: ${{ needs.build-code.outputs.code_ref }}
         run: |
           set -euo pipefail
-          # Content is already proven: every layer was checked against the exact byte size
-          # and sha256 before it was appended. What is left to confirm is structural - that
-          # all four layers actually landed on top of the code image. This reads only
-          # manifests, so it costs a few KB instead of re-downloading 47 GB.
-          code_layers=$(crane manifest "${CODE_REF}"   | jq '.layers | length')
-          final_layers=$(crane manifest "${final_ref}" | jq '.layers | length')
-          added=$((final_layers - code_layers))
-          echo "code image layers:  ${code_layers}"
-          echo "final image layers: ${final_layers} (+${added})"
-
-          if [ "$added" -ne 4 ]; then
-            echo "::error::Expected exactly 4 appended model layers, found ${added}."
-            exit 1
-          fi
-
-          echo "Appended layer sizes:"
-          crane manifest "${final_ref}" \
-            | jq -r --argjson skip "$code_layers" \
-                '.layers[$skip:][] | "  \(.size / 1000000000 | .*100 | round / 100) GB  \(.digest)"'
-
-          total=$(crane manifest "${final_ref}" \
-            | jq --argjson skip "$code_layers" '[.layers[$skip:][].size] | add')
-          echo "Total appended: $((total / 1000000000)) GB (expected ~42 GB)"
-          if [ "$total" -lt 40000000000 ]; then
-            echo "::error::Appended layers total only $((total / 1000000000)) GB; models are missing."
-            exit 1
-          fi
-          echo "All four FL2VA model layers are present."
+          # Content is already proven: every layer was checked against its exact byte size
+          # and sha256 before being appended. This confirms the layers actually landed on
+          # the right base, in order. Reads manifests only, so it costs a few KB rather
+          # than re-downloading 43 GB.
+          crane manifest "${CODE_REF}"   > /tmp/code-manifest.json
+          crane manifest "${final_ref}"  > /tmp/final-manifest.json
+          python3 scripts/verify_model_layers.py \
+            --manifest /tmp/final-manifest.json \
+            --code-manifest /tmp/code-manifest.json \
+            --models models.tsv
 
       - name: Publish final image
         run: |
@@ -215,13 +213,79 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Clean up staging tags
+      - name: Report staging tags
         if: always()
         run: |
           set -euo pipefail
-          # Staging tags are only scaffolding for the append chain; the final tags keep the
-          # underlying layers alive, so deleting these does not remove any published data.
+          # GHCR rejects manifest DELETE over the registry API, so `crane delete` cannot
+          # remove these. Rather than pretend to clean up (an earlier version swallowed the
+          # failure and logged a misleading "Skipped"), the tags are simply reused by the
+          # next run. Keeping them is actively useful: if a later step fails, the finished
+          # image survives and can be promoted with the promote_tag input instead of
+          # re-downloading 42 GB.
+          echo "Staging tags retained (reused by the next run):"
           for step in 1 2 3 4; do
-            tag="${IMAGE}:staging-${{ github.run_id }}-${step}"
-            crane delete "$tag" 2>/dev/null && echo "Deleted ${tag}" || echo "Skipped ${tag}"
+            echo "  ${IMAGE}:staging-${step}"
           done
+          echo
+          echo "To promote one manually without rebuilding:"
+          echo "  gh workflow run build.yml -f promote_tag=staging-4"
+          echo "Prune them from the GitHub package UI if they ever need to go."
+
+  # ------------------------------------------------------------------------------------
+  # Recovery path: promote an already-appended staging tag straight to :latest.
+  #
+  # The append chain leaves a complete image behind at staging-4. If a later step fails
+  # (or :latest needs rolling back to a previous append), this re-tags it in seconds
+  # instead of re-downloading and re-compressing 42 GB.
+  # ------------------------------------------------------------------------------------
+  promote:
+    if: ${{ inputs.promote_tag != '' && inputs.promote_tag != null }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install crane
+        uses: imjasonh/setup-crane@v0.4
+
+      - name: Log in to GHCR
+        run: |
+          set -euo pipefail
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+            | crane auth login "${REGISTRY}" -u "${{ github.actor }}" --password-stdin
+
+      - name: Verify the staging image before promoting it
+        env:
+          PROMOTE_TAG: ${{ inputs.promote_tag }}
+        run: |
+          set -euo pipefail
+          source_ref="${IMAGE}:${PROMOTE_TAG}"
+          echo "Promoting ${source_ref} -> ${IMAGE}:${FINAL_TAG}"
+
+          # Never promote blind: run the same structural check the normal path runs.
+          crane manifest "${IMAGE}:${CODE_TAG}" > /tmp/code-manifest.json
+          crane manifest "${source_ref}"        > /tmp/final-manifest.json
+          python3 scripts/verify_model_layers.py \
+            --manifest /tmp/final-manifest.json \
+            --code-manifest /tmp/code-manifest.json \
+            --models models.tsv
+
+          echo "source_ref=${source_ref}" >> "$GITHUB_ENV"
+
+      - name: Publish as :latest
+        run: |
+          set -euo pipefail
+          crane tag "${source_ref}" "${FINAL_TAG}"
+          crane tag "${source_ref}" "sha-${GITHUB_SHA::12}"
+          digest=$(crane digest "${IMAGE}:${FINAL_TAG}")
+          echo "Published ${IMAGE}:${FINAL_TAG}"
+          echo "Digest    ${digest}"
+          {
+            echo "### Promoted ${{ inputs.promote_tag }} to :latest"
+            echo
+            echo '```'
+            echo "${IMAGE}:${FINAL_TAG}"
+            echo "${IMAGE}@${digest}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
