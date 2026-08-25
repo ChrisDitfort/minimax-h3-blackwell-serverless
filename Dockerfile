@@ -1,14 +1,75 @@
+# MiniMax H3 FL2VA - RunPod Serverless worker for RTX PRO 6000 Blackwell (sm_120).
+#
+# The base image is a *Pod* image: its ENTRYPOINT (/entrypoint.sh) runs a driver
+# preflight, downloads ~60 GB of H3 weights at runtime, bootstraps SageAttention and
+# then execs /start.sh, which brings up SSH, JupyterLab, FileBrowser and a ComfyUI
+# bound to 0.0.0.0. None of that belongs in a Serverless worker, so this image
+# replaces ENTRYPOINT outright (overriding CMD alone is NOT enough - the base sets
+# ENTRYPOINT, so CMD would just become its arguments).
+#
+# Everything that makes the base Blackwell-ready is inherited untouched:
+#   * PyTorch 2.10.0+cu130 / CUDA 13 in system python3.12 dist-packages
+#   * sageattn3 1.0.0, enabled by the COMFY_SAGE_ATTENTION3=1 env var
+#   * ComfyUI pinned at dec5d945 with native MiniMax H3 support, at /opt/comfyui-baked
+#   * ComfyUI-Pixaroma H3 nodes, already baked into custom_nodes
 FROM ghcr.io/nightfall93/runpod-comfyui-minimax-h3:cuda13-blackwell
 
 USER root
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-WORKDIR /workspace
+# ComfyUI lives at /opt/comfyui-baked in the image; the base only copies it into
+# /workspace/runpod-slim at Pod runtime. We run it in place, which avoids duplicating a
+# ~550 MB tree and keeps the models safe from anything RunPod might mount over /workspace.
+# The ephemeral input/output working directories do use the conventional
+# /workspace/runpod-slim/ComfyUI paths: ComfyUI is pointed at them explicitly via
+# --input-directory/--output-directory and the handler re-creates them at boot, so they
+# still work if a volume is mounted there.
+ENV COMFY_DIR=/opt/comfyui-baked \
+    COMFY_PORT=8188 \
+    COMFY_INPUT_DIR=/workspace/runpod-slim/ComfyUI/input \
+    COMFY_OUTPUT_DIR=/workspace/runpod-slim/ComfyUI/output \
+    COMFY_TEMP_DIR=/tmp/comfy-temp \
+    H3_OUTPUT_MODE=base64 \
+    PYTHONUNBUFFERED=1
 
-RUN python3 -m pip install --no-cache-dir \
-    runpod \
-    requests \
-    websocket-client
+# The Serverless handler and the model layers appended after this build both use system
+# python3.12, which is where the base image installed torch/cu130 and sageattn3. The
+# runtime venv the Pod entrypoint creates is only `--system-site-packages` over this same
+# interpreter, so it would add nothing here.
+#   boto3 + cryptography are needed only by H3_OUTPUT_MODE=r2 (encrypted R2 upload);
+#   they are cheap and baking them keeps that path a pure config switch.
+RUN python3 -m pip install --no-cache-dir --break-system-packages \
+        runpod \
+        requests \
+        websocket-client \
+        boto3 \
+        cryptography \
+ && python3 -c "import runpod, requests, websocket, boto3, cryptography; print('serverless deps OK')"
 
-COPY handler.py /workspace/handler.py
+# Model directories, plus the compatibility symlink for the FL2VA diffusion model.
+#
+# The weights are appended as separate layers after this image is built (see
+# .github/workflows/build.yml), because 42 GB will not fit through a BuildKit build.
+# The real file lands at models/diffusion_models/<name>.safetensors so the existing
+# Cloudflare workflow's bare filename resolves; the bundled Pixaroma workflows instead
+# reference "h3/<name>.safetensors", so we point that at the same bytes. ComfyUI walks
+# model dirs with os.walk(followlinks=True) and get_full_path() accepts symlinks, so both
+# spellings work and nothing is stored twice.
+RUN mkdir -p "$COMFY_DIR/models/diffusion_models/h3" \
+             "$COMFY_DIR/models/text_encoders" \
+             "$COMFY_DIR/models/vae" \
+             /workspace/runpod-slim/ComfyUI/input \
+             /workspace/runpod-slim/ComfyUI/output \
+             /tmp/comfy-temp \
+ && ln -sfn ../minimax_h3_fl2va_pruned_int8_convrot.safetensors \
+      "$COMFY_DIR/models/diffusion_models/h3/minimax_h3_fl2va_pruned_int8_convrot.safetensors"
 
-CMD ["python3", "/workspace/handler.py"]
+COPY handler.py /opt/serverless/handler.py
+
+WORKDIR /opt/serverless
+
+# Override the base image's Pod ENTRYPOINT. This is the whole point of the image: the
+# handler is PID 1, it starts one private ComfyUI on 127.0.0.1, and no model download,
+# SSH, Jupyter or FileBrowser ever runs.
+ENTRYPOINT ["python3", "/opt/serverless/handler.py"]
+CMD []

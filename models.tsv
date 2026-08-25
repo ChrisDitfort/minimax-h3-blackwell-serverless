@@ -1,0 +1,15 @@
+# MiniMax H3 FL2VA model manifest.
+#
+# Source of truth: the Comfy-Org/MiniMax-H3 repo pinned at the same revision the
+# Nightfall Blackwell base image uses in /opt/minimax-h3/minimax_h3_download_setup.sh
+# (MODEL_REVISION=eb8a16107c595128b3a578f82d2ce2f75920c355). Sizes and checksums are
+# copied verbatim from that script's DOWNLOAD_SIZES / DOWNLOAD_SHA256 tables.
+#
+# REF2VA is deliberately excluded: the Cloudflare workflow is FL2VA text-to-video only,
+# and skipping it saves ~21 GB of image size.
+#
+# name<TAB>url<TAB>dest(path inside image)<TAB>size_bytes<TAB>sha256
+fl2va	https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/eb8a16107c595128b3a578f82d2ce2f75920c355/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors	opt/comfyui-baked/models/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors	20970379616	e889202c41dafb67b10d67b97f0d8541508036a6090af23425a5c2615d03c47a
+qwen3vl	https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/eb8a16107c595128b3a578f82d2ce2f75920c355/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors	opt/comfyui-baked/models/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors	15687142551	35a88d51044231fe332301d7a62aa81e3f2cba62febeb446e2c1e3e0ef76f2c6
+video_vae	https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/eb8a16107c595128b3a578f82d2ce2f75920c355/vae/minimax_h3_video_vae_fp16.safetensors	opt/comfyui-baked/models/vae/minimax_h3_video_vae_fp16.safetensors	5207808496	7c1f131492e7eddacaac9069a61b81bdd39de5cc96561e677c5eab1cdce5e522
+audio_vae	https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/eb8a16107c595128b3a578f82d2ce2f75920c355/vae/minimax_h3_audio_vae_fp32.safetensors	opt/comfyui-baked/models/vae/minimax_h3_audio_vae_fp32.safetensors	605254808	8e505d95dd1561d47abd43d4238fd40d9bb1ae9e147ed0a4cba778d76ae4db48

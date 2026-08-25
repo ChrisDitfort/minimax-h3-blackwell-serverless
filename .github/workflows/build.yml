@@ -2,6 +2,11 @@ name: Build Blackwell Serverless Image
 
 on:
   workflow_dispatch:
+    inputs:
+      skip_models:
+        description: "Build and push only the :code image (skip the ~42 GB model layers)"
+        type: boolean
+        default: false
   push:
     branches:
       - main
@@ -10,10 +15,20 @@ permissions:
   contents: read
   packages: write
 
-jobs:
-  build:
-    runs-on: ubuntu-latest
+env:
+  REGISTRY: ghcr.io
+  IMAGE: ghcr.io/chrisditfort/minimax-h3-blackwell-serverless
+  CODE_TAG: code
+  FINAL_TAG: latest
 
+jobs:
+  # ------------------------------------------------------------------------------------
+  # Stage 1: the slim code/runtime image. Fast, cacheable, no model weights.
+  # ------------------------------------------------------------------------------------
+  build-code:
+    runs-on: ubuntu-latest
+    outputs:
+      code_ref: ${{ steps.push.outputs.code_ref }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -21,16 +36,192 @@ jobs:
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
-          registry: ghcr.io
+          registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build and push
+      - name: Build and push code image
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
-          tags: ghcr.io/chrisditfort/minimax-h3-blackwell-serverless:latest
+          tags: ${{ env.IMAGE }}:${{ env.CODE_TAG }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+
+      - name: Record immutable code digest
+        id: push
+        run: |
+          set -euo pipefail
+          # Pin the exact digest so the append stage cannot race a newer :code push.
+          ref="${IMAGE}@${{ steps.build.outputs.digest }}"
+          echo "code_ref=${ref}" >> "$GITHUB_OUTPUT"
+          echo "Code image: ${ref}"
+
+  # ------------------------------------------------------------------------------------
+  # Stage 2: append the four FL2VA model weights, one layer at a time.
+  #
+  # Each model is streamed straight from Hugging Face into a tar layer (never stored twice)
+  # verified against the exact size + sha256 the base image's own downloader uses, appended
+  # to the remote image with crane, and then deleted before the next model starts. Peak
+  # runner disk is therefore ~1x the largest model (21 GB) rather than 42 GB.
+  # ------------------------------------------------------------------------------------
+  append-models:
+    needs: build-code
+    if: ${{ inputs.skip_models != true }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free up runner disk
+        run: |
+          set -euo pipefail
+          echo "Before cleanup:"; df -h / /mnt || true
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost /usr/local/share/powershell \
+                      /usr/local/lib/node_modules /opt/hostedtoolcache || true
+          sudo docker image prune -af || true
+          echo "After cleanup:"; df -h / /mnt || true
+
+      - name: Select work directory on the largest filesystem
+        id: work
+        run: |
+          set -euo pipefail
+          best_dir=""; best_free=0
+          for candidate in /mnt /home/runner /tmp; do
+            [ -d "$candidate" ] || continue
+            free=$(df -B1 --output=avail "$candidate" | tail -1 | tr -d ' ')
+            echo "  $candidate has $((free/1000000000)) GB free"
+            if [ "$free" -gt "$best_free" ]; then best_free=$free; best_dir=$candidate; fi
+          done
+          # Largest model is ~21 GB; crane may buffer a compressed copy while pushing.
+          if [ "$best_free" -lt 50000000000 ]; then
+            echo "::error::Only $((best_free/1000000000)) GB free on $best_dir; need at least 50 GB."
+            exit 1
+          fi
+          work="${best_dir}/h3-build"
+          sudo mkdir -p "$work" && sudo chown "$(id -u):$(id -g)" "$work"
+          echo "dir=${work}" >> "$GITHUB_OUTPUT"
+          echo "Using work directory ${work} ($((best_free/1000000000)) GB free)"
+
+      - name: Install crane
+        uses: imjasonh/setup-crane@v0.4
+
+      - name: Log in to GHCR
+        run: |
+          set -euo pipefail
+          # --password-stdin keeps the token out of the process list and the log.
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+            | crane auth login "${REGISTRY}" -u "${{ github.actor }}" --password-stdin
+          echo "Authenticated to ${REGISTRY}"
+
+      - name: Append model layers
+        env:
+          CODE_REF: ${{ needs.build-code.outputs.code_ref }}
+          WORK: ${{ steps.work.outputs.dir }}
+        run: |
+          set -euo pipefail
+
+          # crane buffers layers under TMPDIR while pushing; keep that off the small root fs.
+          export TMPDIR="${WORK}/tmp"
+          mkdir -p "$TMPDIR"
+
+          current="${CODE_REF}"
+          echo "Starting from ${current}"
+
+          step=0
+          while IFS=$'\t' read -r name url dest size sha; do
+            case "$name" in ''|\#*) continue ;; esac
+            step=$((step + 1))
+            layer="${WORK}/${name}.tar"
+            staging="${IMAGE}:staging-${{ github.run_id }}-${step}"
+
+            echo "::group::[${step}/4] ${name} -> /${dest}"
+            python3 scripts/build_model_layer.py \
+              --url "$url" --dest "$dest" --size "$size" --sha256 "$sha" --out "$layer"
+
+            echo "Appending layer to ${staging} ..."
+            crane append --base "$current" --new_layer "$layer" --new_tag "$staging"
+
+            # Free the layer immediately so the next (possibly 21 GB) model has room.
+            rm -f "$layer"
+            current="$staging"
+            df -h "$WORK" | tail -1
+            echo "::endgroup::"
+          done < models.tsv
+
+          if [ "$step" -ne 4 ]; then
+            echo "::error::Expected 4 model layers, appended ${step}. Check models.tsv."
+            exit 1
+          fi
+
+          echo "final_ref=${current}" >> "$GITHUB_ENV"
+          echo "All model layers appended: ${current}"
+
+      - name: Verify the final image structure
+        env:
+          CODE_REF: ${{ needs.build-code.outputs.code_ref }}
+        run: |
+          set -euo pipefail
+          # Content is already proven: every layer was checked against the exact byte size
+          # and sha256 before it was appended. What is left to confirm is structural - that
+          # all four layers actually landed on top of the code image. This reads only
+          # manifests, so it costs a few KB instead of re-downloading 47 GB.
+          code_layers=$(crane manifest "${CODE_REF}"   | jq '.layers | length')
+          final_layers=$(crane manifest "${final_ref}" | jq '.layers | length')
+          added=$((final_layers - code_layers))
+          echo "code image layers:  ${code_layers}"
+          echo "final image layers: ${final_layers} (+${added})"
+
+          if [ "$added" -ne 4 ]; then
+            echo "::error::Expected exactly 4 appended model layers, found ${added}."
+            exit 1
+          fi
+
+          echo "Appended layer sizes:"
+          crane manifest "${final_ref}" \
+            | jq -r --argjson skip "$code_layers" \
+                '.layers[$skip:][] | "  \(.size / 1000000000 | .*100 | round / 100) GB  \(.digest)"'
+
+          total=$(crane manifest "${final_ref}" \
+            | jq --argjson skip "$code_layers" '[.layers[$skip:][].size] | add')
+          echo "Total appended: $((total / 1000000000)) GB (expected ~42 GB)"
+          if [ "$total" -lt 40000000000 ]; then
+            echo "::error::Appended layers total only $((total / 1000000000)) GB; models are missing."
+            exit 1
+          fi
+          echo "All four FL2VA model layers are present."
+
+      - name: Publish final image
+        run: |
+          set -euo pipefail
+          crane tag "${final_ref}" "${FINAL_TAG}"
+          crane tag "${final_ref}" "sha-${GITHUB_SHA::12}"
+          digest=$(crane digest "${IMAGE}:${FINAL_TAG}")
+          echo "Published ${IMAGE}:${FINAL_TAG}"
+          echo "Digest    ${digest}"
+          {
+            echo "### MiniMax H3 Blackwell serverless image"
+            echo
+            echo '```'
+            echo "${IMAGE}:${FINAL_TAG}"
+            echo "${IMAGE}@${digest}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Clean up staging tags
+        if: always()
+        run: |
+          set -euo pipefail
+          # Staging tags are only scaffolding for the append chain; the final tags keep the
+          # underlying layers alive, so deleting these does not remove any published data.
+          for step in 1 2 3 4; do
+            tag="${IMAGE}:staging-${{ github.run_id }}-${step}"
+            crane delete "$tag" 2>/dev/null && echo "Deleted ${tag}" || echo "Skipped ${tag}"
+          done

@@ -1,0 +1,9 @@
+# The build workflow parses models.tsv with `read` on Linux. A CRLF checkout would leave a
+# trailing \r on the sha256 field and fail every checksum, so pin these to LF explicitly
+# rather than relying on the contributor's core.autocrlf setting.
+* text=auto eol=lf
+models.tsv text eol=lf
+*.sh text eol=lf
+*.py text eol=lf
+*.yml text eol=lf
+*.json text eol=lf
