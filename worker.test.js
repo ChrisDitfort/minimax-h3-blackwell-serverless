@@ -27,10 +27,10 @@ import {
   applySettings,
   buildWorkflowForSettings,
   describeCapabilities,
-  ASPECT_RATIOS,
-  QUALITY_PRESETS,
-  MODES
+  workerConstants
 } from "./worker.js";
+
+const { ASPECT_RATIOS, QUALITY_PRESETS, MODES } = workerConstants();
 
 function expectHttpError(fn, status, messageMatch) {
   try {

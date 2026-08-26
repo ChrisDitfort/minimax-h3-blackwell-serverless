@@ -1578,7 +1578,9 @@ async function streamVideo(request, env, jobId) {
   // Immutable: a job's video never changes once written.
   responseHeaders.set("Cache-Control", "private, max-age=3600, immutable");
 
-  if (object.range && object.size !== undefined) {
+  // Gate on the *request* header, not object.range: R2 populates object.range even for a
+  // full read, and answering an unconditional GET with 206 confuses some players.
+  if (range && object.range && object.size !== undefined) {
     const offset = object.range.offset ?? 0;
     const length = object.range.length ?? object.size - offset;
     const end = offset + length - 1;
@@ -1676,7 +1678,7 @@ async function serveAsset(request, env, jobId, assetId) {
  * lives only in Cloudflare and is never sent anywhere.
  * ---------------------------------------------------------------------------------- */
 
-export const TOKEN_PURPOSES = Object.freeze({
+const TOKEN_PURPOSES = Object.freeze({
   progress: "progress",
   output: "output-upload",
   asset: "asset-download"
@@ -1818,13 +1820,13 @@ function safeAssetId(assetId) {
   return value;
 }
 
-export const ASSET_CONTENT_TYPES = Object.freeze({
+const ASSET_CONTENT_TYPES = Object.freeze({
   "image/png": ".png",
   "image/jpeg": ".jpg",
   "image/webp": ".webp"
 });
 
-export const MAX_ASSET_BYTES = 32 * 1024 * 1024;
+const MAX_ASSET_BYTES = 32 * 1024 * 1024;
 
 /* ------------------------------------------------------------------------------------
  * Durable Object: one per job, the realtime source of truth
@@ -1941,8 +1943,12 @@ export function publicEvent(state) {
   }
 
   const event = { type: "progress", jobId: state.jobId, phase };
-  if (state.step !== undefined) event.step = state.step;
-  if (state.steps !== undefined) event.steps = state.steps;
+  // Step counters belong to sampling only. State is merged, so without this the decoding
+  // event would inherit the last sampler step and render as "decoding, step 12/20".
+  if (phase === "sampling") {
+    if (state.step !== undefined) event.step = state.step;
+    if (state.steps !== undefined) event.steps = state.steps;
+  }
   if (state.percent !== undefined) event.percent = state.percent;
   return event;
 }
@@ -1964,11 +1970,32 @@ async function pushJobState(env, jobId, update) {
 }
 
 function requireBucket(env) {
-  if (!env.MEDIA_BUCKET) {
-    throw new HttpError(500, "Missing R2 binding: MEDIA_BUCKET");
+  // H3_OUTPUTS is the binding name already present on the deployed Worker; it is not a
+  // name chosen here, and wrangler.toml matches it.
+  if (!env.H3_OUTPUTS) {
+    throw new HttpError(500, "Missing R2 binding: H3_OUTPUTS");
   }
-  return env.MEDIA_BUCKET;
+  return env.H3_OUTPUTS;
 }
 
 // Exported for tests. Cloudflare only uses the default export and JobChannel above.
-export { HttpError, MODES, QUALITY_PRESETS, ASPECT_RATIOS, MODEL_FILES, describeCapabilities };
+/*
+ * Only functions and the Durable Object class may be named exports here: the Workers
+ * runtime builds an export map from this module and rejects anything that is not a
+ * function or an ExportedHandler ("Incorrect type for map entry"). Exporting a plain
+ * constant stops the Worker booting at all, so the tables below are handed to tests
+ * through a function instead.
+ */
+export function workerConstants() {
+  return {
+    MODES,
+    QUALITY_PRESETS,
+    ASPECT_RATIOS,
+    MODEL_FILES,
+    TOKEN_PURPOSES,
+    ASSET_CONTENT_TYPES,
+    MAX_ASSET_BYTES
+  };
+}
+
+export { HttpError, describeCapabilities };

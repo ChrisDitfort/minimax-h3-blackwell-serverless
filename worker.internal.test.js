@@ -15,15 +15,16 @@ import assert from "node:assert/strict";
 import {
   signJobToken,
   verifyJobToken,
-  TOKEN_PURPOSES,
   outputKey,
   inputKey,
   normalizeAsset,
   normalizeRequest,
   loadWorkflowTemplate,
   publicEvent,
-  MODES
+  workerConstants
 } from "./worker.js";
+
+const { MODES, TOKEN_PURPOSES } = workerConstants();
 
 const SECRET = "test-secret-value";
 

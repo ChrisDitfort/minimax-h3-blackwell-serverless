@@ -159,6 +159,40 @@ PHASE_COMPLETED = "completed"
 PHASE_FAILED = "failed"
 PHASE_CANCELLED = "cancelled"
 
+# Cloudflare Access sits in front of the Worker, so every call back into it - progress,
+# output upload, asset download - has to present an Access service token as well as the
+# job-scoped bearer token. The two are different things and both are required: Access
+# decides whether the request reaches the Worker at all, and the bearer token decides what
+# it is allowed to do once it gets there.
+#
+# Set CF_ACCESS_CLIENT_ID / CF_ACCESS_CLIENT_SECRET on the RunPod endpoint. Left unset,
+# the headers are simply omitted, which is correct for a Worker not behind Access.
+# CLOUDFLARE_ACCESS_KEY_ID / CLOUDFLARE_SECRET_ACCESS_KEY are accepted as aliases. Note
+# those names conventionally mean R2's *S3-API* credentials, which are a different thing
+# and will not get past Access - what belongs here is an Access **service token** from
+# Zero Trust -> Access -> Service Auth.
+CF_ACCESS_CLIENT_ID = (
+    os.environ.get("CF_ACCESS_CLIENT_ID")
+    or os.environ.get("CLOUDFLARE_ACCESS_KEY_ID")
+    or ""
+).strip()
+CF_ACCESS_CLIENT_SECRET = (
+    os.environ.get("CF_ACCESS_CLIENT_SECRET")
+    or os.environ.get("CLOUDFLARE_SECRET_ACCESS_KEY")
+    or ""
+).strip()
+
+
+def cloudflare_access_headers() -> dict:
+    """Service-token headers for Cloudflare Access, or {} when not configured."""
+    if CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET:
+        return {
+            "CF-Access-Client-Id": CF_ACCESS_CLIENT_ID,
+            "CF-Access-Client-Secret": CF_ACCESS_CLIENT_SECRET,
+        }
+    return {}
+
+
 PROGRESS_TIMEOUT = float(os.environ.get("H3_PROGRESS_TIMEOUT", "3"))
 # Floor between *step* events. Phase changes and the final step ignore it.
 PROGRESS_MIN_INTERVAL = float(os.environ.get("H3_PROGRESS_MIN_INTERVAL", "0.4"))
@@ -216,7 +250,7 @@ class ProgressReporter:
             return
 
         body = {"jobId": self.job_id, **payload}
-        headers = {"Content-Type": "application/json"}
+        headers = {"Content-Type": "application/json", **cloudflare_access_headers()}
         if self.token:
             headers["Authorization"] = f"Bearer {self.token}"
 
@@ -991,7 +1025,10 @@ def _download_image(url: str, bearer_token: str | None = None) -> bytes:
 
         headers = {"Accept": "image/*"}
         if bearer_token and hop == 0:
+            # Both credentials are first-hop only. A redirect can point anywhere, and
+            # forwarding either one across it would hand a credential to that host.
             headers["Authorization"] = f"Bearer {bearer_token}"
+            headers.update(cloudflare_access_headers())
 
         # Redirects are followed manually so each destination is re-validated; letting
         # requests follow them would let a redirect land on an internal address.
@@ -1418,7 +1455,11 @@ class WorkerUploadStore(OutputStore):
 
     def store(self, path: str, entry: dict) -> dict:
         size = os.path.getsize(path)
-        headers = {"Content-Type": "video/mp4", "Content-Length": str(size)}
+        headers = {
+            "Content-Type": "video/mp4",
+            "Content-Length": str(size),
+            **cloudflare_access_headers(),
+        }
         if self.token:
             headers["Authorization"] = f"Bearer {self.token}"
 
