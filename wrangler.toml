@@ -1,34 +1,39 @@
 # Cloudflare Worker configuration for the MiniMax H3 API.
 #
 # ============================================================================
-#  THREE VALUES BELOW ARE PLACEHOLDERS AND MUST BE REPLACED BEFORE DEPLOYING.
-#  They are marked REPLACE-ME. They are deployment facts that cannot be
-#  derived from this repository, so they are left obviously wrong rather than
-#  guessed - a plausible-looking wrong bucket name would deploy and then fail
-#  at runtime, which is worse than refusing to deploy.
+#  TWO VALUES BELOW ARE PLACEHOLDERS AND MUST BE REPLACED BEFORE DEPLOYING:
 #
 #    1. name         - the Worker's name in your account
-#    2. account_id   - `npx wrangler whoami`
-#    3. bucket_name  - `npx wrangler r2 bucket list`
+#    2. bucket_name  - `npx wrangler r2 bucket list`
+#
+#  They are deployment facts that cannot be derived from this repository, so
+#  they are left obviously wrong rather than guessed - a plausible-looking
+#  wrong bucket name would deploy and then fail at runtime, which is worse
+#  than refusing to deploy.
+#
+#  They are deliberately spelled in wrangler's own legal format (lowercase,
+#  hyphens) so they do not break `wrangler login` or `wrangler whoami`, which
+#  parse this file before doing anything else.
+#
+#  account_id is intentionally omitted: wrangler infers it from the logged-in
+#  account, so there is one less thing to fill in.
 #
 #  Everything else here is complete and needs no edits.
 # ============================================================================
 
-name = "REPLACE-ME-worker-name"
+name = "replace-me-worker-name"
 main = "worker.js"
 compatibility_date = "2026-08-01"
 
 # Needed for the Durable Object WebSocket hibernation API used by JobChannel.
 compatibility_flags = ["nodejs_compat"]
 
-account_id = "REPLACE-ME-account-id"
-
 # --- R2 -------------------------------------------------------------------
 # The binding name MEDIA_BUCKET is referenced by worker.js (requireBucket).
 # Keep the binding as-is and set bucket_name to your real bucket.
 [[r2_buckets]]
 binding = "MEDIA_BUCKET"
-bucket_name = "REPLACE-ME-bucket-name"
+bucket_name = "replace-me-bucket-name"
 
 # --- Durable Objects ------------------------------------------------------
 # One JobChannel instance per job id holds realtime state and fans progress
