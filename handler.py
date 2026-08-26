@@ -68,6 +68,10 @@ WS_RECV_TIMEOUT = int(os.environ.get("H3_WS_RECV_TIMEOUT", "30"))
 
 OUTPUT_MODE = os.environ.get("H3_OUTPUT_MODE", "base64").strip().lower()
 
+# Generous: a 5s 1024x576 MP4 is only a few MB, but a long clip on a slow link should not
+# be abandoned after the video has already been paid for in GPU time.
+OUTPUT_UPLOAD_TIMEOUT = float(os.environ.get("H3_OUTPUT_UPLOAD_TIMEOUT", "120"))
+
 # --------------------------------------------------------------------------------------
 # FlashBoot preload (opt-in, default off)
 # --------------------------------------------------------------------------------------
@@ -143,6 +147,97 @@ def _secs(value: float | None) -> str:
     return "n/a" if value is None else f"{value:.1f}s"
 
 
+# Public progress phases. Deliberately a small, stable vocabulary: ComfyUI's own log text
+# is never forwarded, so the browser sees a contract we control rather than internals.
+PHASE_STARTING = "starting_worker"
+PHASE_COMFY_READY = "comfy_ready"
+PHASE_LOADING = "loading_models"
+PHASE_SAMPLING = "sampling"
+PHASE_DECODING = "decoding"
+PHASE_UPLOADING = "uploading"
+PHASE_COMPLETED = "completed"
+PHASE_FAILED = "failed"
+PHASE_CANCELLED = "cancelled"
+
+PROGRESS_TIMEOUT = float(os.environ.get("H3_PROGRESS_TIMEOUT", "3"))
+# Floor between *step* events. Phase changes and the final step ignore it.
+PROGRESS_MIN_INTERVAL = float(os.environ.get("H3_PROGRESS_MIN_INTERVAL", "0.4"))
+
+
+class ProgressReporter:
+    """Best-effort progress delivery to the Cloudflare Worker.
+
+    Three properties matter more than completeness here:
+
+      * It never raises. A generation that has already cost minutes of GPU time must not
+        fail because a callback timed out.
+      * It never blocks for long. The timeout is seconds, not the default connect/read.
+      * Its cost is never charged to sampling. The caller records callback time as its own
+        [perf] field, so a slow Worker cannot inflate the sampling measurement.
+
+    The endpoint and token are job-scoped and arrive in the job payload, so nothing
+    permanent is stored in this image.
+    """
+
+    def __init__(self, job_id: str, url: str | None = None, token: str | None = None) -> None:
+        self.job_id = job_id
+        self.url = url
+        self.token = token
+        self.sent = 0
+        self.failed = 0
+        self.seconds = 0.0
+        self._last_step_at = 0.0
+        self._phase: str | None = None
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.url)
+
+    def phase(self, phase: str, **extra) -> None:
+        """Report a phase change. Always delivered - these are the events clients act on."""
+        self._phase = phase
+        self._emit({"phase": phase, **extra})
+
+    def step(self, step: int, steps: int) -> None:
+        """Report sampler progress, coalesced so a fast sampler cannot flood the Worker."""
+        now = time.monotonic()
+        is_last = bool(steps) and step >= steps
+        if not is_last and (now - self._last_step_at) < PROGRESS_MIN_INTERVAL:
+            return
+        self._last_step_at = now
+
+        payload = {"phase": PHASE_SAMPLING, "step": step, "steps": steps}
+        if steps:
+            payload["percent"] = int(round(step / steps * 100))
+        self._emit(payload)
+
+    def _emit(self, payload: dict) -> None:
+        if not self.enabled:
+            return
+
+        body = {"jobId": self.job_id, **payload}
+        headers = {"Content-Type": "application/json"}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+
+        began = time.monotonic()
+        try:
+            response = requests.post(
+                self.url, json=body, headers=headers, timeout=PROGRESS_TIMEOUT
+            )
+            if response.ok:
+                self.sent += 1
+            else:
+                self.failed += 1
+                log(f"WARNING: progress callback returned HTTP {response.status_code}")
+        except Exception as error:
+            # Swallowed on purpose: Cloudflare being unreachable is not a generation error.
+            self.failed += 1
+            log(f"WARNING: progress callback failed ({type(error).__name__}: {error})")
+        finally:
+            self.seconds += time.monotonic() - began
+
+
 class JobTimer:
     """Wall-clock marks for a single job, emitted as one [perf] line when it finishes.
 
@@ -160,6 +255,8 @@ class JobTimer:
         self._node_totals: dict[str, float] = {}
         self.steps_seen = 0
         self.steps_total: int | None = None
+        self.output_bytes: int | None = None
+        self.progress_callbacks: tuple[int, int] | None = None
 
     # -- marks -------------------------------------------------------------------------
 
@@ -239,6 +336,8 @@ class JobTimer:
         ]
         if "stage_image" in self.spans:
             fields.append(f"stage_image={_secs(self.spans['stage_image'])}")
+        if "input_download" in self.spans:
+            fields.append(f"input_download={_secs(self.spans['input_download'])}")
         fields += [
             f"submit={_secs(self.spans.get('submit'))}",
             # Queued -> first sampler frame: model staging, text encode, graph setup.
@@ -249,6 +348,19 @@ class JobTimer:
             # Last sampler frame -> workflow finished: VAE decode, audio, mux, save.
             f"decode={_secs(self.between('sampling_end', 'execution_end'))}",
             f"output={_secs(self.spans.get('output'))}",
+        ]
+        # Upload is broken out from `output` so a slow R2 write is never mistaken for
+        # slow inference, and callback latency is reported separately from both.
+        if "output_upload" in self.spans:
+            fields.append(f"output_upload={_secs(self.spans['output_upload'])}")
+        if self.output_bytes is not None:
+            fields.append(f"output_bytes={self.output_bytes}")
+        if self.progress_callbacks is not None:
+            sent, failed = self.progress_callbacks
+            fields.append(f"progress_callbacks={sent}/{sent + failed}")
+        if "progress_callback_time" in self.spans:
+            fields.append(f"progress_time={_secs(self.spans['progress_callback_time'])}")
+        fields += [
             f"total={_secs(total)}",
             f"status={status}",
         ]
@@ -577,11 +689,16 @@ def _raise_if_history_failed(history: dict, prompt_id: str) -> None:
     raise WorkflowError(f"ComfyUI reported a failed execution for prompt {prompt_id}: {status}")
 
 
+# Node classes that mean the graph has moved past sampling into decode/encode work.
+DECODE_CLASS_HINTS = ("VAEDecode", "VAEDecodeAudio", "CreateVideo", "SaveVideo")
+
+
 def await_execution(
     prompt_id: str,
     client_id: str,
     deadline: float,
     timer: JobTimer | None = None,
+    reporter: "ProgressReporter | None" = None,
 ) -> dict:
     """Follow a prompt to completion over the websocket, falling back to /history polling.
 
@@ -637,6 +754,8 @@ def await_execution(
                                 timer.on_progress(value, total)
                             if value and total:
                                 log(f"  progress {value}/{total}")
+                                if reporter is not None:
+                                    reporter.step(int(value), int(total))
                         elif event_type == "execution_error" and data.get("prompt_id") == prompt_id:
                             raise WorkflowError(
                                 "ComfyUI execution error in node "
@@ -662,7 +781,16 @@ def await_execution(
                             # A named node started, so the previous one just finished.
                             # This is what attributes time to the text encoder, the
                             # sampler and each VAE decode without touching ComfyUI.
-                            timer.on_node(str(data.get("node")))
+                            node_id = str(data.get("node"))
+                            timer.on_node(node_id)
+
+                            # Translate the node into a public phase. ComfyUI's own log
+                            # text is never forwarded - only this stable vocabulary.
+                            if reporter is not None:
+                                label = timer._label(node_id)
+                                if any(hint in label for hint in DECODE_CLASS_HINTS):
+                                    if reporter._phase != PHASE_DECODING:
+                                        reporter.phase(PHASE_DECODING, percent=90)
 
             # Poll /history regardless: it is the authoritative record and covers the case
             # where the websocket never connected or missed the terminal event.
@@ -850,11 +978,20 @@ def _assert_fetchable_url(url: str) -> None:
             )
 
 
-def _download_image(url: str) -> bytes:
-    """Fetch an image over HTTPS, validating every redirect hop and capping the size."""
+def _download_image(url: str, bearer_token: str | None = None) -> bytes:
+    """Fetch an image over HTTPS, validating every redirect hop and capping the size.
+
+    `bearer_token` is the job-scoped credential for the Worker's internal asset route. It
+    is sent only on the first hop: a redirect can point anywhere, and forwarding the token
+    across it would hand a job credential to whatever host the redirect names.
+    """
     current = url
     for hop in range(MAX_IMAGE_REDIRECTS + 1):
         _assert_fetchable_url(current)
+
+        headers = {"Accept": "image/*"}
+        if bearer_token and hop == 0:
+            headers["Authorization"] = f"Bearer {bearer_token}"
 
         # Redirects are followed manually so each destination is re-validated; letting
         # requests follow them would let a redirect land on an internal address.
@@ -863,7 +1000,7 @@ def _download_image(url: str) -> bytes:
             timeout=IMAGE_DOWNLOAD_TIMEOUT,
             stream=True,
             allow_redirects=False,
-            headers={"Accept": "image/*"},
+            headers=headers,
         )
 
         if response.is_redirect or response.is_permanent_redirect:
@@ -971,8 +1108,14 @@ def _reachable_image_loaders(workflow: dict, start_node: str) -> set[str]:
     return found
 
 
-def find_image_node(workflow: dict, explicit_id: str | None) -> str:
-    """Decide which node receives the staged image, or fail rather than guess."""
+def find_image_node(workflow: dict, explicit_id: str | None, role: str = "first_frame") -> str:
+    """Decide which node receives a staged image, or fail rather than guess.
+
+    `role` is the MiniMaxH3ImageToVideo input the image is destined for - "first_frame" or
+    "last_frame", the two optional Image inputs on that node's schema. With two keyframes
+    in one graph the workflow has two loaders, so "the only image loader" is no longer a
+    usable tiebreak and the role is what disambiguates them.
+    """
     candidates = [
         node_id
         for node_id, node in workflow.items()
@@ -1001,63 +1144,64 @@ def find_image_node(workflow: dict, explicit_id: str | None) -> str:
             "for text-to-video."
         )
 
-    # Prefer a loader that actually feeds MiniMaxH3ImageToVideo.first_frame.
+    # Prefer a loader that actually feeds MiniMaxH3ImageToVideo.<role>.
     preferred: set[str] = set()
     for node_id, node in workflow.items():
         if not isinstance(node, dict) or node.get("class_type") != "MiniMaxH3ImageToVideo":
             continue
-        link = (node.get("inputs") or {}).get("first_frame")
+        link = (node.get("inputs") or {}).get(role)
         if isinstance(link, list) and len(link) == 2:
             preferred |= _reachable_image_loaders(workflow, str(link[0]))
 
     if len(preferred) == 1:
         node_id = next(iter(preferred))
-        log(f"Image node auto-detected via MiniMaxH3ImageToVideo.first_frame: #{node_id}")
+        log(f"Image node auto-detected via MiniMaxH3ImageToVideo.{role}: #{node_id}")
         return node_id
 
-    if len(candidates) == 1:
-        log(f"Image node auto-detected as the workflow's only image loader: #{candidates[0]}")
-        return candidates[0]
+    # Falling back to "the only image loader" is only safe when that loader is not
+    # already committed to a different keyframe. Otherwise a last_frame request on a
+    # first-frame graph would silently attach the image to the wrong end of the clip.
+    claimed_by_other_role: set[str] = set()
+    for other_role in KEYFRAME_ROLES:
+        if other_role == role:
+            continue
+        for node in workflow.values():
+            if not isinstance(node, dict) or node.get("class_type") != "MiniMaxH3ImageToVideo":
+                continue
+            link = (node.get("inputs") or {}).get(other_role)
+            if isinstance(link, list) and len(link) == 2:
+                claimed_by_other_role |= _reachable_image_loaders(workflow, str(link[0]))
+
+    unclaimed = [node_id for node_id in candidates if node_id not in claimed_by_other_role]
+
+    if len(unclaimed) == 1 and not preferred:
+        log(f"Image node auto-detected as the workflow's only image loader: #{unclaimed[0]}")
+        return unclaimed[0]
+
+    if not unclaimed and candidates:
+        raise ImageInputError(
+            f"No image loader is available for {role!r}: the workflow's "
+            f"{len(candidates)} loader(s) already feed another keyframe input. Add a "
+            f"loader wired to MiniMaxH3ImageToVideo.{role}."
+        )
 
     raise ImageInputError(
-        f"Could not unambiguously choose an image node: found {len(candidates)} image "
-        f"loaders ({', '.join(sorted(candidates))})"
-        + (f" and {len(preferred)} feeding first_frame" if preferred else "")
-        + ". Pass image_node_id to say which one should receive the image."
+        f"Could not unambiguously choose an image node for {role!r}: found "
+        f"{len(candidates)} image loaders ({', '.join(sorted(candidates))})"
+        + (f" and {len(preferred)} feeding {role}" if preferred else "")
+        + ". Wire the workflow so exactly one loader feeds "
+        f"MiniMaxH3ImageToVideo.{role}, or pass image_node_id (legacy) / "
+        f"assets.{role}.node_id to say which one should receive the image."
     )
 
 
-def stage_input_image(job_input: dict, workflow: dict) -> str | None:
-    """Validate, store and wire up an optional input image.
+# The keyframe roles the FL2VA node exposes, in the order they are staged. Both are
+# optional Image inputs on MiniMaxH3ImageToVideo's schema.
+KEYFRAME_ROLES = ("first_frame", "last_frame")
 
-    Returns the absolute path of the staged file (for cleanup), or None for the
-    text-to-video path where no image was supplied.
-    """
-    image_url = job_input.get("image_url")
-    image_base64 = job_input.get("image_base64")
 
-    if image_url and image_base64:
-        raise ImageInputError(
-            "Provide either image_url or image_base64, not both."
-        )
-    if not image_url and not image_base64:
-        return None  # text-to-video: unchanged behaviour
-
-    if image_url:
-        if not isinstance(image_url, str):
-            raise ImageInputError("image_url must be a string.")
-        log("Fetching input image from image_url")
-        data = _download_image(image_url)
-    else:
-        log("Decoding input image from image_base64")
-        data = _decode_base64_image(image_base64)
-
-    extension = _validate_image_bytes(data)
-
-    # Resolve the target node before writing anything, so a workflow we cannot wire up
-    # never leaves a file behind.
-    node_id = find_image_node(workflow, job_input.get("image_node_id"))
-
+def _write_staged_image(data: bytes, extension: str) -> str:
+    """Write image bytes into the ComfyUI input directory under a generated name."""
     # Generated filename only: the remote/user-supplied name is never used, which rules
     # out path traversal and collisions between concurrent jobs.
     filename = f"h3-input-{uuid.uuid4().hex}{extension}"
@@ -1072,10 +1216,129 @@ def stage_input_image(job_input: dict, workflow: dict) -> str | None:
     with open(path, "wb") as handle:
         handle.write(data)
     os.chmod(path, 0o644)  # data, never executable
-
-    workflow[node_id]["inputs"][IMAGE_LOADER_FIELD] = filename
-    log(f"Staged input image as {filename} and wired it into node #{node_id}")
     return path
+
+
+def _fetch_asset_bytes(spec: dict, role: str) -> bytes:
+    """Read one asset's bytes from whichever source it declares.
+
+    `url` covers both a plain https image and the Worker's job-scoped asset route - the
+    latter simply carries a bearer token, so no Cloudflare credentials ever live in this
+    image. Exactly one source may be given.
+    """
+    url = spec.get("url")
+    data_b64 = spec.get("base64")
+
+    if url and data_b64:
+        raise ImageInputError(f"{role}: provide either url or base64, not both.")
+
+    if url:
+        if not isinstance(url, str):
+            raise ImageInputError(f"{role}: url must be a string.")
+        token = spec.get("token")
+        if token is not None and not isinstance(token, str):
+            raise ImageInputError(f"{role}: token must be a string.")
+        log(f"Fetching {role} from url")
+        return _download_image(url, bearer_token=token)
+
+    if data_b64:
+        log(f"Decoding {role} from base64")
+        return _decode_base64_image(data_b64)
+
+    raise ImageInputError(f"{role}: no url or base64 supplied.")
+
+
+def _collect_asset_specs(job_input: dict) -> dict:
+    """Normalise the legacy single-image fields and the new `assets` map into one dict.
+
+    Legacy `image_url` / `image_base64` / `image_node_id` keep working untouched and are
+    treated as a first_frame asset, which is what they always effectively were.
+    """
+    specs: dict[str, dict] = {}
+
+    assets = job_input.get("assets")
+    if assets is not None:
+        if not isinstance(assets, dict):
+            raise ImageInputError("assets must be an object keyed by role.")
+        for role, spec in assets.items():
+            if role not in KEYFRAME_ROLES:
+                raise ImageInputError(
+                    f"Unknown asset role {role!r}. Supported: {', '.join(KEYFRAME_ROLES)}."
+                )
+            if not isinstance(spec, dict):
+                raise ImageInputError(f"assets.{role} must be an object.")
+            specs[role] = spec
+
+    legacy_url = job_input.get("image_url")
+    legacy_b64 = job_input.get("image_base64")
+    if legacy_url or legacy_b64:
+        if "first_frame" in specs:
+            raise ImageInputError(
+                "Provide either the legacy image_url/image_base64 fields or "
+                "assets.first_frame, not both."
+            )
+        if legacy_url and legacy_b64:
+            raise ImageInputError("Provide either image_url or image_base64, not both.")
+        specs["first_frame"] = {
+            "url": legacy_url,
+            "base64": legacy_b64,
+            "node_id": job_input.get("image_node_id"),
+        }
+
+    return specs
+
+
+def stage_input_assets(job_input: dict, workflow: dict) -> list[str]:
+    """Validate, store and wire up every supplied keyframe.
+
+    Returns the absolute paths of the staged files, for cleanup. An empty list is the
+    text-to-video path, whose behaviour is unchanged.
+
+    Everything is resolved and validated before anything is written, so a request we
+    cannot wire up leaves no files behind.
+    """
+    specs = _collect_asset_specs(job_input)
+    if not specs:
+        return []  # text-to-video: unchanged behaviour
+
+    # Resolve every target node first - a half-staged graph is worse than a rejected one.
+    resolved: list[tuple[str, dict, str]] = []
+    for role in KEYFRAME_ROLES:
+        spec = specs.get(role)
+        if spec is None:
+            continue
+        node_id = find_image_node(workflow, spec.get("node_id"), role=role)
+        resolved.append((role, spec, node_id))
+
+    if len({node_id for _, _, node_id in resolved}) != len(resolved):
+        raise ImageInputError(
+            "Two keyframes resolved to the same image loader node. Wire the workflow so "
+            "first_frame and last_frame each have their own loader."
+        )
+
+    staged: list[str] = []
+    try:
+        for role, spec, node_id in resolved:
+            data = _fetch_asset_bytes(spec, role)
+            extension = _validate_image_bytes(data)
+            path = _write_staged_image(data, extension)
+            staged.append(path)
+            filename = os.path.basename(path)
+            workflow[node_id]["inputs"][IMAGE_LOADER_FIELD] = filename
+            log(f"Staged {role} as {filename} and wired it into node #{node_id}")
+    except Exception:
+        # Never leak files from a partially staged multi-image request.
+        for path in staged:
+            cleanup_input_image(path)
+        raise
+
+    return staged
+
+
+def stage_input_image(job_input: dict, workflow: dict) -> str | None:
+    """Backwards-compatible single-image wrapper around stage_input_assets()."""
+    staged = stage_input_assets(job_input, workflow)
+    return staged[0] if staged else None
 
 
 def cleanup_input_image(path: str | None) -> None:
@@ -1134,6 +1397,74 @@ class Base64Store(OutputStore):
             "type": entry.get("type", "output"),
             "data": data,
         }
+
+
+class WorkerUploadStore(OutputStore):
+    """PUT the raw MP4 to the Cloudflare Worker, which streams it straight into R2.
+
+    The bytes go up as a normal binary body - never base64 - so nothing inflates the
+    payload by a third just to move it. Authentication is a job-scoped bearer token that
+    arrived with this job, which is why no Cloudflare credential is baked into the image.
+
+    Returns metadata only. The video itself is served later from R2 by the Worker.
+    """
+
+    def __init__(self, url: str, token: str | None, timeout: float) -> None:
+        self.url = url
+        self.token = token
+        self.timeout = timeout
+        self.uploaded_bytes = 0
+        self.upload_seconds = 0.0
+
+    def store(self, path: str, entry: dict) -> dict:
+        size = os.path.getsize(path)
+        headers = {"Content-Type": "video/mp4", "Content-Length": str(size)}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+
+        began = time.monotonic()
+        try:
+            # A file object streams; requests will not read it all into memory first.
+            with open(path, "rb") as handle:
+                response = requests.put(
+                    self.url, data=handle, headers=headers, timeout=self.timeout
+                )
+        except Exception as error:
+            raise WorkflowError(
+                f"Uploading {entry['filename']} to the output endpoint failed: {error}"
+            ) from error
+        finally:
+            self.upload_seconds += time.monotonic() - began
+
+        if not response.ok:
+            # Deliberately fatal. Reporting success here would hand the client a job that
+            # says COMPLETED with no playable video behind it.
+            raise WorkflowError(
+                f"Output upload returned HTTP {response.status_code} for "
+                f"{entry['filename']}: {response.text[:200]}"
+            )
+
+        self.uploaded_bytes += size
+
+        result = {
+            "filename": entry["filename"],
+            "subfolder": entry.get("subfolder", ""),
+            "type": entry.get("type", "output"),
+            "size": size,
+        }
+
+        # The Worker owns key naming; echo back whatever it reports rather than inventing
+        # a key here, so RunPod can never dictate where an object lands.
+        try:
+            body = response.json()
+        except ValueError:
+            body = None
+        if isinstance(body, dict):
+            for field in ("key", "url", "contentType"):
+                if body.get(field):
+                    result[field] = body[field]
+
+        return result
 
 
 class EncryptedR2Store(OutputStore):
@@ -1335,8 +1666,10 @@ def get_output_store() -> OutputStore:
     return _output_store
 
 
-def collect_outputs(history: dict) -> list[dict]:
-    store = get_output_store()
+def collect_outputs(history: dict, store: OutputStore | None = None) -> list[dict]:
+    # `store` is injected per job so an R2-backed request can upload through the Worker
+    # while everything else keeps using the process-wide configured store.
+    store = store if store is not None else get_output_store()
     results: list[dict] = []
     scratch = tempfile.mkdtemp(prefix="h3-out-")
     keep_outputs = os.environ.get("H3_KEEP_OUTPUTS", "0") == "1"
@@ -1377,9 +1710,34 @@ def _discard_output_file(path: str) -> None:
 # --------------------------------------------------------------------------------------
 
 
+def _spec(job_input: dict, key: str) -> dict:
+    """Read a job-scoped {url, token} block out of the job payload."""
+    value = job_input.get(key)
+    return value if isinstance(value, dict) else {}
+
+
+def build_output_store_for_job(job_input: dict) -> tuple[OutputStore, WorkerUploadStore | None]:
+    """Pick where this job's artefacts go.
+
+    A job carrying an `output` block is uploaded straight to the Worker, which streams it
+    into R2. Anything else falls back to the configured store, so existing callers that
+    know nothing about R2 keep getting base64 exactly as before.
+    """
+    output = _spec(job_input, "output")
+    url = output.get("url")
+    if url:
+        store = WorkerUploadStore(
+            url=str(url),
+            token=output.get("token"),
+            timeout=float(output.get("timeout") or OUTPUT_UPLOAD_TIMEOUT),
+        )
+        return store, store
+    return get_output_store(), None
+
+
 def handler(job: dict) -> dict:
     job_id = job.get("id", "<unknown>")
-    staged_image: str | None = None
+    staged_assets: list[str] = []
 
     global _jobs_served
     with _jobs_lock:
@@ -1391,28 +1749,40 @@ def handler(job: dict) -> dict:
     timer = JobTimer(workflow if isinstance(workflow, dict) else None)
     status = "error"
 
+    # Job-scoped progress endpoint. Absent means "no realtime channel", and everything
+    # below then behaves exactly as it did before callbacks existed.
+    progress = _spec(job_input, "progress")
+    reporter = ProgressReporter(
+        job_id=str(progress.get("jobId") or job_id),
+        url=progress.get("url"),
+        token=progress.get("token"),
+    )
+
     try:
         if not isinstance(workflow, dict) or not workflow:
             status = "bad_request"
             return {"error": "input.workflow is required and must be a ComfyUI API-format object."}
 
-        # Optional first-frame image-to-video. With no image supplied this is a no-op and
-        # the text-to-video path runs exactly as before. Done before starting ComfyUI so a
-        # bad image is rejected immediately instead of after a cold-start wait.
+        reporter.phase(PHASE_STARTING)
+
+        # Optional keyframes. With none supplied this is a no-op and the text-to-video
+        # path runs exactly as before. Done before starting ComfyUI so a bad image is
+        # rejected immediately instead of after a cold-start wait.
         began = time.monotonic()
-        staged_image = stage_input_image(job_input, workflow)
-        if staged_image:
-            timer.add_span("stage_image", time.monotonic() - began)
+        staged_assets = stage_input_assets(job_input, workflow)
+        if staged_assets:
+            timer.add_span("input_download", time.monotonic() - began)
 
         # Near-zero on a warm process; on a cold one this is the ComfyUI boot itself.
         began = time.monotonic()
         start_comfyui()
         timer.add_span("comfy_wait", time.monotonic() - began)
+        reporter.phase(PHASE_COMFY_READY)
 
         client_id = str(uuid.uuid4())
         deadline = time.monotonic() + JOB_TIMEOUT
 
-        mode = "image-to-video" if staged_image else "text-to-video"
+        mode = f"{len(staged_assets)}-keyframe" if staged_assets else "text-to-video"
         log(f"Job {job_id}: queueing {mode} workflow with {len(workflow)} nodes")
         began = time.monotonic()
         prompt_id = queue_prompt(workflow, client_id)
@@ -1420,14 +1790,29 @@ def handler(job: dict) -> dict:
         timer.mark("submitted")
         log(f"Job {job_id}: prompt_id={prompt_id}")
 
-        history = await_execution(prompt_id, client_id, deadline, timer)
+        # Everything between here and the first sampler frame is model staging.
+        reporter.phase(PHASE_LOADING)
+
+        history = await_execution(prompt_id, client_id, deadline, timer, reporter)
+
+        store, upload_store = build_output_store_for_job(job_input)
+        if upload_store is not None:
+            reporter.phase(PHASE_UPLOADING, percent=95)
 
         began = time.monotonic()
-        images = collect_outputs(history)
+        images = collect_outputs(history, store=store)
         timer.add_span("output", time.monotonic() - began)
+
+        if upload_store is not None:
+            # Reported separately so a slow R2 write is never read as slow inference.
+            timer.add_span("output_upload", upload_store.upload_seconds)
+            timer.output_bytes = upload_store.uploaded_bytes
 
         if not images:
             status = "no_output"
+            reporter.phase(
+                PHASE_FAILED, error={"code": "no_output", "message": "workflow saved nothing"}
+            )
             return {
                 "error": (
                     "The workflow completed but produced no saved output. Ensure it ends in "
@@ -1438,20 +1823,42 @@ def handler(job: dict) -> dict:
 
         log(f"Job {job_id}: returning {len(images)} artefact(s)")
         status = "ok"
-        return {"images": images, "prompt_id": prompt_id}
+
+        result = {"images": images, "prompt_id": prompt_id}
+
+        # Only now is the job genuinely done: the upload has already succeeded, because
+        # WorkerUploadStore raises rather than returning on a failed PUT.
+        if upload_store is not None:
+            video = dict(images[0])
+            video.pop("data", None)  # metadata only; the bytes are in R2
+            result["video"] = video
+            reporter.phase(PHASE_COMPLETED, percent=100, video=video)
+        else:
+            reporter.phase(PHASE_COMPLETED, percent=100)
+
+        return result
 
     except WorkflowError as error:
         # Covers ImageInputError too: a caller-facing validation failure, not a crash.
         log(f"Job {job_id}: workflow error: {error}")
         status = "workflow_error"
+        reporter.phase(PHASE_FAILED, error={"code": "workflow_error", "message": str(error)})
         return {"error": str(error)}
     except Exception as error:
         log(f"Job {job_id}: unhandled error: {type(error).__name__}: {error}")
         status = "exception"
+        reporter.phase(
+            PHASE_FAILED,
+            error={"code": type(error).__name__, "message": str(error)},
+        )
         return {"error": f"{type(error).__name__}: {error}"}
     finally:
-        # Always runs, so a failed or rejected job cannot orphan an input image.
-        cleanup_input_image(staged_image)
+        # Always runs, so a failed or rejected job cannot orphan staged input images.
+        for path in staged_assets:
+            cleanup_input_image(path)
+        timer.progress_callbacks = (reporter.sent, reporter.failed)
+        if reporter.seconds:
+            timer.add_span("progress_callback_time", reporter.seconds)
         # Emitted for failures too: a slow job that times out is exactly the one whose
         # phase breakdown you want.
         emit_perf(timer, job_index=job_index, status=status)
