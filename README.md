@@ -407,6 +407,134 @@ place; the weights are a deliberate, separately-costed decision.
 Nothing installed and nothing measured. `regenerate_2k` exists only as a reserved mode
 name so the routing layer does not need reshaping later.
 
+## Realtime progress and R2 output
+
+The browser never talks to RunPod. Cloudflare owns the public API, the storage and the
+realtime channel; RunPod owns inference and nothing else.
+
+```
+Browser ──WebSocket──> Worker ──> JobChannel (Durable Object)
+   │                     │                ▲
+   │  POST /generate     │ R2 binding     │ HTTP progress + output
+   ▼                     ▼                │
+Worker ──job payload──> RunPod handler ───┘
+                            │
+                            └──> ComfyUI (internal websocket)
+```
+
+### Why RunPod holds no Cloudflare credentials
+
+Each job is issued three short-lived HMAC tokens binding **job id + purpose + expiry**:
+`progress`, `output-upload` and `asset-download`. A progress token cannot upload a video;
+an output token for one job cannot write to another; all of them expire. The signing key
+(`JOB_TOKEN_SECRET`) never leaves Cloudflare, and R2 is reached only through the Worker's
+`H3_OUTPUTS` binding - there is no R2 API key anywhere in the image.
+
+### Internal routes (RunPod -> Cloudflare)
+
+| Route | Purpose token | Notes |
+|---|---|---|
+| `POST /internal/jobs/:id/progress` | `progress` | Normalised phase events; raw ComfyUI text is never forwarded |
+| `PUT /internal/jobs/:id/output` | `output-upload` | Raw `video/mp4` body streamed straight into R2 |
+| `GET /internal/jobs/:id/assets/:assetId` | `asset-download` | Keyframe fetch |
+
+### Public routes
+
+| Route | Notes |
+|---|---|
+| `POST /jobs/:id/assets` | Upload a keyframe. PNG/JPEG/WebP, 32 MB cap |
+| `GET /jobs/:id/video` | Streams from R2. Range supported, so browsers can seek |
+| `GET /ws/jobs/:id` | WebSocket. Current state on connect, then live events |
+
+### WebSocket protocol
+
+```jsonc
+{"type": "state",    "jobId": "...", "phase": "sampling", "step": 5, "steps": 20}
+{"type": "progress", "jobId": "...", "phase": "sampling", "step": 7, "steps": 20, "percent": 35}
+{"type": "progress", "jobId": "...", "phase": "decoding", "percent": 90}
+{"type": "completed","jobId": "...", "video": {"url": "/jobs/.../video"}}
+{"type": "failed",   "jobId": "...", "error": {"code": "...", "message": "..."}}
+{"type": "cancelled","jobId": "..."}
+```
+
+Phases: `queued`, `starting_worker`, `comfy_ready`, `loading_models`, `sampling`,
+`decoding`, `uploading`, `completed`, `failed`, `cancelled`. Step counters appear only
+during `sampling`.
+
+### R2 object naming
+
+```
+inputs/{jobId}/{assetId}.{png|jpg|webp}
+outputs/{jobId}/video.mp4
+```
+
+Keys are chosen by the Worker, never by RunPod: the handler uploads to a route that
+already knows where the object belongs, so a compromised or buggy worker cannot write
+anywhere else in the bucket. A client-supplied `r2_key` is reduced to its asset id for the
+same reason. There is no user namespace because this system has no user identity;
+`outputKey()` and `inputKey()` are the only two places that would change if one is added.
+
+**Lifecycle:** nothing is deleted automatically. Outputs are small (a 5s clip is ~1.5-3 MB)
+so this is not urgent, but an R2 lifecycle rule expiring `inputs/` after a few days and
+`outputs/` after whatever the product promises is the obvious next step. Do not add
+aggressive cleanup that could race a job still writing.
+
+### Behind Cloudflare Access
+
+If the Worker is behind Access - it is, on `minimax-h3-backend` - RunPod needs an Access
+**service token** as well as its job token. They are different credentials doing different
+jobs: Access decides whether the request reaches the Worker at all, the job token decides
+what it may do once there.
+
+Set on the RunPod endpoint (any of these spellings; the first pair is Cloudflare's own):
+
+```
+CLOUDFLARE_ACCESS_CLIENT_ID / CLOUDFLARE_ACCESS_CLIENT_SECRET
+CF_ACCESS_CLIENT_ID         / CF_ACCESS_CLIENT_SECRET
+CLOUDFLARE_ACCESS_KEY_ID    / CLOUDFLARE_SECRET_ACCESS_KEY
+```
+
+The last pair is accepted because it is easy to reach for, but those names conventionally
+mean R2's *S3-API* credentials, which are a different credential and will not pass Access.
+An Access service token's client id ends in `.access`.
+
+### Troubleshooting the callback path
+
+The worker states its own view at boot, which is the fastest way to rule out the
+environment:
+
+```
+[handler] Cloudflare Access service token: configured (client id 6f1a2b...c.access, ends in '.access')
+[handler] Cloudflare Access service token: NOT configured. ...
+```
+
+Then the `[perf]` line at the end of each job:
+
+| Field | Meaning |
+|---|---|
+| `progress_callbacks=21/21` | All callbacks delivered |
+| `progress_callbacks=0/21` | Every callback rejected - look for the warning naming Access |
+| `output_upload`, `output_bytes` | Present only when the R2 path ran |
+
+Two traps worth knowing, both of which have bitten this code:
+
+* **A 302 is not a failure to `requests`.** `Response.ok` is `status_code < 400`, so
+  Access's login redirect reads as success, and `requests` follows redirects by default -
+  re-issuing the PUT as a GET without the body. Both are now explicitly rejected, and the
+  upload additionally requires the Worker's own JSON acknowledgement, because anything in
+  front of the Worker can answer 200 with HTML while storing nothing.
+* **Env vars are injected at container start.** A worker container created before the
+  variables were saved keeps the old environment no matter what the endpoint config says.
+  The same `workerId` across runs is the tell. Releasing a new endpoint version forces
+  fresh workers.
+
+**R2 is the ground truth.** A status response can only report what the handler believed;
+the object either exists or it does not:
+
+```
+npx wrangler r2 object get minimax-h3-private-output/outputs/{jobId}/video.mp4 --remote --file out.mp4
+```
+
 ## Request schema
 
 ```jsonc
