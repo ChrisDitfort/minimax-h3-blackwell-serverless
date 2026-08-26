@@ -227,6 +227,39 @@ def _is_2xx(response) -> bool:
     return 200 <= response.status_code < 300
 
 
+def log_callback_configuration() -> None:
+    """Say at boot whether an Access service token reached the container.
+
+    Worth its own line because of how this fails otherwise. A missing token and a rejected
+    token both end as the same 302, and the operator's own curl works because they pass the
+    headers by hand - so "it works from my machine" tells you nothing about what the worker
+    is sending. Only the variable names and the client-id shape are logged; the secret is
+    never printed, and neither is the full id.
+    """
+    if CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET:
+        shape = "ends in '.access'" if CF_ACCESS_CLIENT_ID.endswith(".access") else (
+            "does NOT end in '.access' - this may be an R2 S3 key rather than an Access "
+            "service token"
+        )
+        log(
+            f"Cloudflare Access service token: configured "
+            f"(client id {CF_ACCESS_CLIENT_ID[:6]}...{CF_ACCESS_CLIENT_ID[-8:]}, {shape})"
+        )
+    elif CF_ACCESS_CLIENT_ID or CF_ACCESS_CLIENT_SECRET:
+        missing = "secret" if CF_ACCESS_CLIENT_ID else "client id"
+        log(
+            f"WARNING: Cloudflare Access service token is HALF configured - the {missing} "
+            "is missing, so no Access headers will be sent and callbacks will be rejected."
+        )
+    else:
+        log(
+            "Cloudflare Access service token: NOT configured. Set "
+            "CLOUDFLARE_ACCESS_KEY_ID and CLOUDFLARE_SECRET_ACCESS_KEY on the endpoint if "
+            "the Worker is behind Access, or progress callbacks and the R2 upload will be "
+            "bounced to a login page."
+        )
+
+
 def cloudflare_access_headers() -> dict:
     """Service-token headers for Cloudflare Access, or {} when not configured."""
     if CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET:
@@ -2167,6 +2200,7 @@ def _shutdown(signum, _frame) -> None:
 def main() -> None:
     log("=== MiniMax H3 Blackwell serverless worker starting ===")
     log(f"process_id={PROCESS_ID}")
+    log_callback_configuration()
     log(f"COMFY_DIR = {COMFY_DIR}")
     log_torch_environment()
 
