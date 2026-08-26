@@ -186,7 +186,7 @@ export default {
 
       if (request.method === "POST" && segments[0] === "cancel") {
         const { backend, jobId } = parseJobRoute(segments, url, "cancel");
-        return await cancelJob(backend, jobId, env, headers);
+        return await cancelJob(backend, jobId, env, headers, url);
       }
 
       /*
@@ -996,9 +996,15 @@ async function generateVideo(request, env, headers) {
 
       resolvedFrom: settings.resolvedFrom,
 
+      /*
+       * status and cancel carry ?jobId= so those routes can also reach the realtime
+       * channel, which is keyed on our job id rather than RunPod's. Both work without it
+       * exactly as before - the parameter only adds the video route and the cancelled
+       * event.
+       */
       routes: {
-        status: `/status/${encodedBackend}/${encodedJobId}`,
-        cancel: `/cancel/${encodedBackend}/${encodedJobId}`,
+        status: `/status/${encodedBackend}/${encodedJobId}?jobId=${encodeURIComponent(jobId)}`,
+        cancel: `/cancel/${encodedBackend}/${encodedJobId}?jobId=${encodeURIComponent(jobId)}`,
         events: `/ws/jobs/${encodeURIComponent(jobId)}`,
         video: `/jobs/${encodeURIComponent(jobId)}/video`
       }
@@ -1105,7 +1111,7 @@ async function getJobStatus(backend, jobId, env, headers, url) {
   return json(result, 200, headers);
 }
 
-async function cancelJob(backend, jobId, env, headers) {
+async function cancelJob(backend, jobId, env, headers, url) {
   const config = getRunPodConfig(backend, env);
   const runpodUrl = `https://api.runpod.ai/v2/${config.endpointId}/cancel/${encodeURIComponent(jobId)}`;
 
@@ -1124,6 +1130,25 @@ async function cancelJob(backend, jobId, env, headers) {
       data,
       headers
     });
+  }
+
+  /*
+   * Tell the realtime channel too, so a browser watching the socket sees `cancelled`
+   * instead of the progress simply stopping with no explanation. Cancellation itself is
+   * unchanged - this is additive, and a DO failure must not turn a successful cancel into
+   * an error response.
+   */
+  const workerJobId = url?.searchParams.get("jobId");
+  if (workerJobId) {
+    try {
+      await pushJobState(env, workerJobId, {
+        status: "CANCELLED",
+        phase: "cancelled",
+        runpodId: jobId
+      });
+    } catch (error) {
+      console.warn(`Cancelled job ${jobId} but could not update its channel: ${error?.message}`);
+    }
   }
 
   return json(addBackendToResult(backend, sanitizeRunPodResult(data)), 200, headers);
