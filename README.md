@@ -196,6 +196,76 @@ reading the surrounding ComfyUI chatter:
 
 A phase whose boundary never arrived reports `n/a` rather than failing the job.
 
+### FlashBoot preload (opt-in, off by default)
+
+`pre_sampling` is ~16s on a cold Blackwell worker, and the `[perf] nodes` line shows where
+it goes: the loaders finish in ~0.6s, then `MiniMaxH3ImageToVideo` spends ~7s staging the
+text encoder and `SamplerCustomAdvanced` ~9s staging the DiT. **Executing a loader does not
+put weights on the GPU** - `model_management.load_models_gpu()` does, and only when a node
+actually uses the model. So a loader-only warmup would save nothing.
+
+`H3_FLASHBOOT_PRELOAD=1` therefore runs the smallest graph that reaches both of those
+calls, after ComfyUI is ready and before `runpod.serverless.start()`:
+
+```
+UNETLoader ─┬─────────────────────────► BasicGuider ─┐
+CLIPLoader ─┼─► MiniMaxH3ImageToVideo ───────────────┼─► SamplerCustomAdvanced ─► PreviewAny
+VAELoader  ─┘   (32x32, 5 frames)      BasicScheduler┘   (1 step)
+VAELoader (audio) ───────────────────────────────────────────────────────────────► PreviewAny
+```
+
+No `VAEDecode`, no `CreateVideo`, no `SaveVideo` - nothing is decoded and nothing is written
+to disk. `PreviewAny` is there because ComfyUI **rejects a prompt with no `OUTPUT_NODE`**
+("Prompt has no outputs"), so a graph of loaders alone would never execute at all.
+
+Why the real job then gets it for free: ComfyUI keys its output cache on `class_type` +
+inputs and deliberately excludes node id, so the real workflow's loaders - whose inputs are
+byte-identical to the preload's - hit the cache and receive **the same `ModelPatcher`
+objects**. `load_models_gpu()` finds those already in `current_loaded_models`
+(`LoadedModel.__eq__` compares by identity) and skips staging. Models survive the preload
+prompt because `unload_all_models()` only runs on OOM or under `--disable-smart-memory`.
+
+**Not preloaded:** VRAM staging for the two VAEs. There is no way to stage a VAE without
+running a decode, and decode is the expensive part. Their *loaders* run, so those cache
+entries are warm, but the ~10.8s decode phase is untouched.
+
+If the preload fails or times out, it logs and the worker starts normally - the first
+request just loads models the usual way. On timeout ComfyUI is sent `/interrupt` so the
+first real job is not queued behind an abandoned synthetic prompt.
+
+#### Measuring it
+
+```
+# A: control
+H3_FLASHBOOT_PRELOAD=0
+
+# B: preload
+H3_FLASHBOOT_PRELOAD=1
+```
+
+Startup gains a line:
+
+```
+[perf] preload proc=… status=ok total=15.9s loaded=te,dit,video_vae,… preload_te=7.1s preload_dit=8.4s
+[perf] startup proc=… to_serverless_ready=24.8s comfy_boot=7.1s preload_enabled=true preload_total=15.9s
+```
+
+Compare the **first job's `pre_sampling`** against the ~16.0s control. `sampling` and
+`per_step` must stay ~47.0s / ~2.35s; if they move, something other than residency changed.
+
+The blunt check for whether it worked: ComfyUI logs `Requested to load <name>` **only when a
+model is not already resident**. After a successful preload the first real job should show
+*fewer* `Requested to load MiniMaxH3TEModel_` / `MiniMaxH3` lines than the control.
+
+#### The honest caveat
+
+Within one process this mechanism is sound and verified in ComfyUI's source. Whether
+**FlashBoot** preserves it across a scale-to-zero is the open question: it snapshots the
+worker process, but CUDA context and VRAM residency are not ordinary process memory, and a
+restore may well come back with an empty GPU. If it does not survive, the preload merely
+moves ~16s from the first request into startup - both are billed, so that is a wash, not a
+win. Judge it on `pre_sampling`, not on the fact that the preload ran.
+
 ### A/B testing `--highvram`
 
 The 96 GB Blackwell parts hold the entire ~41 GB working set with room to spare, but ComfyUI
@@ -535,6 +605,10 @@ mp4 = AESGCM(dek).decrypt(
 | `COMFY_STARTUP_TIMEOUT` | `600` | Seconds to wait for ComfyUI readiness |
 | `COMFY_EXTRA_ARGS` | *(empty)* | Extra ComfyUI CLI arguments, shell-quoted (e.g. `--highvram`). Logged verbatim at startup |
 | `H3_PERF_NODES` | `1` | `0` suppresses the per-node `[perf] nodes` line |
+| `H3_FLASHBOOT_PRELOAD` | `0` | `1` stages the text encoder and DiT onto the GPU before the serverless loop starts |
+| `H3_FLASHBOOT_PRELOAD_TIMEOUT` | `60` | Seconds before the preload is abandoned and ComfyUI interrupted |
+| `H3_FLASHBOOT_PRELOAD_WIDTH` / `_HEIGHT` / `_LENGTH` | `32` / `32` / `5` | Synthetic graph size; the node schema's minimums |
+| `H3_FLASHBOOT_PRELOAD_UNET` / `_CLIP` / `_VIDEO_VAE` / `_AUDIO_VAE` | baked model filenames | Must match the real workflow's loader inputs exactly |
 | `H3_PERF_NODES_TOP` | `6` | How many nodes to show on that line |
 | `COMFY_SAGE_ATTENTION3` | `1` (from base) | `0` disables SageAttention3 if it destabilises |
 | `H3_SAGE_AUTODETECT` | `1` | Auto-disable SageAttention3 when the scheduled GPU is not the capability the wheel was built for. `0` forces `COMFY_SAGE_ATTENTION3` through unchecked |

@@ -68,6 +68,38 @@ WS_RECV_TIMEOUT = int(os.environ.get("H3_WS_RECV_TIMEOUT", "30"))
 
 OUTPUT_MODE = os.environ.get("H3_OUTPUT_MODE", "base64").strip().lower()
 
+# --------------------------------------------------------------------------------------
+# FlashBoot preload (opt-in, default off)
+# --------------------------------------------------------------------------------------
+PRELOAD_ENABLED = os.environ.get("H3_FLASHBOOT_PRELOAD", "0") == "1"
+PRELOAD_TIMEOUT = int(os.environ.get("H3_FLASHBOOT_PRELOAD_TIMEOUT", "60"))
+
+# The smallest graph the node schema allows: width/height min 32 step 32, length min 5
+# step 17 (the model's 17k+5 grid). Read off MiniMaxH3ImageToVideo's own schema, not
+# guessed. Overridable in case a base-image bump tightens the limits.
+PRELOAD_WIDTH = int(os.environ.get("H3_FLASHBOOT_PRELOAD_WIDTH", "32"))
+PRELOAD_HEIGHT = int(os.environ.get("H3_FLASHBOOT_PRELOAD_HEIGHT", "32"))
+PRELOAD_LENGTH = int(os.environ.get("H3_FLASHBOOT_PRELOAD_LENGTH", "5"))
+PRELOAD_PROMPT = os.environ.get("H3_FLASHBOOT_PRELOAD_PROMPT", "preload")
+
+# These MUST match the real workflow's loader inputs byte for byte. ComfyUI keys its
+# output cache on class_type + inputs and explicitly excludes node id
+# (CacheKeySetInputSignature.include_node_id_in_input() -> False), so identical loader
+# inputs are what makes the real job reuse the objects this preload put on the GPU.
+# Defaults are the four models baked by models.tsv.
+PRELOAD_UNET = os.environ.get(
+    "H3_FLASHBOOT_PRELOAD_UNET", "minimax_h3_fl2va_pruned_int8_convrot.safetensors"
+)
+PRELOAD_CLIP = os.environ.get(
+    "H3_FLASHBOOT_PRELOAD_CLIP", "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"
+)
+PRELOAD_VIDEO_VAE = os.environ.get(
+    "H3_FLASHBOOT_PRELOAD_VIDEO_VAE", "minimax_h3_video_vae_fp16.safetensors"
+)
+PRELOAD_AUDIO_VAE = os.environ.get(
+    "H3_FLASHBOOT_PRELOAD_AUDIO_VAE", "minimax_h3_audio_vae_fp32.safetensors"
+)
+
 # ComfyUI history buckets that carry saved artefacts. SaveVideo emits ui.PreviewVideo,
 # whose as_dict() is {"images": [...], "animated": (True,)} - so MP4s land under "images",
 # which is exactly what the Cloudflare Worker already reads.
@@ -1425,6 +1457,184 @@ def handler(job: dict) -> dict:
         emit_perf(timer, job_index=job_index, status=status)
 
 
+# --------------------------------------------------------------------------------------
+# FlashBoot preload
+# --------------------------------------------------------------------------------------
+#
+# Why this graph, and why it is not loader-only.
+#
+# Everything below was read out of ComfyUI at the pinned commit (dec5d945) rather than
+# assumed, because three of its behaviours decide whether a preload can work at all:
+#
+#   1. A prompt with no OUTPUT_NODE is rejected outright - execution.validate_prompt()
+#      returns "Prompt has no outputs". A graph of four loaders and nothing else would
+#      never run. PreviewAny (comfy_extras/nodes_preview_any.py) is OUTPUT_NODE=True,
+#      takes IO.ANY and only stringifies its input, so it forces upstream execution
+#      without a decode, an encode or a file write.
+#
+#   2. Executing a loader does NOT put weights on the GPU. UNETLoader/CLIPLoader/VAELoader
+#      just build a ModelPatcher; the expensive staging happens later, inside
+#      model_management.load_models_gpu(), when a node actually uses the model. The
+#      production logs show exactly this - the loaders finish in ~0.6s, then
+#      MiniMaxH3ImageToVideo spends ~7s staging the text encoder and SamplerCustomAdvanced
+#      ~9s staging the DiT. Those two calls are the 16s of pre_sampling we are targeting,
+#      so the preload has to reach them: text encode plus one sampler step.
+#
+#   3. The saving is real only because ComfyUI reuses the objects. Its output cache is
+#      keyed on class_type + inputs with node id deliberately excluded
+#      (CacheKeySetInputSignature.include_node_id_in_input() -> False), so the real job's
+#      loaders - identical inputs - hit the cache and get back the *same* ModelPatcher
+#      instances. load_models_gpu() then finds them already in current_loaded_models
+#      (LoadedModel.__eq__ is `self.model is other.model`, i.e. identity) and skips
+#      staging entirely. Models survive the preload prompt because unload_all_models() is
+#      only called on OOM or under --disable-smart-memory, neither of which applies here.
+#
+# What is deliberately NOT preloaded: VRAM staging for the two VAEs. There is no way to
+# stage a VAE without running a decode, and decode is the expensive thing. Their loaders
+# do execute (cheap file open + ModelPatcher), so those cache entries are warm, but the
+# decode phase is untouched by this.
+
+
+def build_preload_workflow() -> dict:
+    """The cheapest graph that stages the text encoder and the DiT onto the GPU.
+
+    Loader nodes mirror the real workflow's inputs exactly - that is the whole mechanism.
+    Everything downstream is shrunk to the schema minimum (32x32, 5 frames, 1 step) and
+    terminates in PreviewAny so nothing is decoded, encoded or written to disk.
+    """
+    return {
+        # --- loaders: inputs identical to examples/fl2va-text-to-video.json ---
+        "1": {
+            "class_type": "UNETLoader",
+            "inputs": {"unet_name": PRELOAD_UNET, "weight_dtype": "default"},
+        },
+        "2": {
+            "class_type": "CLIPLoader",
+            "inputs": {"clip_name": PRELOAD_CLIP, "type": "minimax"},
+        },
+        "3": {"class_type": "VAELoader", "inputs": {"vae_name": PRELOAD_VIDEO_VAE}},
+        "4": {"class_type": "VAELoader", "inputs": {"vae_name": PRELOAD_AUDIO_VAE}},
+        # --- text encode: stages MiniMaxH3TEModel_. No first_frame/last_frame, so the
+        #     node never calls vae.encode() and the video VAE stays off the GPU. ---
+        "5": {
+            "class_type": "MiniMaxH3ImageToVideo",
+            "inputs": {
+                "clip": ["2", 0],
+                "vae": ["3", 0],
+                "prompt": PRELOAD_PROMPT,
+                "width": PRELOAD_WIDTH,
+                "height": PRELOAD_HEIGHT,
+                "length": PRELOAD_LENGTH,
+            },
+        },
+        # --- one sampler step: stages MiniMaxH3 (the DiT) ---
+        "6": {"class_type": "RandomNoise", "inputs": {"noise_seed": 0}},
+        "7": {"class_type": "BasicGuider", "inputs": {"model": ["1", 0], "conditioning": ["5", 0]}},
+        "8": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "res_multistep"}},
+        "9": {
+            "class_type": "BasicScheduler",
+            "inputs": {"model": ["1", 0], "scheduler": "simple", "steps": 1, "denoise": 1.0},
+        },
+        "10": {
+            "class_type": "SamplerCustomAdvanced",
+            "inputs": {
+                "noise": ["6", 0],
+                "guider": ["7", 0],
+                "sampler": ["8", 0],
+                "sigmas": ["9", 0],
+                "latent_image": ["5", 1],
+            },
+        },
+        # --- terminators: OUTPUT_NODEs that only stringify, so the graph is allowed to
+        #     run. Node 12 exists purely to make the audio VAE loader execute. ---
+        "11": {"class_type": "PreviewAny", "inputs": {"source": ["10", 0]}},
+        "12": {"class_type": "PreviewAny", "inputs": {"source": ["4", 0]}},
+    }
+
+
+def _interrupt_comfy() -> None:
+    """Ask ComfyUI to abandon the running prompt.
+
+    Used when the preload overruns its timeout: without this the synthetic prompt keeps
+    running and the first real job queues behind it, which would be strictly worse than
+    not preloading at all.
+    """
+    try:
+        requests.post(f"{COMFY_URL}/interrupt", timeout=10)
+        log("Preload: sent /interrupt to ComfyUI.")
+    except Exception as error:
+        log(f"WARNING: could not interrupt ComfyUI after preload timeout: {error}")
+
+
+# Which node class stands in for which component, for the preload timing line.
+_PRELOAD_COMPONENTS = (
+    ("te", "MiniMaxH3ImageToVideo"),
+    ("dit", "SamplerCustomAdvanced"),
+    ("video_vae", "VAELoader"),
+    ("unet_loader", "UNETLoader"),
+    ("clip_loader", "CLIPLoader"),
+)
+
+
+def run_flashboot_preload() -> float | None:
+    """Stage the H3 models before runpod.serverless.start(), so FlashBoot can snapshot them.
+
+    Returns the elapsed seconds, or None if the preload did not complete. Never raises: a
+    preload is an optimisation, so a failure, a timeout or a model that is not where we
+    expect it must still leave the worker able to come up and serve requests normally.
+    """
+    began = time.monotonic()
+    workflow = build_preload_workflow()
+    timer = JobTimer(workflow)
+
+    try:
+        client_id = str(uuid.uuid4())
+        deadline = time.monotonic() + PRELOAD_TIMEOUT
+        log(
+            f"Preload: queueing synthetic {PRELOAD_WIDTH}x{PRELOAD_HEIGHT} "
+            f"length={PRELOAD_LENGTH} 1-step graph ({len(workflow)} nodes), "
+            f"timeout={PRELOAD_TIMEOUT}s"
+        )
+        prompt_id = queue_prompt(workflow, client_id)
+        timer.mark("submitted")
+        await_execution(prompt_id, client_id, deadline, timer)
+
+        elapsed = time.monotonic() - began
+        loaded = [
+            name for name, node_class in _PRELOAD_COMPONENTS
+            if node_class in timer._node_totals
+        ]
+        parts = " ".join(
+            f"preload_{name}={_secs(timer._node_totals[node_class])}"
+            for name, node_class in _PRELOAD_COMPONENTS
+            if node_class in timer._node_totals
+        )
+        log(
+            f"[perf] preload proc={PROCESS_ID} status=ok total={_secs(elapsed)} "
+            f"loaded={','.join(loaded) if loaded else 'none'} {parts}".rstrip()
+        )
+        return elapsed
+
+    except WorkflowError as error:
+        elapsed = time.monotonic() - began
+        timed_out = time.monotonic() >= began + PRELOAD_TIMEOUT
+        if timed_out:
+            _interrupt_comfy()
+        log(
+            f"[perf] preload proc={PROCESS_ID} "
+            f"status={'timeout' if timed_out else 'failed'} "
+            f"total={_secs(elapsed)} error={error}"
+        )
+        return None
+    except Exception as error:
+        elapsed = time.monotonic() - began
+        log(
+            f"[perf] preload proc={PROCESS_ID} status=failed total={_secs(elapsed)} "
+            f"error={type(error).__name__}: {error}"
+        )
+        return None
+
+
 def _shutdown(signum, _frame) -> None:
     log(f"Received signal {signum}; stopping ComfyUI.")
     if _comfy_process is not None and _comfy_process.poll() is None:
@@ -1456,53 +1666,26 @@ def main() -> None:
         except Exception as error:
             log(f"WARNING: eager ComfyUI start failed ({error}); will retry on first job.")
 
-    log(
-        f"[perf] startup proc={PROCESS_ID} "
-        f"to_serverless_ready={_secs(time.monotonic() - _PROCESS_START)} "
-        f"comfy_boot={_secs(_comfy_boot_seconds)}"
-    )
+    # The preload runs after ComfyUI is ready and before the serverless loop starts, so
+    # the models are resident in the process FlashBoot snapshots. Opt-in: a miss costs a
+    # synthetic step on every cold start, which is only worth paying once the [perf] data
+    # shows workers actually being reused.
+    preload_total = None
+    if PRELOAD_ENABLED:
+        log("FlashBoot preload enabled")
+        preload_total = run_flashboot_preload()
+    else:
+        log("FlashBoot preload disabled")
 
-    # ----------------------------------------------------------------------------------
-    # NOT IMPLEMENTED (deliberately): FlashBoot model preload
-    # ----------------------------------------------------------------------------------
-    # RunPod's FlashBoot snapshots the worker process when it scales to zero and restores
-    # it on the next request. It can only capture state that already exists at snapshot
-    # time. Today ComfyUI is running by this point (H3_EAGER_START), but it holds *no*
-    # models: ComfyUI loads them lazily, on the first prompt. So the snapshot restores a
-    # ComfyUI with empty VRAM and every cold start re-pays model staging - measured at
-    # 13-25s, i.e. the pre_sampling field on the [perf] line.
-    #
-    # What preloading here would require:
-    #
-    #   * Components to load. Four, all lazy today: MiniMaxH3TEModel_ (text encoder,
-    #     ~14956 MB staged), MiniMaxH3 (the FL2VA DiT, ~19995 MB), MiniMaxH3VideoVAE
-    #     (~4965 MB) and MiniMaxH3AudioVAE (~576 MB). ~41 GB against 96 GB of VRAM, so it
-    #     fits with room to spare.
-    #   * A synthetic workflow: yes, almost certainly. ComfyUI has no public "load model"
-    #     API - loaders are graph nodes, so the only supported way to force a load is to
-    #     execute a graph that touches them. That means a real (tiny) generation: minimum
-    #     resolution, 1 step, output discarded. It must use the *same* loader nodes and
-    #     checkpoint names as the real workflow or it warms the wrong objects.
-    #   * Residency: ComfyUI keeps loaded models cached and only evicts under VRAM
-    #     pressure. With ~41 GB resident on a 96 GB card there is no pressure, so they
-    #     should survive to the first real job. Not guaranteed - comfy-aimdo's DynamicVRAM
-    #     layer stages through pinned host RAM and makes its own residency decisions.
-    #   * Risks. (1) On a FlashBoot *miss* the warmup is roughly cost-neutral - the same
-    #     staging happens, just earlier - but it is NOT free: the synthetic step itself
-    #     costs a few seconds of GPU time on every cold start that does not get reused.
-    #     (2) It hard-codes assumptions about the workflow's loader nodes, so a workflow
-    #     change silently stops warming the right models. (3) A warmup failure must never
-    #     block serving; it would need the same try/except treatment as the eager start.
-    #     (4) It lengthens the window before the worker registers with RunPod, which could
-    #     look like a slower cold start on any request that arrives mid-warmup.
-    #   * Where the hook belongs: right here - after start_comfyui() has returned ready and
-    #     immediately before runpod.serverless.start(), so the models are resident in the
-    #     process that FlashBoot snapshots.
-    #
-    # Gate on evidence before building it: compare pre_sampling across jobs where proc=
-    # differs (true cold) against jobs where it repeats (reused). If reuse is rare at this
-    # traffic level, preloading buys nothing and costs a synthetic step every time.
-    # ----------------------------------------------------------------------------------
+    startup_fields = [
+        f"proc={PROCESS_ID}",
+        f"to_serverless_ready={_secs(time.monotonic() - _PROCESS_START)}",
+        f"comfy_boot={_secs(_comfy_boot_seconds)}",
+        f"preload_enabled={'true' if PRELOAD_ENABLED else 'false'}",
+    ]
+    if PRELOAD_ENABLED:
+        startup_fields.append(f"preload_total={_secs(preload_total)}")
+    log("[perf] startup " + " ".join(startup_fields))
 
     runpod.serverless.start({"handler": handler})
 
