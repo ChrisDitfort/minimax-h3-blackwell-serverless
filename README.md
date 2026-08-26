@@ -292,6 +292,121 @@ Then compare **`pre_sampling`** and **`first_step`** between the two, on jobs wh
 `cold_process=true` in both. `sampling` and `per_step` should be unchanged; if they move,
 something other than residency changed and the comparison is not clean.
 
+## Cloudflare Worker API (worker.js)
+
+`worker.js` is the public API in front of both RunPod endpoints. It owns the contract and
+builds the ComfyUI graph; the RunPod handler stays a thin executor that runs whatever
+workflow it is handed. Callers never see ComfyUI node ids.
+
+Run its tests with `node --test worker.test.js` (no dependencies).
+
+### Normalized request
+
+```json
+{
+  "backend": "h3-blackwell",
+  "mode": "text_to_video",
+  "prompt": "A cinematic ocean scene",
+  "quality": "standard",
+  "duration": 5,
+  "aspect_ratio": "16:9",
+  "seed": 51
+}
+```
+
+The raw shape (`width`/`height`/`frames`/`steps`/`seed`) still works unchanged, and
+`/status/...` and `/cancel/...` are untouched.
+
+### Quality tiers
+
+Dimensions are not invented here. They come from the pinned ComfyUI build's own
+`adapt_canvas()` in `comfy_extras/nodes_minimax_h3.py`: short edge to the tier's value,
+total area capped at 768x1344, each axis rounded to 32.
+
+| Quality | Short edge | Steps | 16:9 | 9:16 | 1:1 | 4:3 | 3:4 |
+|---|---|---|---|---|---|---|---|
+| `fast` | 576 | 14 | 1024x576 | 576x1024 | 576x576 | 768x576 | 576x768 |
+| `standard` | 576 | 20 | 1024x576 | 576x1024 | 576x576 | 768x576 | 576x768 |
+| `hd` | 768 | 20 | 1344x768 | 768x1344 | 768x768 | 1024x768 | 768x1024 |
+
+`hd` is the canvas the H3 nodes themselves default to - a validated 768-class
+configuration, not an upscale or a second-stage pipeline.
+
+`GET /capabilities` returns this table live, so clients need not hardcode it.
+
+### Duration
+
+H3 runs at 24 fps and only accepts frame counts where `frames % 17 == 5`
+(`align_frame_count()` in the same file). `duration` is converted in one helper:
+
+```
+duration: 5  ->  round(5 * 24) = 120  ->  snapped up to 124 frames (5.1667s)
+```
+
+Supplying an off-grid `frames` value is a 400 that names the nearest legal counts.
+
+### Precedence
+
+Explicit raw values beat the quality preset. A raw value that *contradicts* a normalized
+one is a 400 rather than a silent guess:
+
+| Combination | Result |
+|---|---|
+| `quality` + `steps` | `steps` wins |
+| `quality`/`aspect_ratio` + `width`/`height` | `width`/`height` win |
+| `aspect_ratio` + `width`/`height` that disagree | **400** |
+| `duration` + `frames` that disagree | **400** |
+| `width` without `height` | **400** |
+
+### Structured prompt fields
+
+`camera`, `shot`, `lighting`, `style`, `motion` and `audio_prompt` are appended as labelled
+lines after the user's prompt, which is never rewritten. Absent fields add nothing.
+
+```
+A woman standing near the ocean.
+
+Camera: slow dolly forward.
+Lighting: warm sunset.
+```
+
+### Modes
+
+| Mode | Status |
+|---|---|
+| `text_to_video` | available |
+| `first_frame_to_video` | available (`first_frame.url`, https) |
+| `last_frame_to_video` | **501** - handler stages only one image |
+| `first_last_frame_to_video` | **501** - handler stages only one image |
+| `reference` (Ref2VA) | **501** - model not in the image |
+| `regenerate_2k` | **501** - no second-stage model |
+
+An unavailable mode returns 501 with a reason. It never silently degrades to
+text-to-video, which would return a video that quietly ignored the caller's keyframes.
+
+### Ref2VA status
+
+`MiniMaxH3ReferenceToVideo` **is present** in the pinned ComfyUI build, so no ComfyUI
+change is needed. What is missing is the weight file:
+
+| Item | Value |
+|---|---|
+| File | `minimax_h3_ref2va_pruned_int8_convrot.safetensors` |
+| Size | **20,970,379,616 bytes (20.97 GB)** |
+| Image impact | 43.2 GB -> ~64 GB compressed, roughly +50% |
+| Cold start | first pull on an uncached worker grows proportionally |
+| VRAM | ~20 GB more resident if held alongside FL2VA; 96 GB is sufficient |
+
+The node also needs an `audio_vae` input that FL2VA does not use, plus Autogrow inputs
+(`ref_image_0..8`, `ref_video_0..2`, `ref_video_audio_0..2`, `ref_audio_0..2`), and the
+prompt must reference `<Picture i>` / `<Video k>` / `<Audio j>` tags. The API shape is in
+place; the weights are a deliberate, separately-costed decision.
+
+### 2K status
+
+Nothing installed and nothing measured. `regenerate_2k` exists only as a reserved mode
+name so the routing layer does not need reshaping later.
+
 ## Request schema
 
 ```jsonc
