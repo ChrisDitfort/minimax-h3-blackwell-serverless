@@ -205,16 +205,22 @@ class OutputUploadTest(unittest.TestCase):
         handler.requests.put = self._put
 
     def fake_put(self, status=200, body=None, capture=None):
-        def _put(url, data=None, headers=None, timeout=None):
+        # Mirrors the Worker's real acknowledgement: a 2xx *and* a JSON body carrying the
+        # key. Both are required now, because a 2xx alone can come from an auth gateway.
+        payload = body if body is not None else {"key": "outputs/j/video.mp4"}
+
+        def _put(url, data=None, headers=None, timeout=None, allow_redirects=None):
             if capture is not None:
                 capture["url"] = url
                 capture["headers"] = headers or {}
+                capture["allow_redirects"] = allow_redirects
                 capture["body"] = data.read() if hasattr(data, "read") else data
             return types.SimpleNamespace(
-                ok=200 <= status < 300,
+                ok=status < 400,
                 status_code=status,
                 text="err",
-                json=lambda: (body if body is not None else {}),
+                headers={},
+                json=lambda: payload,
             )
 
         return _put
@@ -286,9 +292,9 @@ class ProgressReporterTest(unittest.TestCase):
     def capture_posts(self, status=200):
         sent = []
 
-        def _post(url, json=None, headers=None, timeout=None):
+        def _post(url, json=None, headers=None, timeout=None, allow_redirects=None):
             sent.append({"url": url, "json": json, "headers": headers or {}, "timeout": timeout})
-            return types.SimpleNamespace(ok=200 <= status < 300, status_code=status)
+            return types.SimpleNamespace(ok=status < 400, status_code=status, headers={})
 
         handler.requests.post = _post
         return sent

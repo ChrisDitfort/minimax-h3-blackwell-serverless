@@ -193,6 +193,40 @@ CF_ACCESS_CLIENT_SECRET = (
 ).strip()
 
 
+def _describe_non_2xx(response) -> str:
+    """Explain a non-2xx, naming Cloudflare Access when that is what happened.
+
+    Access answers an unauthenticated call with a 302 to its login page. `requests`
+    follows redirects by default and Response.ok is merely `status_code < 400`, so both
+    the redirect and the resulting HTML login page read as success unless this is checked
+    explicitly. That is exactly how a job once reported a video it had never uploaded.
+    """
+    # Every field is read defensively: this only ever builds a log string, and must not be
+    # able to raise into the caller's error handling and have the failure counted twice.
+    status = getattr(response, "status_code", "?")
+    location = (getattr(response, "headers", None) or {}).get("Location", "") or ""
+    if status in (301, 302, 303, 307, 308):
+        if "cloudflareaccess.com" in location or "/cdn-cgi/access/login" in location:
+            return (
+                f"HTTP {status} to a Cloudflare Access login page. The Access service token "
+                "was not accepted - check CLOUDFLARE_ACCESS_KEY_ID / "
+                "CLOUDFLARE_SECRET_ACCESS_KEY hold an Access service token (client id ends "
+                "in '.access') and that a Service Auth policy allows it."
+            )
+        return f"HTTP {status} redirect to {location[:120]!r}"
+    body = str(getattr(response, "text", "") or "")[:200]
+    return f"HTTP {status}: {body}"
+
+
+def _is_2xx(response) -> bool:
+    """True only for a real success.
+
+    Deliberately not `response.ok`, which is `status_code < 400` and therefore treats a
+    302 as a success.
+    """
+    return 200 <= response.status_code < 300
+
+
 def cloudflare_access_headers() -> dict:
     """Service-token headers for Cloudflare Access, or {} when not configured."""
     if CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET:
@@ -232,6 +266,7 @@ class ProgressReporter:
         self.seconds = 0.0
         self._last_step_at = 0.0
         self._phase: str | None = None
+        self._warned = False
 
     @property
     def enabled(self) -> bool:
@@ -266,14 +301,23 @@ class ProgressReporter:
 
         began = time.monotonic()
         try:
+            # allow_redirects=False: a redirect here is never a real delivery, and
+            # following one silently turns an auth rejection into a counted success.
             response = requests.post(
-                self.url, json=body, headers=headers, timeout=PROGRESS_TIMEOUT
+                self.url,
+                json=body,
+                headers=headers,
+                timeout=PROGRESS_TIMEOUT,
+                allow_redirects=False,
             )
-            if response.ok:
+            if _is_2xx(response):
                 self.sent += 1
             else:
                 self.failed += 1
-                log(f"WARNING: progress callback returned HTTP {response.status_code}")
+                if not self._warned:
+                    # Once per job: 20+ identical warnings would bury the log.
+                    self._warned = True
+                    log(f"WARNING: progress callback rejected - {_describe_non_2xx(response)}")
         except Exception as error:
             # Swallowed on purpose: Cloudflare being unreachable is not a generation error.
             self.failed += 1
@@ -1477,8 +1521,14 @@ class WorkerUploadStore(OutputStore):
         try:
             # A file object streams; requests will not read it all into memory first.
             with open(path, "rb") as handle:
+                # allow_redirects=False: on a 302 requests would re-issue as a GET without
+                # the body, so the video would silently never be sent.
                 response = requests.put(
-                    self.url, data=handle, headers=headers, timeout=self.timeout
+                    self.url,
+                    data=handle,
+                    headers=headers,
+                    timeout=self.timeout,
+                    allow_redirects=False,
                 )
         except Exception as error:
             raise WorkflowError(
@@ -1487,12 +1537,30 @@ class WorkerUploadStore(OutputStore):
         finally:
             self.upload_seconds += time.monotonic() - began
 
-        if not response.ok:
+        if not _is_2xx(response):
             # Deliberately fatal. Reporting success here would hand the client a job that
             # says COMPLETED with no playable video behind it.
             raise WorkflowError(
-                f"Output upload returned HTTP {response.status_code} for "
-                f"{entry['filename']}: {response.text[:200]}"
+                f"Output upload failed for {entry['filename']} - {_describe_non_2xx(response)}"
+            )
+
+        # The Worker owns key naming; echo back whatever it reports rather than inventing
+        # a key here, so RunPod can never dictate where an object lands.
+        try:
+            body = response.json()
+        except ValueError:
+            body = None
+
+        # Require our own acknowledgement, not merely a 2xx. Anything sitting in front of
+        # the Worker - an auth gateway, a proxy, an error page - can answer 200 with HTML
+        # while storing nothing, and a job that claims a video it does not have is the
+        # single worst outcome this path can produce.
+        if not isinstance(body, dict) or not body.get("key"):
+            raise WorkflowError(
+                f"Output upload for {entry['filename']} returned HTTP "
+                f"{response.status_code} but not the Worker's JSON acknowledgement "
+                f"(expected a 'key'). Got: {response.text[:200]!r}. The upload did not "
+                "reach R2."
             )
 
         self.uploaded_bytes += size
@@ -1503,17 +1571,9 @@ class WorkerUploadStore(OutputStore):
             "type": entry.get("type", "output"),
             "size": size,
         }
-
-        # The Worker owns key naming; echo back whatever it reports rather than inventing
-        # a key here, so RunPod can never dictate where an object lands.
-        try:
-            body = response.json()
-        except ValueError:
-            body = None
-        if isinstance(body, dict):
-            for field in ("key", "url", "contentType"):
-                if body.get(field):
-                    result[field] = body[field]
+        for field in ("key", "url", "contentType"):
+            if body.get(field):
+                result[field] = body[field]
 
         return result
 

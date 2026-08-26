@@ -79,9 +79,9 @@ class CloudflareAccessHeaderTest(unittest.TestCase):
         handler.CF_ACCESS_CLIENT_SECRET = "client-secret"
         captured = {}
 
-        def _post(url, json=None, headers=None, timeout=None):
+        def _post(url, json=None, headers=None, timeout=None, allow_redirects=None):
             captured.update(headers or {})
-            return types.SimpleNamespace(ok=True, status_code=200)
+            return types.SimpleNamespace(ok=True, status_code=200, headers={})
 
         handler.requests.post = _post
         handler.ProgressReporter("job-1", "https://w/p", "tok").phase(handler.PHASE_SAMPLING)
@@ -100,9 +100,15 @@ class CloudflareAccessHeaderTest(unittest.TestCase):
         with open(video, "wb") as fh:
             fh.write(b"x" * 16)
 
-        def _put(url, data=None, headers=None, timeout=None):
+        def _put(url, data=None, headers=None, timeout=None, allow_redirects=None):
             captured.update(headers or {})
-            return types.SimpleNamespace(ok=True, status_code=200, text="", json=lambda: {})
+            return types.SimpleNamespace(
+                ok=True,
+                status_code=200,
+                text="",
+                headers={},
+                json=lambda: {"key": "outputs/j/video.mp4"},
+            )
 
         handler.requests.put = _put
         handler.WorkerUploadStore("https://w/o", "tok", 30).store(video, {"filename": "v.mp4"})
@@ -117,8 +123,10 @@ class CloudflareAccessHeaderTest(unittest.TestCase):
         handler.CF_ACCESS_CLIENT_ID = "client-id"
         handler.CF_ACCESS_CLIENT_SECRET = "wrong-secret"
 
-        def _post(url, json=None, headers=None, timeout=None):
-            return types.SimpleNamespace(ok=False, status_code=302)
+        def _post(url, json=None, headers=None, timeout=None, allow_redirects=None):
+            return types.SimpleNamespace(
+                ok=True, status_code=302, headers={"Location": "https://x/login"}
+            )
 
         handler.requests.post = _post
         reporter = handler.ProgressReporter("job-1", "https://w/p", "tok")
