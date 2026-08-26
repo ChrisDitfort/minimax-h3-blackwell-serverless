@@ -165,6 +165,63 @@ up front when it does not match, letting ComfyUI choose its own backend cleanly:
 Seeing this means the endpoint is not pinned to Blackwell. Generation still succeeds, just
 slower. Fix it in the endpoint's GPU selection rather than in the image.
 
+## Measuring cold-start performance
+
+Every job ends with one structured line, so a run can be compared against another without
+reading the surrounding ComfyUI chatter:
+
+```
+[perf] proc=657169cad581 cold_process=true job_in_proc=1 proc_age=0.0s comfy_boot=8.4s        comfy_wait=0.1s submit=0.0s pre_sampling=13.2s first_step=5.1s sampling=47.1s        steps=20/20 decode=8.8s output=1.3s total=71.4s per_step=2.36s status=ok
+[perf] nodes KSampler=47.1s MiniMaxH3VideoVAEDecode=7.2s MiniMaxH3TextEncode=3.9s
+```
+
+| Field | Meaning |
+|---|---|
+| `proc` | Identifies the worker **process**. The same value on two jobs means the process was reused; a new value means that job paid a full cold start. On a scale-to-zero endpoint this is the only way to tell whether FlashBoot actually restored a worker |
+| `cold_process` | `true` on the first job a process serves |
+| `job_in_proc` | How many jobs this process has served, including this one |
+| `proc_age` | Seconds between process start and this job starting |
+| `comfy_boot` | How long ComfyUI itself took to answer HTTP |
+| `comfy_wait` | How much of that this job actually waited for. `~0.0s` means ComfyUI was already up and its boot was **not** on this job's clock |
+| `submit` | Time to POST the prompt to ComfyUI |
+| `pre_sampling` | Prompt queued → first sampler frame: model staging, text encode, graph setup. **This is the cold-start cost the optimisation work targets** |
+| `first_step` | First sampler frame → first completed step. Carries the model-initialisation stall, so it is not mistaken for per-step cost |
+| `sampling` | First → last sampler frame (includes `first_step`) |
+| `steps` | Steps observed / total |
+| `per_step` | `sampling` ÷ steps observed |
+| `decode` | Last sampler frame → workflow finished: VAE decode, audio, mux, save |
+| `output` | Collecting, encoding and delivering artefacts |
+| `total` | Whole handler invocation |
+| `status` | `ok`, `bad_request`, `no_output`, `workflow_error` or `exception`. Emitted for failures too — a job that times out is exactly the one whose breakdown you want |
+
+A phase whose boundary never arrived reports `n/a` rather than failing the job.
+
+### A/B testing `--highvram`
+
+The 96 GB Blackwell parts hold the entire ~41 GB working set with room to spare, but ComfyUI
+still selects `NORMAL_VRAM` and streams weights through pinned host RAM. Whether pinning
+them in VRAM helps is measurable without rebuilding: set `COMFY_EXTRA_ARGS` on the endpoint
+and compare runs of the **same image**.
+
+```
+# baseline
+COMFY_EXTRA_ARGS=            # or unset
+
+# candidate
+COMFY_EXTRA_ARGS=--highvram
+```
+
+Confirm the flag actually landed — startup logs it explicitly:
+
+```
+[handler] ComfyUI effective args: COMFY_EXTRA_ARGS='--highvram' -> extra=['--highvram']
+[INFO] Set vram state to: HIGH_VRAM
+```
+
+Then compare **`pre_sampling`** and **`first_step`** between the two, on jobs where
+`cold_process=true` in both. `sampling` and `per_step` should be unchanged; if they move,
+something other than residency changed and the comparison is not clean.
+
 ## Request schema
 
 ```jsonc
@@ -476,7 +533,9 @@ mp4 = AESGCM(dek).decrypt(
 | `COMFY_PORT` | `8188` | Internal ComfyUI port (localhost only) |
 | `COMFY_OUTPUT_DIR` | `/tmp/comfy-output` | Where ComfyUI writes results |
 | `COMFY_STARTUP_TIMEOUT` | `600` | Seconds to wait for ComfyUI readiness |
-| `COMFY_EXTRA_ARGS` | *(empty)* | Extra ComfyUI CLI arguments |
+| `COMFY_EXTRA_ARGS` | *(empty)* | Extra ComfyUI CLI arguments, shell-quoted (e.g. `--highvram`). Logged verbatim at startup |
+| `H3_PERF_NODES` | `1` | `0` suppresses the per-node `[perf] nodes` line |
+| `H3_PERF_NODES_TOP` | `6` | How many nodes to show on that line |
 | `COMFY_SAGE_ATTENTION3` | `1` (from base) | `0` disables SageAttention3 if it destabilises |
 | `H3_SAGE_AUTODETECT` | `1` | Auto-disable SageAttention3 when the scheduled GPU is not the capability the wheel was built for. `0` forces `COMFY_SAGE_ATTENTION3` through unchecked |
 | `SAGE_SUPPORTED_CC` | `12.0` (from base) | Compute capability the `sageattn3` wheel was compiled for |

@@ -24,6 +24,7 @@ import hashlib
 import json
 import os
 import secrets
+import shlex
 import shutil
 import signal
 import subprocess
@@ -78,6 +79,169 @@ _start_lock = threading.Lock()
 
 def log(message: str) -> None:
     print(f"[handler] {message}", flush=True)
+
+
+# --------------------------------------------------------------------------------------
+# Performance instrumentation
+# --------------------------------------------------------------------------------------
+#
+# Every phase boundary below comes from something the handler can already see: its own
+# call sites, plus the `executing` / `progress` frames ComfyUI sends over the websocket it
+# is already connected to. Nothing inside ComfyUI is patched or wrapped, so this cannot
+# change what a job computes - the worst a bug in here can do is print "n/a".
+
+# Identifies this worker *process*. Two jobs logging the same proc= ran back-to-back on
+# one warm process; different values mean each paid its own cold start. On a scale-to-zero
+# endpoint that is the only way to tell from the logs alone whether a worker was actually
+# reused, which is precisely the question the cold-start work needs answered.
+PROCESS_ID = uuid.uuid4().hex[:12]
+_PROCESS_START = time.monotonic()
+
+# Set once, by whichever call to start_comfyui() actually launched ComfyUI.
+_comfy_boot_seconds: float | None = None
+_jobs_served = 0
+_jobs_lock = threading.Lock()
+
+# The per-node breakdown is a second line per job; H3_PERF_NODES=0 turns it off.
+PERF_NODES = os.environ.get("H3_PERF_NODES", "1") == "1"
+PERF_NODES_TOP = int(os.environ.get("H3_PERF_NODES_TOP", "6"))
+
+
+def _secs(value: float | None) -> str:
+    return "n/a" if value is None else f"{value:.1f}s"
+
+
+class JobTimer:
+    """Wall-clock marks for a single job, emitted as one [perf] line when it finishes.
+
+    Deliberately forgiving: a phase whose boundary never arrived (a dropped websocket, a
+    job that failed before sampling) reports "n/a" rather than raising. Instrumentation
+    must never be the reason a paid generation fails.
+    """
+
+    def __init__(self, workflow: dict | None = None) -> None:
+        self.start = time.monotonic()
+        self.marks: dict[str, float] = {}
+        self.spans: dict[str, float] = {}
+        self._workflow = workflow if isinstance(workflow, dict) else {}
+        self._open_node: tuple[str, float] | None = None
+        self._node_totals: dict[str, float] = {}
+        self.steps_seen = 0
+        self.steps_total: int | None = None
+
+    # -- marks -------------------------------------------------------------------------
+
+    def mark(self, name: str) -> None:
+        """Record the first time `name` happened."""
+        self.marks.setdefault(name, time.monotonic())
+
+    def remark(self, name: str) -> None:
+        """Record the most recent time `name` happened."""
+        self.marks[name] = time.monotonic()
+
+    def add_span(self, name: str, seconds: float) -> None:
+        self.spans[name] = self.spans.get(name, 0.0) + seconds
+
+    def between(self, first: str, second: str) -> float | None:
+        a, b = self.marks.get(first), self.marks.get(second)
+        if a is None or b is None or b < a:
+            return None
+        return b - a
+
+    # -- websocket-driven phase detection ----------------------------------------------
+
+    def on_progress(self, value, total) -> None:
+        """A sampler progress frame. The first one is where sampling begins."""
+        self.mark("sampling_start")
+        self.remark("sampling_end")
+        if isinstance(total, int) and total > 0:
+            self.steps_total = total
+        if isinstance(value, int):
+            self.steps_seen = max(self.steps_seen, value)
+            # The first *completed* step carries the model-initialisation cost, which on a
+            # cold worker is most of the stall before steady-state sampling. Break it out
+            # so it is not mistaken for per-step sampler cost.
+            if value >= 1:
+                self.mark("first_step_done")
+
+    def on_node(self, node_id: str) -> None:
+        """An `executing` frame: the named node starts, so the previous one has ended."""
+        now = time.monotonic()
+        self._close_node(now)
+        self._open_node = (self._label(node_id), now)
+
+    def on_execution_end(self) -> None:
+        self._close_node(time.monotonic())
+        self.mark("execution_end")
+
+    def _close_node(self, now: float) -> None:
+        if self._open_node is None:
+            return
+        label, began = self._open_node
+        self._node_totals[label] = self._node_totals.get(label, 0.0) + (now - began)
+        self._open_node = None
+
+    def _label(self, node_id: str) -> str:
+        node = self._workflow.get(str(node_id))
+        if isinstance(node, dict):
+            class_type = node.get("class_type")
+            if class_type:
+                return str(class_type)
+        return f"node{node_id}"
+
+    # -- output ------------------------------------------------------------------------
+
+    def summary(self, *, job_index: int, status: str) -> str:
+        total = time.monotonic() - self.start
+        sampling = self.between("sampling_start", "sampling_end")
+
+        fields = [
+            f"proc={PROCESS_ID}",
+            # First job in this process, so this job paid for the cold start.
+            f"cold_process={'true' if job_index == 1 else 'false'}",
+            f"job_in_proc={job_index}",
+            f"proc_age={_secs(self.start - _PROCESS_START)}",
+            f"comfy_boot={_secs(_comfy_boot_seconds)}",
+            # ~0 means ComfyUI was already up, so its boot was NOT on this job's clock.
+            f"comfy_wait={_secs(self.spans.get('comfy_wait'))}",
+        ]
+        if "stage_image" in self.spans:
+            fields.append(f"stage_image={_secs(self.spans['stage_image'])}")
+        fields += [
+            f"submit={_secs(self.spans.get('submit'))}",
+            # Queued -> first sampler frame: model staging, text encode, graph setup.
+            f"pre_sampling={_secs(self.between('submitted', 'sampling_start'))}",
+            f"first_step={_secs(self.between('sampling_start', 'first_step_done'))}",
+            f"sampling={_secs(sampling)}",
+            f"steps={self.steps_seen}/{self.steps_total if self.steps_total else '?'}",
+            # Last sampler frame -> workflow finished: VAE decode, audio, mux, save.
+            f"decode={_secs(self.between('sampling_end', 'execution_end'))}",
+            f"output={_secs(self.spans.get('output'))}",
+            f"total={_secs(total)}",
+            f"status={status}",
+        ]
+        if sampling and self.steps_seen > 1:
+            fields.insert(-1, f"per_step={sampling / self.steps_seen:.2f}s")
+        return "[perf] " + " ".join(fields)
+
+    def node_summary(self) -> str | None:
+        if not self._node_totals:
+            return None
+        ranked = sorted(self._node_totals.items(), key=lambda kv: kv[1], reverse=True)
+        shown = ranked[: max(1, PERF_NODES_TOP)]
+        return "[perf] nodes " + " ".join(f"{name}={value:.1f}s" for name, value in shown)
+
+
+def emit_perf(timer: JobTimer, *, job_index: int, status: str) -> None:
+    """Print the timing lines. Never raises - a broken metric must not fail a job."""
+    try:
+        log(timer.summary(job_index=job_index, status=status))
+        if PERF_NODES:
+            nodes = timer.node_summary()
+            if nodes:
+                log(nodes)
+    except Exception as error:  # pragma: no cover - defensive only
+        log(f"WARNING: could not emit perf summary: {error}")
 
 
 # --------------------------------------------------------------------------------------
@@ -224,13 +388,30 @@ def _comfy_is_ready() -> bool:
     return response.ok
 
 
+def parse_extra_args(raw: str) -> list[str]:
+    """Split COMFY_EXTRA_ARGS into argv, tolerating quoting and bad input.
+
+    shlex rather than str.split() so a quoted value survives ("--foo 'a b'" used to become
+    three broken tokens). If the string is unbalanced, shlex raises - fall back to a naive
+    split rather than refusing to start ComfyUI at all, since a malformed tuning flag is
+    never worth taking the worker down for.
+    """
+    if not raw or not raw.strip():
+        return []
+    try:
+        return shlex.split(raw)
+    except ValueError as error:
+        log(f"WARNING: COMFY_EXTRA_ARGS is not valid shell syntax ({error}); splitting naively.")
+        return raw.split()
+
+
 def start_comfyui() -> None:
     """Start ComfyUI once and block until it genuinely answers HTTP.
 
     Serialised behind a lock because RunPod may hand us concurrent jobs, and re-entrant
     starts would race two ComfyUI processes onto the same port.
     """
-    global _comfy_process
+    global _comfy_process, _comfy_boot_seconds
 
     with _start_lock:
         if _comfy_process is not None and _comfy_process.poll() is None and _comfy_is_ready():
@@ -239,6 +420,10 @@ def start_comfyui() -> None:
         if _comfy_process is not None and _comfy_process.poll() is not None:
             log(f"ComfyUI exited with code {_comfy_process.returncode}; restarting it.")
             _comfy_process = None
+
+        # Covers the wait even when we join a start already in flight, so comfy_boot
+        # reflects time-to-ready rather than time-since-fork.
+        boot_began = time.monotonic()
 
         if _comfy_process is None:
             for directory in (COMFY_OUTPUT_DIR, COMFY_TEMP_DIR, COMFY_INPUT_DIR):
@@ -265,10 +450,17 @@ def start_comfyui() -> None:
                 "--input-directory",
                 COMFY_INPUT_DIR,
             ]
-            extra_args = os.environ.get("COMFY_EXTRA_ARGS", "").split()
+            extra_args = parse_extra_args(os.environ.get("COMFY_EXTRA_ARGS", ""))
             command.extend(extra_args)
 
+            # Logged in full and on its own line so an A/B run can be attributed to the
+            # exact flags it used - `--highvram` in particular is invisible otherwise.
             log(f"Starting ComfyUI: {' '.join(command)} (cwd={COMFY_DIR})")
+            log(
+                "ComfyUI effective args: "
+                f"COMFY_EXTRA_ARGS={os.environ.get('COMFY_EXTRA_ARGS', '<unset>')!r} "
+                f"-> extra={extra_args or '[]'}"
+            )
             # Resolved here, not at import: the GPU is only knowable once the worker is
             # actually placed on a host.
             _comfy_process = subprocess.Popen(command, cwd=COMFY_DIR, env=build_comfy_env())
@@ -283,8 +475,9 @@ def start_comfyui() -> None:
                     "Check the ComfyUI log above for the underlying error."
                 )
             if _comfy_is_ready():
-                waited = COMFY_STARTUP_TIMEOUT - int(deadline - time.monotonic())
-                log(f"ComfyUI is ready after ~{waited}s")
+                elapsed = time.monotonic() - boot_began
+                _comfy_boot_seconds = elapsed
+                log(f"ComfyUI is ready after ~{elapsed:.1f}s")
                 return
             time.sleep(1)
 
@@ -352,7 +545,12 @@ def _raise_if_history_failed(history: dict, prompt_id: str) -> None:
     raise WorkflowError(f"ComfyUI reported a failed execution for prompt {prompt_id}: {status}")
 
 
-def await_execution(prompt_id: str, client_id: str, deadline: float) -> dict:
+def await_execution(
+    prompt_id: str,
+    client_id: str,
+    deadline: float,
+    timer: JobTimer | None = None,
+) -> dict:
     """Follow a prompt to completion over the websocket, falling back to /history polling.
 
     A recv timeout is expected and harmless - generation frequently produces no traffic for
@@ -401,6 +599,10 @@ def await_execution(prompt_id: str, client_id: str, deadline: float) -> dict:
 
                         if event_type == "progress" and data.get("prompt_id") == prompt_id:
                             value, total = data.get("value"), data.get("max")
+                            if timer is not None:
+                                # Fed every frame, including value=0, so sampling_start is
+                                # the sampler actually beginning rather than step 1 ending.
+                                timer.on_progress(value, total)
                             if value and total:
                                 log(f"  progress {value}/{total}")
                         elif event_type == "execution_error" and data.get("prompt_id") == prompt_id:
@@ -420,6 +622,15 @@ def await_execution(prompt_id: str, client_id: str, deadline: float) -> dict:
                             and data.get("node") is None
                         ):
                             break  # legacy completion signal
+                        elif (
+                            event_type == "executing"
+                            and data.get("prompt_id") == prompt_id
+                            and timer is not None
+                        ):
+                            # A named node started, so the previous one just finished.
+                            # This is what attributes time to the text encoder, the
+                            # sampler and each VAE decode without touching ComfyUI.
+                            timer.on_node(str(data.get("node")))
 
             # Poll /history regardless: it is the authoritative record and covers the case
             # where the websocket never connected or missed the terminal event.
@@ -432,6 +643,10 @@ def await_execution(prompt_id: str, client_id: str, deadline: float) -> dict:
             if connection is None:
                 time.sleep(1)
     finally:
+        # Closes the decode phase whichever way we left the loop. On a failure path the
+        # span is meaningless, which is what status= on the [perf] line is there to say.
+        if timer is not None:
+            timer.on_execution_end()
         if connection is not None:
             try:
                 connection.close()
@@ -1134,32 +1349,53 @@ def handler(job: dict) -> dict:
     job_id = job.get("id", "<unknown>")
     staged_image: str | None = None
 
-    try:
-        job_input = job.get("input") or {}
-        workflow = job_input.get("workflow")
+    global _jobs_served
+    with _jobs_lock:
+        _jobs_served += 1
+        job_index = _jobs_served
 
+    job_input = job.get("input") or {}
+    workflow = job_input.get("workflow")
+    timer = JobTimer(workflow if isinstance(workflow, dict) else None)
+    status = "error"
+
+    try:
         if not isinstance(workflow, dict) or not workflow:
+            status = "bad_request"
             return {"error": "input.workflow is required and must be a ComfyUI API-format object."}
 
         # Optional first-frame image-to-video. With no image supplied this is a no-op and
         # the text-to-video path runs exactly as before. Done before starting ComfyUI so a
         # bad image is rejected immediately instead of after a cold-start wait.
+        began = time.monotonic()
         staged_image = stage_input_image(job_input, workflow)
+        if staged_image:
+            timer.add_span("stage_image", time.monotonic() - began)
 
+        # Near-zero on a warm process; on a cold one this is the ComfyUI boot itself.
+        began = time.monotonic()
         start_comfyui()
+        timer.add_span("comfy_wait", time.monotonic() - began)
 
         client_id = str(uuid.uuid4())
         deadline = time.monotonic() + JOB_TIMEOUT
 
         mode = "image-to-video" if staged_image else "text-to-video"
         log(f"Job {job_id}: queueing {mode} workflow with {len(workflow)} nodes")
+        began = time.monotonic()
         prompt_id = queue_prompt(workflow, client_id)
+        timer.add_span("submit", time.monotonic() - began)
+        timer.mark("submitted")
         log(f"Job {job_id}: prompt_id={prompt_id}")
 
-        history = await_execution(prompt_id, client_id, deadline)
+        history = await_execution(prompt_id, client_id, deadline, timer)
+
+        began = time.monotonic()
         images = collect_outputs(history)
+        timer.add_span("output", time.monotonic() - began)
 
         if not images:
+            status = "no_output"
             return {
                 "error": (
                     "The workflow completed but produced no saved output. Ensure it ends in "
@@ -1169,18 +1405,24 @@ def handler(job: dict) -> dict:
             }
 
         log(f"Job {job_id}: returning {len(images)} artefact(s)")
+        status = "ok"
         return {"images": images, "prompt_id": prompt_id}
 
     except WorkflowError as error:
         # Covers ImageInputError too: a caller-facing validation failure, not a crash.
         log(f"Job {job_id}: workflow error: {error}")
+        status = "workflow_error"
         return {"error": str(error)}
     except Exception as error:
         log(f"Job {job_id}: unhandled error: {type(error).__name__}: {error}")
+        status = "exception"
         return {"error": f"{type(error).__name__}: {error}"}
     finally:
         # Always runs, so a failed or rejected job cannot orphan an input image.
         cleanup_input_image(staged_image)
+        # Emitted for failures too: a slow job that times out is exactly the one whose
+        # phase breakdown you want.
+        emit_perf(timer, job_index=job_index, status=status)
 
 
 def _shutdown(signum, _frame) -> None:
@@ -1196,6 +1438,7 @@ def _shutdown(signum, _frame) -> None:
 
 def main() -> None:
     log("=== MiniMax H3 Blackwell serverless worker starting ===")
+    log(f"process_id={PROCESS_ID}")
     log(f"COMFY_DIR = {COMFY_DIR}")
     log_torch_environment()
 
@@ -1212,6 +1455,54 @@ def main() -> None:
             start_comfyui()
         except Exception as error:
             log(f"WARNING: eager ComfyUI start failed ({error}); will retry on first job.")
+
+    log(
+        f"[perf] startup proc={PROCESS_ID} "
+        f"to_serverless_ready={_secs(time.monotonic() - _PROCESS_START)} "
+        f"comfy_boot={_secs(_comfy_boot_seconds)}"
+    )
+
+    # ----------------------------------------------------------------------------------
+    # NOT IMPLEMENTED (deliberately): FlashBoot model preload
+    # ----------------------------------------------------------------------------------
+    # RunPod's FlashBoot snapshots the worker process when it scales to zero and restores
+    # it on the next request. It can only capture state that already exists at snapshot
+    # time. Today ComfyUI is running by this point (H3_EAGER_START), but it holds *no*
+    # models: ComfyUI loads them lazily, on the first prompt. So the snapshot restores a
+    # ComfyUI with empty VRAM and every cold start re-pays model staging - measured at
+    # 13-25s, i.e. the pre_sampling field on the [perf] line.
+    #
+    # What preloading here would require:
+    #
+    #   * Components to load. Four, all lazy today: MiniMaxH3TEModel_ (text encoder,
+    #     ~14956 MB staged), MiniMaxH3 (the FL2VA DiT, ~19995 MB), MiniMaxH3VideoVAE
+    #     (~4965 MB) and MiniMaxH3AudioVAE (~576 MB). ~41 GB against 96 GB of VRAM, so it
+    #     fits with room to spare.
+    #   * A synthetic workflow: yes, almost certainly. ComfyUI has no public "load model"
+    #     API - loaders are graph nodes, so the only supported way to force a load is to
+    #     execute a graph that touches them. That means a real (tiny) generation: minimum
+    #     resolution, 1 step, output discarded. It must use the *same* loader nodes and
+    #     checkpoint names as the real workflow or it warms the wrong objects.
+    #   * Residency: ComfyUI keeps loaded models cached and only evicts under VRAM
+    #     pressure. With ~41 GB resident on a 96 GB card there is no pressure, so they
+    #     should survive to the first real job. Not guaranteed - comfy-aimdo's DynamicVRAM
+    #     layer stages through pinned host RAM and makes its own residency decisions.
+    #   * Risks. (1) On a FlashBoot *miss* the warmup is roughly cost-neutral - the same
+    #     staging happens, just earlier - but it is NOT free: the synthetic step itself
+    #     costs a few seconds of GPU time on every cold start that does not get reused.
+    #     (2) It hard-codes assumptions about the workflow's loader nodes, so a workflow
+    #     change silently stops warming the right models. (3) A warmup failure must never
+    #     block serving; it would need the same try/except treatment as the eager start.
+    #     (4) It lengthens the window before the worker registers with RunPod, which could
+    #     look like a slower cold start on any request that arrives mid-warmup.
+    #   * Where the hook belongs: right here - after start_comfyui() has returned ready and
+    #     immediately before runpod.serverless.start(), so the models are resident in the
+    #     process that FlashBoot snapshots.
+    #
+    # Gate on evidence before building it: compare pre_sampling across jobs where proc=
+    # differs (true cold) against jobs where it repeats (reused). If reuse is rare at this
+    # traffic level, preloading buys nothing and costs a synthetic step every time.
+    # ----------------------------------------------------------------------------------
 
     runpod.serverless.start({"handler": handler})
 
