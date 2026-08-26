@@ -479,6 +479,62 @@ so this is not urgent, but an R2 lifecycle rule expiring `inputs/` after a few d
 `outputs/` after whatever the product promises is the obvious next step. Do not add
 aggressive cleanup that could race a job still writing.
 
+### Deleting an output
+
+```
+DELETE /jobs/{jobId}/video
+```
+
+```json
+{ "id": "08ad4ace-d847-46b4-a1d6-a919d7e3a0c9", "deleted": true }
+```
+
+The key is derived from the job id inside the Worker via `outputKey()`, so a caller cannot
+name an arbitrary object - and there is deliberately **no** generic "delete this key"
+route anywhere in the API. A malformed job id is a 400 before R2 is touched at all.
+
+Idempotent: R2's delete does not fail on a missing key and the job is marked deleted either
+way, so a retry after a dropped connection returns the same answer rather than an error.
+
+Afterwards `/status/...?jobId=...` reports the output as gone instead of handing back a URL
+that would 404, while the generation itself stays `COMPLETED` - deleting an artefact is not
+a retrospective failure of the job that produced it:
+
+```jsonc
+// before
+"video": { "url": "/jobs/.../video", "key": "outputs/.../video.mp4", "size": 2196233, "deleted": false }
+// after
+"video": { "deleted": true }
+```
+
+`GET /jobs/{jobId}/video` then returns 404, including for Range requests, and the WebSocket
+`completed` event carries `{"deleted": true}` with no URL.
+
+**Access control is unchanged:** possession of the job id is the credential, exactly as it
+already is for `/status/{jobId}`. This endpoint is shaped so that a future API Runtime layer
+can call it internally *after* verifying user ownership - the ownership check belongs there,
+not here.
+
+### Retention
+
+Nothing expires by default; the bucket only carries R2's stock multipart-abort rule.
+`scripts/set_r2_lifecycle.sh` applies a prefix-scoped policy - dry-run by default, `--apply`
+to write it:
+
+| Prefix | Suggested | Why |
+|---|---|---|
+| `inputs/` | 7 days | Keyframes are only needed while the job runs, which is under two minutes |
+| `outputs/` | 30 days | Long enough that a bookmarked link is unlikely to surprise anyone; ~6 GB for 100 clips/day |
+
+These are suggestions, not a decision made for you: retention length is user-visible and
+belongs to the product. Edit the two constants at the top of the script before applying.
+
+Lifecycle expiry and `DELETE /jobs/:id/video` are deliberately separate - the endpoint is
+for deliberate removal, the policy is for outputs nobody came back for. Note that an object
+expired by lifecycle leaves the Durable Object still reporting a URL until that job's state
+is next written; `GET .../video` correctly 404s, but the status response can lag. Shortening
+retention below the DO's own lifetime would make that more visible.
+
 ### Behind Cloudflare Access
 
 If the Worker is behind Access - it is, on `minimax-h3-backend` - RunPod needs an Access

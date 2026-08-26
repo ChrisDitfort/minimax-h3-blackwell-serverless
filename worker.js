@@ -219,6 +219,16 @@ export default {
         return await streamVideo(request, env, segments[1]);
       }
 
+      // DELETE /jobs/:jobId/video  - remove that job's output from R2
+      if (
+        request.method === "DELETE" &&
+        segments.length === 3 &&
+        segments[0] === "jobs" &&
+        segments[2] === "video"
+      ) {
+        return await deleteVideo(env, headers, segments[1]);
+      }
+
       // GET /ws/jobs/:jobId  - realtime progress
       if (
         request.method === "GET" &&
@@ -1007,7 +1017,8 @@ async function generateVideo(request, env, headers, url) {
         status: `/status/${encodedBackend}/${encodedJobId}?jobId=${encodeURIComponent(jobId)}`,
         cancel: `/cancel/${encodedBackend}/${encodedJobId}?jobId=${encodeURIComponent(jobId)}`,
         events: `/ws/jobs/${encodeURIComponent(jobId)}`,
-        video: `/jobs/${encodeURIComponent(jobId)}/video`
+        video: `/jobs/${encodeURIComponent(jobId)}/video`,
+        deleteVideo: `/jobs/${encodeURIComponent(jobId)}/video`
       }
     },
     202,
@@ -1099,11 +1110,23 @@ async function getJobStatus(backend, jobId, env, headers, url) {
   const video = result?.output?.video;
   if (workerJobId && video && typeof video === "object") {
     try {
-      result.video = {
-        url: `/jobs/${encodeURIComponent(workerJobId)}/video`,
-        key: outputKey(workerJobId),
-        size: video.size
-      };
+      const key = outputKey(workerJobId);
+
+      /*
+       * A deleted output must not be advertised as playable. The job stays COMPLETED -
+       * deleting an artefact afterwards is not a retrospective failure of the generation -
+       * but the response says so explicitly rather than handing back a URL that 404s.
+       */
+      if (await isVideoDeleted(env, workerJobId)) {
+        result.video = { deleted: true };
+      } else {
+        result.video = {
+          url: `/jobs/${encodeURIComponent(workerJobId)}/video`,
+          key,
+          size: video.size,
+          deleted: false
+        };
+      }
     } catch {
       /* an unusable job id simply means no video route is advertised */
     }
@@ -1359,6 +1382,10 @@ function routeDescriptions() {
   return [
     "GET /health",
     "GET /capabilities",
+    "POST /jobs/:jobId/assets",
+    "GET /jobs/:jobId/video",
+    "DELETE /jobs/:jobId/video",
+    "GET /ws/jobs/:jobId",
     "POST /generate",
     "GET /status/:backend/:jobId",
     "POST /cancel/:backend/:jobId",
@@ -1615,6 +1642,38 @@ async function streamVideo(request, env, jobId) {
   }
 
   return new Response(object.body, { status: 200, headers: responseHeaders });
+}
+
+/**
+ * Delete one job's output from R2.
+ *
+ * Scoped by construction: the key is derived from the job id through outputKey(), so there
+ * is no way to name an arbitrary object. There is deliberately no generic "delete this key"
+ * primitive anywhere in this Worker - the only deletable object is the one this job owns.
+ *
+ * Idempotent. R2's delete does not fail on a missing key, and the job is marked deleted
+ * either way, so repeated calls return the same answer. That matters because a retry after
+ * a dropped connection must not look like an error.
+ *
+ * The generation itself stays COMPLETED. Removing an artefact afterwards is not a
+ * retrospective failure of the job that produced it.
+ */
+async function deleteVideo(env, headers, jobId) {
+  const bucket = requireBucket(env);
+  const key = outputKey(jobId); // throws 400 on a malformed id, before touching R2
+
+  await bucket.delete(key);
+
+  // Record it so /status stops advertising a URL that would now 404.
+  try {
+    await pushJobState(env, jobId, { video: { key, deleted: true } });
+  } catch (error) {
+    // The object is gone either way; a channel that cannot be updated must not turn a
+    // successful deletion into a failure the caller will retry forever.
+    console.warn(`Deleted ${key} but could not update its channel: ${error?.message || error}`);
+  }
+
+  return json({ id: jobId, deleted: true }, 200, headers);
 }
 
 async function openJobSocket(request, env, jobId) {
@@ -1951,11 +2010,14 @@ export function publicEvent(state) {
   const phase = state.phase || "queued";
 
   if (phase === "completed") {
-    return {
-      type: "completed",
-      jobId: state.jobId,
-      video: state.video ? { url: `/jobs/${state.jobId}/video`, key: state.video.key } : undefined
-    };
+    let video;
+    if (state.video?.deleted) {
+      // Deleted outputs are reported as such rather than as a URL that would 404.
+      video = { deleted: true };
+    } else if (state.video) {
+      video = { url: `/jobs/${state.jobId}/video`, key: state.video.key, deleted: false };
+    }
+    return { type: "completed", jobId: state.jobId, video };
   }
   if (phase === "failed") {
     return {
@@ -1984,6 +2046,24 @@ function jobChannel(env, jobId) {
     throw new HttpError(500, "Missing Durable Object binding: JOB_CHANNEL");
   }
   return env.JOB_CHANNEL.get(env.JOB_CHANNEL.idFromName(safeJobSegment(jobId)));
+}
+
+/**
+ * Has this job's output been deleted?
+ *
+ * Reads the Durable Object rather than probing R2: the DO is the record of intent, and a
+ * missing object could equally mean the upload never happened. Any failure answers "not
+ * deleted", so a channel problem degrades to the previous behaviour instead of hiding a
+ * video that is really there.
+ */
+async function isVideoDeleted(env, jobId) {
+  try {
+    const response = await jobChannel(env, jobId).fetch(new Request("https://do/state"));
+    const state = await response.json();
+    return Boolean(state?.video?.deleted);
+  } catch {
+    return false;
+  }
 }
 
 async function pushJobState(env, jobId, update) {
