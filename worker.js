@@ -176,7 +176,7 @@ export default {
       const segments = splitPath(url.pathname);
 
       if (request.method === "POST" && isExactRoute(segments, "generate")) {
-        return await generateVideo(request, env, headers);
+        return await generateVideo(request, env, headers, url);
       }
 
       if (request.method === "GET" && segments[0] === "status") {
@@ -892,7 +892,8 @@ function describeCapabilities() {
  * Routes
  * ---------------------------------------------------------------------------------- */
 
-async function generateVideo(request, env, headers) {
+// `url` is needed for the callback origin, so it is passed in rather than re-parsed.
+async function generateVideo(request, env, headers, url) {
   const body = await readJsonObject(request);
   const backend = resolveRequestedBackend(body);
   const config = getRunPodConfig(backend, env);
