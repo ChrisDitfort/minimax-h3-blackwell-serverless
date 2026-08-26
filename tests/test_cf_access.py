@@ -134,5 +134,53 @@ class CloudflareAccessHeaderTest(unittest.TestCase):
         self.assertEqual(reporter.failed, 1)
 
 
+class UnresolvedSecretReferenceTest(unittest.TestCase):
+    """RunPod passes {{ RUNPOD_SECRET_x }} through literally when no such secret exists.
+
+    The variable then looks set, so the handler would happily send a template string as a
+    credential and Cloudflare Access would reject it - indistinguishable, from inside the
+    container, from a real token being refused. These pin down that it is named instead.
+    """
+
+    def setUp(self) -> None:
+        self._id = handler.CF_ACCESS_CLIENT_ID
+        self._secret = handler.CF_ACCESS_CLIENT_SECRET
+
+    def tearDown(self) -> None:
+        handler.CF_ACCESS_CLIENT_ID = self._id
+        handler.CF_ACCESS_CLIENT_SECRET = self._secret
+
+    def test_detects_the_placeholder(self):
+        self.assertTrue(
+            handler._is_unresolved_secret_reference("{{ RUNPOD_SECRET_CLOUDFLARE_ACCESS_KEY_ID }}")
+        )
+        self.assertTrue(handler._is_unresolved_secret_reference("  {{ RUNPOD_SECRET_X }}  "))
+
+    def test_does_not_flag_a_real_token(self):
+        self.assertFalse(handler._is_unresolved_secret_reference("abcdef1234567890.access"))
+        self.assertFalse(handler._is_unresolved_secret_reference(""))
+        self.assertFalse(handler._is_unresolved_secret_reference("{{ not closed"))
+
+    def test_no_headers_are_sent_for_an_unresolved_reference(self):
+        """Sending a template string as a credential is worse than sending nothing."""
+        handler.CF_ACCESS_CLIENT_ID = "{{ RUNPOD_SECRET_CLOUDFLARE_ACCESS_KEY_ID }}"
+        handler.CF_ACCESS_CLIENT_SECRET = "{{ RUNPOD_SECRET_CLOUDFLARE_SECRET_ACCESS_KEY }}"
+        self.assertEqual(handler.cloudflare_access_headers(), {})
+
+    def test_the_error_names_the_unresolved_reference(self):
+        handler.CF_ACCESS_CLIENT_ID = "{{ RUNPOD_SECRET_CLOUDFLARE_ACCESS_KEY_ID }}"
+        handler.CF_ACCESS_CLIENT_SECRET = "{{ RUNPOD_SECRET_CLOUDFLARE_SECRET_ACCESS_KEY }}"
+
+        message = handler._describe_non_2xx(
+            types.SimpleNamespace(
+                status_code=302,
+                headers={"Location": "https://x.cloudflareaccess.com/cdn-cgi/access/login/y"},
+                text="",
+            )
+        )
+        self.assertIn("UNRESOLVED RunPod secret reference", message)
+        self.assertIn("Settings -> Secrets", message)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

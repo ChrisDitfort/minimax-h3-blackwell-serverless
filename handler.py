@@ -210,6 +210,17 @@ def _describe_non_2xx(response) -> str:
             # State whether we even sent a token. "Rejected" and "never sent" produce
             # the identical 302, and the startup line that distinguishes them scrolls out
             # of RunPod's log window - so the answer belongs in the error itself.
+            if _is_unresolved_secret_reference(CF_ACCESS_CLIENT_ID) or (
+                _is_unresolved_secret_reference(CF_ACCESS_CLIENT_SECRET)
+            ):
+                return (
+                    f"HTTP {status} to a Cloudflare Access login page. The Access service "
+                    "token is an UNRESOLVED RunPod secret reference - the value is still "
+                    "the literal '{{ RUNPOD_SECRET_... }}' placeholder, so no real "
+                    "credential was sent. Create account-level secrets with those exact "
+                    "names under RunPod Settings -> Secrets, or replace the reference with "
+                    "the value itself."
+                )
             if not (CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET):
                 which = []
                 if not CF_ACCESS_CLIENT_ID:
@@ -276,8 +287,26 @@ def log_callback_configuration() -> None:
         )
 
 
+def _is_unresolved_secret_reference(value: str) -> bool:
+    """True if the value is a RunPod secret reference that never got substituted.
+
+    RunPod env values may be written as {{ RUNPOD_SECRET_<name> }}. If no account-level
+    secret of that name exists, RunPod passes the literal braces through instead of
+    failing - so the variable looks set, the handler sends it as a header, and Cloudflare
+    Access rejects a credential that is really a template string. Worth naming explicitly,
+    because "configured but wrong" and "configured correctly" are otherwise identical from
+    inside the container.
+    """
+    text = (value or "").strip()
+    return text.startswith("{{") and text.endswith("}}")
+
+
 def cloudflare_access_headers() -> dict:
-    """Service-token headers for Cloudflare Access, or {} when not configured."""
+    """Service-token headers for Cloudflare Access, or {} when not usably configured."""
+    if _is_unresolved_secret_reference(CF_ACCESS_CLIENT_ID) or _is_unresolved_secret_reference(
+        CF_ACCESS_CLIENT_SECRET
+    ):
+        return {}
     if CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET:
         return {
             "CF-Access-Client-Id": CF_ACCESS_CLIENT_ID,
