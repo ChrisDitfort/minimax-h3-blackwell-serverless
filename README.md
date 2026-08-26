@@ -132,7 +132,8 @@ The worker logs its GPU stack before accepting jobs. Expect:
 [handler] torch.cuda.get_device_name(0)       = NVIDIA RTX PRO 6000 Blackwell Server Edition
 [handler] torch.cuda.get_device_capability(0) = (12, 0)
 [handler] COMFY_SAGE_ATTENTION3 = 1
-[handler] sageattn3 available, version 1.0.0
+[handler] sageattn3 present, version 1.0.0
+[handler] SageAttention3 enabled: GPU capability (12, 0) matches the wheel (12.0).
 ```
 
 and from ComfyUI itself:
@@ -143,6 +144,26 @@ Using SageAttention3
 
 A capability below `(12, 0)` or a non-CUDA-13 torch is logged as a `WARNING` — it means the
 wrong GPU was scheduled, not that the image is wrong.
+
+### If a non-Blackwell GPU gets scheduled
+
+The `sageattn3` wheel in the base image is compiled for one compute capability (`sm_120`).
+It *imports* fine on any GPU — the mismatch only surfaces at generation time, as
+`no kernel image is available for execution on the device` on **every** attention call,
+which floods the log and silently falls back to PyTorch attention for the whole run.
+
+So the worker checks the capability it was actually scheduled and turns SageAttention3 off
+up front when it does not match, letting ComfyUI choose its own backend cleanly:
+
+```
+[handler] WARNING: SageAttention3 was built for compute capability 12.0 but this worker
+          was scheduled a 9.0 GPU. Disabling it - ...
+[handler]   This is a GPU scheduling problem: pin the RunPod endpoint to an
+          RTX PRO 6000 Blackwell to get SageAttention3. Generation still works without it.
+```
+
+Seeing this means the endpoint is not pinned to Blackwell. Generation still succeeds, just
+slower. Fix it in the endpoint's GPU selection rather than in the image.
 
 ## Request schema
 
@@ -457,6 +478,8 @@ mp4 = AESGCM(dek).decrypt(
 | `COMFY_STARTUP_TIMEOUT` | `600` | Seconds to wait for ComfyUI readiness |
 | `COMFY_EXTRA_ARGS` | *(empty)* | Extra ComfyUI CLI arguments |
 | `COMFY_SAGE_ATTENTION3` | `1` (from base) | `0` disables SageAttention3 if it destabilises |
+| `H3_SAGE_AUTODETECT` | `1` | Auto-disable SageAttention3 when the scheduled GPU is not the capability the wheel was built for. `0` forces `COMFY_SAGE_ATTENTION3` through unchecked |
+| `SAGE_SUPPORTED_CC` | `12.0` (from base) | Compute capability the `sageattn3` wheel was compiled for |
 | `H3_JOB_TIMEOUT` | `3000` | Max seconds for one workflow |
 | `H3_WS_RECV_TIMEOUT` | `30` | Websocket recv timeout (timeouts are normal) |
 | `H3_EAGER_START` | `1` | Start ComfyUI during cold start, not the first job |

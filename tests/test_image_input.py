@@ -75,7 +75,11 @@ def image_to_video_workflow() -> dict:
 
 class ImageInputTestCase(unittest.TestCase):
     def setUp(self) -> None:
-        self.input_dir = _TEST_INPUT_DIR
+        # handler.py resolves its directories once, at import. If another test module
+        # imported it first, that module's scratch dir is the one staging actually uses,
+        # so read it back off handler rather than assuming _TEST_INPUT_DIR won the race.
+        self.input_dir = handler.COMFY_INPUT_DIR
+        os.makedirs(self.input_dir, exist_ok=True)
         for name in os.listdir(self.input_dir):
             os.remove(os.path.join(self.input_dir, name))
         self._original_max_bytes = handler.MAX_IMAGE_BYTES

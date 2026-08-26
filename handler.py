@@ -124,26 +124,91 @@ def log_torch_environment() -> None:
         log(f"WARNING: GPU probe failed: {error}")
 
 
-def log_attention_backend() -> None:
-    """Report whether SageAttention3 will be used, without changing the outcome."""
-    sage3 = os.environ.get("COMFY_SAGE_ATTENTION3", "0") == "1"
-    log(f"COMFY_SAGE_ATTENTION3 = {os.environ.get('COMFY_SAGE_ATTENTION3', '<unset>')}")
-    if not sage3:
+def _device_capability() -> tuple[int, int] | None:
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return None
+        return torch.cuda.get_device_capability(0)
+    except Exception:
+        return None
+
+
+def build_comfy_env() -> dict:
+    """Return the environment for the ComfyUI subprocess, with attention backend resolved.
+
+    The sageattn3 wheel in the base image is compiled for a single compute capability
+    (SAGE_SUPPORTED_CC, 12.0 / Blackwell). Importing it succeeds on any GPU, so import
+    alone proves nothing - the failure only appears when a kernel is launched, as
+    `cudaErrorNoKernelImageForDevice` on *every* attention call. That floods the log and
+    silently falls back to PyTorch attention for the whole run.
+
+    So if the scheduled GPU is not the capability the wheel was built for, turn
+    SageAttention3 off up front. ComfyUI then picks its own backend cleanly. Set
+    H3_SAGE_AUTODETECT=0 to force whatever COMFY_SAGE_ATTENTION3 says instead.
+    """
+    env = os.environ.copy()
+    requested = env.get("COMFY_SAGE_ATTENTION3", "0") == "1"
+    log(f"COMFY_SAGE_ATTENTION3 = {env.get('COMFY_SAGE_ATTENTION3', '<unset>')}")
+
+    if not requested:
         log("SageAttention3 disabled by env; ComfyUI will pick its default attention backend.")
-        return
+        return env
+
+    try:
+        import sageattn3  # noqa: F401
+    except Exception as error:
+        # ComfyUI's sage3 patch raises at import if the package is missing, which would
+        # stop ComfyUI booting at all. Disable rather than let that happen.
+        log(f"WARNING: sageattn3 is unusable ({error}); disabling SageAttention3.")
+        env["COMFY_SAGE_ATTENTION3"] = "0"
+        return env
+
+    # Version lookup is a separate, best-effort step on purpose. It keys off the
+    # *distribution* name, which need not match the module name, and a wheel installed
+    # without dist-info has no metadata at all - so a lookup failure says nothing about
+    # whether the backend works. Folding it into the import check above would disable
+    # SageAttention3 on a perfectly good Blackwell card over a missing version string.
     try:
         import importlib.metadata
 
-        import sageattn3  # noqa: F401
+        log(f"sageattn3 present, version {importlib.metadata.version('sageattn3')}")
+    except Exception:
+        log("sageattn3 present (version metadata unavailable)")
 
-        log(f"sageattn3 available, version {importlib.metadata.version('sageattn3')}")
-    except Exception as error:
-        # ComfyUI's sage3 patch raises on import if the package is missing, so surface it
-        # here first with a clear remedy rather than as an opaque ComfyUI stack trace.
+    if env.get("H3_SAGE_AUTODETECT", "1") != "1":
+        log("H3_SAGE_AUTODETECT=0; leaving SageAttention3 enabled without a capability check.")
+        return env
+
+    capability = _device_capability()
+    if capability is None:
+        log("WARNING: could not read GPU capability; leaving SageAttention3 as configured.")
+        return env
+
+    supported = env.get("SAGE_SUPPORTED_CC", "12.0")
+    try:
+        supported_major = int(float(supported))
+    except ValueError:
+        supported_major = 12
+
+    if capability[0] != supported_major:
         log(
-            f"ERROR: COMFY_SAGE_ATTENTION3=1 but sageattn3 is unusable ({error}). "
-            "ComfyUI will refuse to start. Set COMFY_SAGE_ATTENTION3=0 to fall back."
+            f"WARNING: SageAttention3 was built for compute capability {supported} but this "
+            f"worker was scheduled a {capability[0]}.{capability[1]} GPU. Disabling it - "
+            "otherwise every attention call fails with "
+            "'no kernel image is available for execution on the device' and falls back to "
+            "PyTorch attention anyway, one error per call."
         )
+        log(
+            "  This is a GPU scheduling problem: pin the RunPod endpoint to an "
+            "RTX PRO 6000 Blackwell to get SageAttention3. Generation still works without it."
+        )
+        env["COMFY_SAGE_ATTENTION3"] = "0"
+    else:
+        log(f"SageAttention3 enabled: GPU capability {capability} matches the wheel ({supported}).")
+
+    return env
 
 
 # --------------------------------------------------------------------------------------
@@ -204,7 +269,9 @@ def start_comfyui() -> None:
             command.extend(extra_args)
 
             log(f"Starting ComfyUI: {' '.join(command)} (cwd={COMFY_DIR})")
-            _comfy_process = subprocess.Popen(command, cwd=COMFY_DIR)
+            # Resolved here, not at import: the GPU is only knowable once the worker is
+            # actually placed on a host.
+            _comfy_process = subprocess.Popen(command, cwd=COMFY_DIR, env=build_comfy_env())
 
         deadline = time.monotonic() + COMFY_STARTUP_TIMEOUT
         while time.monotonic() < deadline:
@@ -1131,7 +1198,6 @@ def main() -> None:
     log("=== MiniMax H3 Blackwell serverless worker starting ===")
     log(f"COMFY_DIR = {COMFY_DIR}")
     log_torch_environment()
-    log_attention_backend()
 
     # Fail fast on misconfigured output storage rather than at the end of a paid 5-minute
     # generation. Validates R2 credentials and the key-wrapping key at boot.
