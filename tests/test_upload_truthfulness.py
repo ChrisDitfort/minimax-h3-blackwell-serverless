@@ -70,10 +70,47 @@ class StatusCodeSemanticsTest(unittest.TestCase):
         for status in (301, 302, 303, 307, 308, 400, 401, 403, 500):
             self.assertFalse(handler._is_2xx(response(status)), status)
 
-    def test_access_redirect_is_named_in_the_error(self):
-        message = handler._describe_non_2xx(response(302, headers={"Location": ACCESS_LOGIN}))
+    def test_access_redirect_says_no_token_was_sent_when_none_is_configured(self):
+        """"Rejected" and "never sent" are the same 302. The error must distinguish them.
+
+        The startup line that used to carry this scrolls out of RunPod's log window, so
+        the answer has to travel with the error itself.
+        """
+        saved = (handler.CF_ACCESS_CLIENT_ID, handler.CF_ACCESS_CLIENT_SECRET)
+        handler.CF_ACCESS_CLIENT_ID = ""
+        handler.CF_ACCESS_CLIENT_SECRET = ""
+        try:
+            message = handler._describe_non_2xx(response(302, headers={"Location": ACCESS_LOGIN}))
+        finally:
+            handler.CF_ACCESS_CLIENT_ID, handler.CF_ACCESS_CLIENT_SECRET = saved
+
         self.assertIn("Cloudflare Access", message)
-        self.assertIn(".access", message, "the error should say what a valid client id looks like")
+        self.assertIn("NO Access service token was sent", message)
+        self.assertIn("configuration problem", message)
+
+    def test_access_redirect_says_the_token_was_rejected_when_one_is_configured(self):
+        saved = (handler.CF_ACCESS_CLIENT_ID, handler.CF_ACCESS_CLIENT_SECRET)
+        handler.CF_ACCESS_CLIENT_ID = "abcdef1234567890.access"
+        handler.CF_ACCESS_CLIENT_SECRET = "secret"
+        try:
+            message = handler._describe_non_2xx(response(302, headers={"Location": ACCESS_LOGIN}))
+        finally:
+            handler.CF_ACCESS_CLIENT_ID, handler.CF_ACCESS_CLIENT_SECRET = saved
+
+        self.assertIn("WAS sent", message)
+        self.assertIn("Service Auth policy", message)
+        self.assertNotIn("secret", message, "the secret must never appear in an error")
+
+    def test_a_half_configured_token_names_the_missing_half(self):
+        saved = (handler.CF_ACCESS_CLIENT_ID, handler.CF_ACCESS_CLIENT_SECRET)
+        handler.CF_ACCESS_CLIENT_ID = "abcdef1234567890.access"
+        handler.CF_ACCESS_CLIENT_SECRET = ""
+        try:
+            message = handler._describe_non_2xx(response(302, headers={"Location": ACCESS_LOGIN}))
+        finally:
+            handler.CF_ACCESS_CLIENT_ID, handler.CF_ACCESS_CLIENT_SECRET = saved
+
+        self.assertIn("secret is missing", message)
 
     def test_other_redirects_are_described_without_blaming_access(self):
         message = handler._describe_non_2xx(

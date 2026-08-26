@@ -207,11 +207,27 @@ def _describe_non_2xx(response) -> str:
     location = (getattr(response, "headers", None) or {}).get("Location", "") or ""
     if status in (301, 302, 303, 307, 308):
         if "cloudflareaccess.com" in location or "/cdn-cgi/access/login" in location:
+            # State whether we even sent a token. "Rejected" and "never sent" produce
+            # the identical 302, and the startup line that distinguishes them scrolls out
+            # of RunPod's log window - so the answer belongs in the error itself.
+            if not (CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET):
+                which = []
+                if not CF_ACCESS_CLIENT_ID:
+                    which.append("client id")
+                if not CF_ACCESS_CLIENT_SECRET:
+                    which.append("secret")
+                return (
+                    f"HTTP {status} to a Cloudflare Access login page, and NO Access "
+                    f"service token was sent because the {' and '.join(which)} is missing "
+                    "from this container's environment. Set CLOUDFLARE_ACCESS_KEY_ID and "
+                    "CLOUDFLARE_SECRET_ACCESS_KEY on the RunPod endpoint. This is a "
+                    "configuration problem, not an Access policy problem."
+                )
             return (
-                f"HTTP {status} to a Cloudflare Access login page. The Access service token "
-                "was not accepted - check CLOUDFLARE_ACCESS_KEY_ID / "
-                "CLOUDFLARE_SECRET_ACCESS_KEY hold an Access service token (client id ends "
-                "in '.access') and that a Service Auth policy allows it."
+                f"HTTP {status} to a Cloudflare Access login page. An Access service token "
+                f"WAS sent (client id {CF_ACCESS_CLIENT_ID[:6]}...{CF_ACCESS_CLIENT_ID[-8:]}) "
+                "and Access rejected it. Check the token is valid and that a Service Auth "
+                "policy on this application allows it."
             )
         return f"HTTP {status} redirect to {location[:120]!r}"
     body = str(getattr(response, "text", "") or "")[:200]
