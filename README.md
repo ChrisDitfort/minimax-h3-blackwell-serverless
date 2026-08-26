@@ -528,6 +528,16 @@ Two traps worth knowing, both of which have bitten this code:
   The same `workerId` across runs is the tell. Releasing a new endpoint version forces
   fresh workers.
 
+* **A RunPod secret reference that never resolved.** Endpoint values may be written as
+  `{{ RUNPOD_SECRET_<name> }}`. If no account-level secret of that name exists under
+  RunPod Settings -> Secrets, RunPod passes the literal braces through rather than
+  failing. The variable then looks set, the handler sends a template string as a
+  credential, and Cloudflare Access rejects it - identical, from inside the container, to
+  a real token being refused. This is what actually broke the first working deployment,
+  and it survived several rounds of checking the Access policy, the paths and the
+  variable names, all of which were correct. The handler now treats such a value as
+  unconfigured and names it in the error.
+
 **R2 is the ground truth.** A status response can only report what the handler believed;
 the object either exists or it does not:
 
