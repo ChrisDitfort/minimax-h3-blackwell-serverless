@@ -167,17 +167,27 @@ PHASE_CANCELLED = "cancelled"
 #
 # Set CF_ACCESS_CLIENT_ID / CF_ACCESS_CLIENT_SECRET on the RunPod endpoint. Left unset,
 # the headers are simply omitted, which is correct for a Worker not behind Access.
-# CLOUDFLARE_ACCESS_KEY_ID / CLOUDFLARE_SECRET_ACCESS_KEY are accepted as aliases. Note
-# those names conventionally mean R2's *S3-API* credentials, which are a different thing
-# and will not get past Access - what belongs here is an Access **service token** from
-# Zero Trust -> Access -> Service Auth.
+# Three spellings are accepted, in this order:
+#
+#   CF_ACCESS_CLIENT_ID / CF_ACCESS_CLIENT_SECRET
+#   CLOUDFLARE_ACCESS_CLIENT_ID / CLOUDFLARE_ACCESS_CLIENT_SECRET   <- Cloudflare's own
+#       convention; wrangler asks for exactly these names when it hits an Access-protected
+#       host, so this is the spelling to prefer.
+#   CLOUDFLARE_ACCESS_KEY_ID / CLOUDFLARE_SECRET_ACCESS_KEY
+#
+# The third pair is accepted only because it is easy to reach for, but be careful: those
+# names conventionally mean R2's *S3-API* credentials, which are a completely different
+# credential and will not get past Access. What belongs in all three is an Access
+# **service token** from Zero Trust -> Access -> Service Auth.
 CF_ACCESS_CLIENT_ID = (
     os.environ.get("CF_ACCESS_CLIENT_ID")
+    or os.environ.get("CLOUDFLARE_ACCESS_CLIENT_ID")
     or os.environ.get("CLOUDFLARE_ACCESS_KEY_ID")
     or ""
 ).strip()
 CF_ACCESS_CLIENT_SECRET = (
     os.environ.get("CF_ACCESS_CLIENT_SECRET")
+    or os.environ.get("CLOUDFLARE_ACCESS_CLIENT_SECRET")
     or os.environ.get("CLOUDFLARE_SECRET_ACCESS_KEY")
     or ""
 ).strip()
