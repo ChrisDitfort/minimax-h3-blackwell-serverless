@@ -1,0 +1,68 @@
+# Cloudflare Worker configuration for the MiniMax H3 API.
+#
+# ============================================================================
+#  THREE VALUES BELOW ARE PLACEHOLDERS AND MUST BE REPLACED BEFORE DEPLOYING.
+#  They are marked REPLACE-ME. They are deployment facts that cannot be
+#  derived from this repository, so they are left obviously wrong rather than
+#  guessed - a plausible-looking wrong bucket name would deploy and then fail
+#  at runtime, which is worse than refusing to deploy.
+#
+#    1. name         - the Worker's name in your account
+#    2. account_id   - `npx wrangler whoami`
+#    3. bucket_name  - `npx wrangler r2 bucket list`
+#
+#  Everything else here is complete and needs no edits.
+# ============================================================================
+
+name = "REPLACE-ME-worker-name"
+main = "worker.js"
+compatibility_date = "2026-08-01"
+
+# Needed for the Durable Object WebSocket hibernation API used by JobChannel.
+compatibility_flags = ["nodejs_compat"]
+
+account_id = "REPLACE-ME-account-id"
+
+# --- R2 -------------------------------------------------------------------
+# The binding name MEDIA_BUCKET is referenced by worker.js (requireBucket).
+# Keep the binding as-is and set bucket_name to your real bucket.
+[[r2_buckets]]
+binding = "MEDIA_BUCKET"
+bucket_name = "REPLACE-ME-bucket-name"
+
+# --- Durable Objects ------------------------------------------------------
+# One JobChannel instance per job id holds realtime state and fans progress
+# out to connected WebSockets.
+[[durable_objects.bindings]]
+name = "JOB_CHANNEL"
+class_name = "JobChannel"
+
+# SQLite-backed DO classes are available on the free plan; new_sqlite_classes
+# is the correct migration for a first deployment. If this Worker already has
+# DO migrations applied, bump the tag instead of reusing v1.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["JobChannel"]
+
+# --- Plain vars -----------------------------------------------------------
+[vars]
+# Lifetime of the job-scoped callback tokens handed to RunPod. Long enough to
+# cover a slow cold start plus a full generation, short enough that a leaked
+# token is not useful for long.
+JOB_TOKEN_TTL_SECONDS = "3600"
+
+# Optional. Set this if the Worker is reached through a custom domain, so the
+# callback URLs handed to RunPod point at the public hostname rather than
+# whichever origin the request happened to arrive on.
+# PUBLIC_BASE_URL = "https://api.example.com"
+
+# --- Secrets (set with `npx wrangler secret put <NAME>`, never committed) ---
+#
+#   JOB_TOKEN_SECRET             required. HMAC key for job-scoped tokens.
+#                                Generate with:
+#                                  node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))"
+#
+#   RUNPOD_API_KEY               existing
+#   RUNPOD_ENDPOINT_ID           existing
+#   RUNPOD_BLACKWELL_API_KEY     existing (optional; falls back to RUNPOD_API_KEY)
+#   RUNPOD_BLACKWELL_ENDPOINT_ID existing

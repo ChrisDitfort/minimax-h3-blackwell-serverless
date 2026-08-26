@@ -118,24 +118,11 @@ const MODES = Object.freeze({
   text_to_video: Object.freeze({ implemented: true, firstFrame: false, lastFrame: false }),
   first_frame_to_video: Object.freeze({ implemented: true, firstFrame: true, lastFrame: false }),
 
-  // Needs handler.py to stage more than one image; see README.
-  last_frame_to_video: Object.freeze({
-    implemented: false,
-    firstFrame: false,
-    lastFrame: true,
-    reason:
-      "The RunPod handler currently stages exactly one input image, and attaches it to " +
-      "the loader feeding first_frame. Last-frame conditioning needs a handler change " +
-      "and an image rebuild."
-  }),
-
+  last_frame_to_video: Object.freeze({ implemented: true, firstFrame: false, lastFrame: true }),
   first_last_frame_to_video: Object.freeze({
-    implemented: false,
+    implemented: true,
     firstFrame: true,
-    lastFrame: true,
-    reason:
-      "The RunPod handler currently stages exactly one input image. Two keyframes need " +
-      "a handler change and an image rebuild."
+    lastFrame: true
   }),
 
   reference: Object.freeze({
@@ -194,7 +181,7 @@ export default {
 
       if (request.method === "GET" && segments[0] === "status") {
         const { backend, jobId } = parseJobRoute(segments, url, "status");
-        return await getJobStatus(backend, jobId, env, headers);
+        return await getJobStatus(backend, jobId, env, headers, url);
       }
 
       if (request.method === "POST" && segments[0] === "cancel") {
@@ -210,6 +197,58 @@ export default {
        */
       if (request.method === "GET" && isExactRoute(segments, "capabilities")) {
         return json(describeCapabilities(), 200, headers);
+      }
+
+      // POST /jobs/:jobId/assets  - upload an input keyframe
+      if (
+        request.method === "POST" &&
+        segments.length === 3 &&
+        segments[0] === "jobs" &&
+        segments[2] === "assets"
+      ) {
+        return await uploadAsset(request, env, headers, segments[1], url);
+      }
+
+      // GET /jobs/:jobId/video  - stream the finished MP4 out of R2
+      if (
+        request.method === "GET" &&
+        segments.length === 3 &&
+        segments[0] === "jobs" &&
+        segments[2] === "video"
+      ) {
+        return await streamVideo(request, env, segments[1]);
+      }
+
+      // GET /ws/jobs/:jobId  - realtime progress
+      if (
+        request.method === "GET" &&
+        segments.length === 3 &&
+        segments[0] === "ws" &&
+        segments[1] === "jobs"
+      ) {
+        return await openJobSocket(request, env, segments[2]);
+      }
+
+      // --- internal, RunPod -> Cloudflare. All HMAC-gated, all job-scoped. ---
+
+      if (
+        segments[0] === "internal" &&
+        segments[1] === "jobs" &&
+        segments.length >= 4
+      ) {
+        const jobId = segments[2];
+
+        if (request.method === "POST" && segments[3] === "progress" && segments.length === 4) {
+          return await receiveProgress(request, env, headers, jobId);
+        }
+
+        if (request.method === "PUT" && segments[3] === "output" && segments.length === 4) {
+          return await receiveOutput(request, env, headers, jobId);
+        }
+
+        if (request.method === "GET" && segments[3] === "assets" && segments.length === 5) {
+          return await serveAsset(request, env, jobId, segments[4]);
+        }
       }
 
       if (request.method === "GET" && isExactRoute(segments, "health")) {
@@ -612,19 +651,30 @@ export function normalizeAsset(value, fieldName) {
 
   const hasUrl = hasNonEmptyValue(value.url);
   const hasKey = hasNonEmptyValue(value.r2_key);
+  const hasAssetId = hasNonEmptyValue(value.asset_id);
   const hasBase64 = hasNonEmptyValue(value.base64);
 
-  if ([hasUrl, hasKey, hasBase64].filter(Boolean).length > 1) {
-    throw new HttpError(400, `${fieldName} must specify exactly one of url, r2_key or base64`);
+  if ([hasUrl, hasKey || hasAssetId, hasBase64].filter(Boolean).length > 1) {
+    throw new HttpError(
+      400,
+      `${fieldName} must specify exactly one of url, r2_key/asset_id or base64`
+    );
+  }
+
+  if (hasAssetId) {
+    return { kind: "r2", value: String(value.asset_id).trim() };
   }
 
   if (hasKey) {
-    validateR2Key(String(value.r2_key), fieldName);
-    throw new HttpError(
-      501,
-      `${fieldName}.r2_key is not deliverable yet: this Worker has no R2 binding. ` +
-        `Use ${fieldName}.url with an https URL, or see README 'R2 status'.`
-    );
+    // Validated, then reduced to its asset id: RunPod is handed a route, never a key, so
+    // it can never address an arbitrary object in the bucket.
+    const key = validateR2Key(String(value.r2_key), fieldName);
+    const base = key.split("/").pop() || "";
+    const assetId = base.replace(/\.[A-Za-z0-9]+$/, "");
+    if (!assetId) {
+      throw new HttpError(400, `${fieldName}.r2_key has no usable asset name`);
+    }
+    return { kind: "r2", value: assetId };
   }
 
   if (hasBase64) {
@@ -850,6 +900,22 @@ async function generateVideo(request, env, headers) {
   const settings = normalizeRequest(body);
   const workflow = buildWorkflowForSettings(settings);
 
+  /*
+   * Our own job id, minted before submission because the callback tokens have to be
+   * inside the payload we are about to send. RunPod's id is kept separately so the
+   * existing /status/:id and /cancel/:id routes keep working untouched.
+   */
+  const jobId = crypto.randomUUID();
+  const callbacks = env.JOB_TOKEN_SECRET
+    ? await buildCallbackBlocks(env, jobId, url.origin, settings)
+    : null;
+
+  if (!callbacks) {
+    // Worth saying out loud rather than silently degrading to a job with no realtime
+    // channel and no R2 output.
+    console.warn("JOB_TOKEN_SECRET is unset: progress callbacks and R2 output are disabled");
+  }
+
   const runpodUrl = `https://api.runpod.ai/v2/${config.endpointId}/run`;
 
   const response = await fetch(runpodUrl, {
@@ -859,7 +925,7 @@ async function generateVideo(request, env, headers) {
       Authorization: `Bearer ${config.apiKey}`
     },
     body: JSON.stringify({
-      input: buildRunPodInput(backend, workflow, settings),
+      input: buildRunPodInput(backend, workflow, settings, callbacks),
       policy: { executionTimeout: 600000, ttl: 1800000 }
     })
   });
@@ -891,10 +957,27 @@ async function generateVideo(request, env, headers) {
   const encodedBackend = encodeURIComponent(backend);
   const encodedJobId = encodeURIComponent(data.id);
 
+  // Seed the realtime channel so a client connecting before the worker starts still gets
+  // a sensible first frame instead of an empty state.
+  if (callbacks) {
+    try {
+      await pushJobState(env, jobId, {
+        status: data.status ?? "IN_QUEUE",
+        phase: "queued",
+        percent: 0,
+        runpodId: data.id,
+        backend
+      });
+    } catch (error) {
+      console.warn(`Could not seed job channel: ${error?.message || error}`);
+    }
+  }
+
   return json(
     {
       backend,
       id: data.id,
+      jobId,
       status: data.status ?? null,
       seed: settings.seed,
       mode: settings.mode,
@@ -915,7 +998,9 @@ async function generateVideo(request, env, headers) {
 
       routes: {
         status: `/status/${encodedBackend}/${encodedJobId}`,
-        cancel: `/cancel/${encodedBackend}/${encodedJobId}`
+        cancel: `/cancel/${encodedBackend}/${encodedJobId}`,
+        events: `/ws/jobs/${encodeURIComponent(jobId)}`,
+        video: `/jobs/${encodeURIComponent(jobId)}/video`
       }
     },
     202,
@@ -923,7 +1008,56 @@ async function generateVideo(request, env, headers) {
   );
 }
 
-async function getJobStatus(backend, jobId, env, headers) {
+/**
+ * Mint the job-scoped blocks RunPod needs to call back in.
+ *
+ * Each token is bound to this job and one purpose, so the progress token cannot upload a
+ * video and the output token cannot read another job's assets. RunPod holds nothing
+ * permanent - the tokens expire on their own.
+ */
+async function buildCallbackBlocks(env, jobId, origin, settings) {
+  const secret = env.JOB_TOKEN_SECRET;
+  const ttl = Number(env.JOB_TOKEN_TTL_SECONDS || 3600);
+  const base = String(env.PUBLIC_BASE_URL || origin).replace(/\/+$/, "");
+
+  const blocks = {
+    progress: {
+      url: `${base}/internal/jobs/${jobId}/progress`,
+      token: await signJobToken(secret, jobId, TOKEN_PURPOSES.progress, ttl),
+      jobId
+    },
+    output: {
+      url: `${base}/internal/jobs/${jobId}/output`,
+      token: await signJobToken(secret, jobId, TOKEN_PURPOSES.output, ttl)
+    }
+  };
+
+  const assets = {};
+  for (const role of ["firstFrame", "lastFrame"]) {
+    const asset = settings[role];
+    if (!asset) continue;
+    const key = role === "firstFrame" ? "first_frame" : "last_frame";
+
+    if (asset.kind === "r2") {
+      assets[key] = {
+        url: `${base}/internal/jobs/${jobId}/assets/${asset.value}`,
+        token: await signJobToken(secret, jobId, TOKEN_PURPOSES.asset, ttl)
+      };
+    } else if (asset.kind === "url") {
+      assets[key] = { url: asset.value };
+    } else if (asset.kind === "base64") {
+      assets[key] = { base64: asset.value };
+    }
+  }
+
+  if (Object.keys(assets).length > 0) {
+    blocks.assets = assets;
+  }
+
+  return blocks;
+}
+
+async function getJobStatus(backend, jobId, env, headers, url) {
   const config = getRunPodConfig(backend, env);
   const runpodUrl = `https://api.runpod.ai/v2/${config.endpointId}/status/${encodeURIComponent(jobId)}`;
 
@@ -944,7 +1078,31 @@ async function getJobStatus(backend, jobId, env, headers) {
     });
   }
 
-  return json(addBackendToResult(backend, sanitizeRunPodResult(data)), 200, headers);
+  const result = addBackendToResult(backend, sanitizeRunPodResult(data));
+
+  /*
+   * Surface a playable route when the handler reported an R2-backed video. `?jobId=` is
+   * the Worker-side id from /generate; without it we cannot name the object, because the
+   * R2 key is keyed on our id rather than RunPod's.
+   *
+   * Note the base64 path is unchanged: sanitizeRunPodResult still strips it, exactly as
+   * before. This adds a way to get the video, it does not remove one.
+   */
+  const workerJobId = url?.searchParams.get("jobId");
+  const video = result?.output?.video;
+  if (workerJobId && video && typeof video === "object") {
+    try {
+      result.video = {
+        url: `/jobs/${encodeURIComponent(workerJobId)}/video`,
+        key: outputKey(workerJobId),
+        size: video.size
+      };
+    } catch {
+      /* an unusable job id simply means no video route is advertised */
+    }
+  }
+
+  return json(result, 200, headers);
 }
 
 async function cancelJob(backend, jobId, env, headers) {
@@ -976,19 +1134,26 @@ async function cancelJob(backend, jobId, env, headers) {
  * Keyframes ride along in the fields handler.py already understands (image_url /
  * image_base64), so no image rebuild is needed for the modes enabled here.
  */
-function buildRunPodInput(backend, workflow, settings) {
+function buildRunPodInput(backend, workflow, settings, callbacks) {
   switch (backend) {
     case "h3":
     case "h3-blackwell": {
       const input = { workflow };
 
-      if (settings?.firstFrame) {
-        if (settings.firstFrame.kind === "url") {
-          input.image_url = settings.firstFrame.value;
-        } else {
-          input.image_base64 = settings.firstFrame.value;
+      if (callbacks) {
+        input.progress = callbacks.progress;
+        input.output = callbacks.output;
+        if (callbacks.assets) {
+          // Tell the handler which loader node each keyframe belongs to, so it never has
+          // to infer it from graph shape.
+          input.assets = {};
+          for (const [role, asset] of Object.entries(callbacks.assets)) {
+            input.assets[role] = {
+              ...asset,
+              node_id: role === "first_frame" ? "first_frame_image" : "last_frame_image"
+            };
+          }
         }
-        input.image_node_id = "first_frame_image";
       }
 
       return input;
@@ -1344,5 +1509,466 @@ function json(data, status, headers) {
   return new Response(JSON.stringify(data, null, 2), { status, headers });
 }
 
-// Exported for tests. Cloudflare only uses the default export above.
+/* ------------------------------------------------------------------------------------
+ * Asset and video routes
+ * ---------------------------------------------------------------------------------- */
+
+async function uploadAsset(request, env, headers, jobId, url) {
+  const bucket = requireBucket(env);
+  const contentType = (request.headers.get("Content-Type") || "").split(";")[0].trim();
+
+  const extension = ASSET_CONTENT_TYPES[contentType];
+  if (!extension) {
+    throw new HttpError(
+      415,
+      `Unsupported Content-Type '${contentType || "(none)"}'. Allowed: ` +
+        Object.keys(ASSET_CONTENT_TYPES).join(", ")
+    );
+  }
+
+  const declared = Number(request.headers.get("Content-Length") || 0);
+  if (declared > MAX_ASSET_BYTES) {
+    throw new HttpError(413, `Asset exceeds the ${MAX_ASSET_BYTES}-byte limit`);
+  }
+
+  const assetId = url.searchParams.get("id") || "first-frame";
+  const key = inputKey(jobId, assetId, extension);
+
+  // Read once so the true size is known - Content-Length is a claim, not a fact.
+  const body = await request.arrayBuffer();
+  if (body.byteLength > MAX_ASSET_BYTES) {
+    throw new HttpError(413, `Asset exceeds the ${MAX_ASSET_BYTES}-byte limit`);
+  }
+
+  await bucket.put(key, body, { httpMetadata: { contentType } });
+
+  return json(
+    { asset: { id: assetId, key, contentType, size: body.byteLength } },
+    201,
+    headers
+  );
+}
+
+/**
+ * Stream the finished MP4 out of R2, with Range support so browsers can seek.
+ *
+ * The object body is handed to the Response directly and never read into a buffer, so
+ * Worker memory does not scale with video size.
+ */
+async function streamVideo(request, env, jobId) {
+  const bucket = requireBucket(env);
+  const key = outputKey(jobId);
+  const range = request.headers.get("Range");
+
+  const object = await bucket.get(key, range ? { range: request.headers } : undefined);
+
+  if (!object) {
+    return new Response(JSON.stringify({ error: "Video not found for this job" }), {
+      status: 404,
+      headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+    });
+  }
+
+  const responseHeaders = new Headers();
+  object.writeHttpMetadata(responseHeaders);
+  responseHeaders.set("Content-Type", "video/mp4");
+  responseHeaders.set("etag", object.httpEtag);
+  responseHeaders.set("Accept-Ranges", "bytes");
+  responseHeaders.set("Access-Control-Allow-Origin", "*");
+  // Immutable: a job's video never changes once written.
+  responseHeaders.set("Cache-Control", "private, max-age=3600, immutable");
+
+  if (object.range && object.size !== undefined) {
+    const offset = object.range.offset ?? 0;
+    const length = object.range.length ?? object.size - offset;
+    const end = offset + length - 1;
+    responseHeaders.set("Content-Range", `bytes ${offset}-${end}/${object.size}`);
+    return new Response(object.body, { status: 206, headers: responseHeaders });
+  }
+
+  return new Response(object.body, { status: 200, headers: responseHeaders });
+}
+
+async function openJobSocket(request, env, jobId) {
+  const stub = jobChannel(env, jobId);
+  return stub.fetch(new Request("https://do/ws", { headers: request.headers }));
+}
+
+/* ------------------------------------------------------------------------------------
+ * Internal routes (RunPod -> Cloudflare)
+ * ---------------------------------------------------------------------------------- */
+
+async function receiveProgress(request, env, headers, jobId) {
+  await verifyJobToken(env.JOB_TOKEN_SECRET, bearerToken(request), jobId, TOKEN_PURPOSES.progress);
+
+  const body = await readJsonObject(request);
+
+  // Only the fields the public protocol defines are persisted - RunPod cannot inject
+  // arbitrary keys into what clients receive.
+  const update = {};
+  for (const field of ["phase", "step", "steps", "percent", "error"]) {
+    if (body[field] !== undefined) update[field] = body[field];
+  }
+  if (update.phase === "completed" || update.phase === "failed") {
+    update.status = update.phase === "completed" ? "COMPLETED" : "FAILED";
+  }
+  if (body.video && typeof body.video === "object") {
+    update.video = { key: outputKey(jobId), size: body.video.size };
+  }
+
+  await pushJobState(env, jobId, update);
+  return json({ ok: true }, 200, headers);
+}
+
+async function receiveOutput(request, env, headers, jobId) {
+  await verifyJobToken(env.JOB_TOKEN_SECRET, bearerToken(request), jobId, TOKEN_PURPOSES.output);
+
+  const bucket = requireBucket(env);
+  const key = outputKey(jobId);
+
+  if (!request.body) {
+    throw new HttpError(400, "Expected a raw video/mp4 request body");
+  }
+
+  // The stream goes straight into R2: the video is never buffered in Worker memory, and
+  // the key comes from us, never from the uploader.
+  const object = await bucket.put(key, request.body, {
+    httpMetadata: { contentType: "video/mp4" }
+  });
+
+  const declaredSize = Number(request.headers.get("Content-Length") || 0);
+  const size = object?.size ?? (declaredSize > 0 ? declaredSize : undefined);
+
+  await pushJobState(env, jobId, { video: { key, size } });
+
+  return json({ key, size, url: `/jobs/${jobId}/video` }, 201, headers);
+}
+
+async function serveAsset(request, env, jobId, assetId) {
+  await verifyJobToken(env.JOB_TOKEN_SECRET, bearerToken(request), jobId, TOKEN_PURPOSES.asset);
+
+  const bucket = requireBucket(env);
+
+  // Try each allowed extension rather than trusting a caller-supplied filename.
+  for (const extension of Object.values(ASSET_CONTENT_TYPES)) {
+    const object = await bucket.get(inputKey(jobId, assetId, extension));
+    if (object) {
+      const responseHeaders = new Headers();
+      object.writeHttpMetadata(responseHeaders);
+      responseHeaders.set("Cache-Control", "no-store");
+      return new Response(object.body, { status: 200, headers: responseHeaders });
+    }
+  }
+
+  throw new HttpError(404, `No asset '${assetId}' for job ${jobId}`);
+}
+
+/* ------------------------------------------------------------------------------------
+ * Job-scoped tokens
+ *
+ * RunPod needs to call back into this Worker to report progress, upload the finished MP4
+ * and fetch input assets. Those endpoints must not be open to anyone who guesses the URL,
+ * and RunPod must not hold a permanent credential.
+ *
+ * So each job is issued short-lived HMAC tokens that bind three things: the job id, the
+ * purpose, and an expiry. A progress token cannot upload output; an output token for job A
+ * cannot write to job B; and every token stops working on its own. The signing secret
+ * lives only in Cloudflare and is never sent anywhere.
+ * ---------------------------------------------------------------------------------- */
+
+export const TOKEN_PURPOSES = Object.freeze({
+  progress: "progress",
+  output: "output-upload",
+  asset: "asset-download"
+});
+
+const TOKEN_DEFAULT_TTL_SECONDS = 3600;
+
+function b64urlEncode(bytes) {
+  let binary = "";
+  for (const byte of new Uint8Array(bytes)) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function b64urlDecodeToBytes(value) {
+  const padded = value.replace(/-/g, "+").replace(/_/g, "/");
+  const binary = atob(padded + "=".repeat((4 - (padded.length % 4)) % 4));
+  const out = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
+  return out;
+}
+
+async function hmacKey(secret) {
+  return crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+}
+
+/** Mint a token binding jobId + purpose + expiry. */
+export async function signJobToken(secret, jobId, purpose, ttlSeconds = TOKEN_DEFAULT_TTL_SECONDS) {
+  if (!secret) {
+    throw new HttpError(500, "Missing Cloudflare secret: JOB_TOKEN_SECRET");
+  }
+  const payload = { jid: jobId, pur: purpose, exp: Math.floor(Date.now() / 1000) + ttlSeconds };
+  const body = b64urlEncode(new TextEncoder().encode(JSON.stringify(payload)));
+  const signature = await crypto.subtle.sign("HMAC", await hmacKey(secret), new TextEncoder().encode(body));
+  return `${body}.${b64urlEncode(signature)}`;
+}
+
+/**
+ * Verify a token for an exact job and purpose. Returns the payload or throws 401/403.
+ *
+ * Signature is checked before anything in the payload is trusted, and compared with
+ * `crypto.subtle.verify` rather than string equality so it is not timing-sensitive.
+ */
+export async function verifyJobToken(secret, token, jobId, purpose) {
+  if (!secret) {
+    throw new HttpError(500, "Missing Cloudflare secret: JOB_TOKEN_SECRET");
+  }
+  if (!token || typeof token !== "string" || !token.includes(".")) {
+    throw new HttpError(401, "Missing or malformed job token");
+  }
+
+  const [body, signature] = token.split(".", 2);
+
+  let valid = false;
+  try {
+    valid = await crypto.subtle.verify(
+      "HMAC",
+      await crypto.subtle.importKey(
+        "raw",
+        new TextEncoder().encode(secret),
+        { name: "HMAC", hash: "SHA-256" },
+        false,
+        ["verify"]
+      ),
+      b64urlDecodeToBytes(signature),
+      new TextEncoder().encode(body)
+    );
+  } catch {
+    valid = false;
+  }
+
+  if (!valid) {
+    throw new HttpError(401, "Invalid job token signature");
+  }
+
+  let payload;
+  try {
+    payload = JSON.parse(new TextDecoder().decode(b64urlDecodeToBytes(body)));
+  } catch {
+    throw new HttpError(401, "Malformed job token payload");
+  }
+
+  if (payload.exp && Math.floor(Date.now() / 1000) > payload.exp) {
+    throw new HttpError(401, "Job token has expired");
+  }
+  if (payload.jid !== jobId) {
+    throw new HttpError(403, "Job token is for a different job");
+  }
+  if (payload.pur !== purpose) {
+    throw new HttpError(403, `Job token is for '${payload.pur}', not '${purpose}'`);
+  }
+
+  return payload;
+}
+
+function bearerToken(request) {
+  const header = request.headers.get("Authorization") || "";
+  return header.startsWith("Bearer ") ? header.slice(7).trim() : "";
+}
+
+/* ------------------------------------------------------------------------------------
+ * R2 object naming
+ *
+ * Deterministic and entirely Worker-owned. RunPod never chooses a key - it uploads to a
+ * route that already knows where the object belongs, which is what stops a compromised or
+ * buggy worker writing anywhere in the bucket.
+ *
+ * There is no user namespace because this system has no user identity to namespace by;
+ * inventing one here would be fiction. If auth is added later, these two helpers are the
+ * only places that need to change.
+ * ---------------------------------------------------------------------------------- */
+
+export function outputKey(jobId) {
+  return `outputs/${safeJobSegment(jobId)}/video.mp4`;
+}
+
+export function inputKey(jobId, assetId, extension) {
+  return `inputs/${safeJobSegment(jobId)}/${safeAssetId(assetId)}${extension}`;
+}
+
+function safeJobSegment(jobId) {
+  const value = String(jobId || "").trim();
+  if (!value || !/^[A-Za-z0-9._-]+$/.test(value) || value.length > 256) {
+    throw new HttpError(400, "Invalid job id");
+  }
+  return value;
+}
+
+function safeAssetId(assetId) {
+  const value = String(assetId || "").trim();
+  if (!value || !/^[A-Za-z0-9._-]+$/.test(value) || value.length > 128) {
+    throw new HttpError(400, "Invalid asset id");
+  }
+  return value;
+}
+
+export const ASSET_CONTENT_TYPES = Object.freeze({
+  "image/png": ".png",
+  "image/jpeg": ".jpg",
+  "image/webp": ".webp"
+});
+
+export const MAX_ASSET_BYTES = 32 * 1024 * 1024;
+
+/* ------------------------------------------------------------------------------------
+ * Durable Object: one per job, the realtime source of truth
+ * ---------------------------------------------------------------------------------- */
+
+export class JobChannel {
+  constructor(state, env) {
+    this.state = state;
+    this.env = env;
+  }
+
+  async currentState() {
+    return (await this.state.storage.get("state")) || null;
+  }
+
+  async fetch(request) {
+    const url = new URL(request.url);
+
+    if (url.pathname.endsWith("/ws")) {
+      if (request.headers.get("Upgrade") !== "websocket") {
+        return new Response("Expected websocket upgrade", { status: 426 });
+      }
+
+      const pair = new WebSocketPair();
+      const [client, server] = Object.values(pair);
+
+      // Hibernation: the DO can be evicted between events and woken by the runtime, so a
+      // long generation does not hold an instance alive doing nothing.
+      this.state.acceptWebSocket(server);
+
+      // Replay immediately so a client that connects late - or reconnects - is never
+      // left staring at an empty screen waiting for the next event.
+      const snapshot = await this.currentState();
+      if (snapshot) {
+        try {
+          server.send(JSON.stringify({ type: "state", ...snapshot }));
+        } catch {
+          /* a socket that dies during replay is not an error worth failing on */
+        }
+      }
+
+      return new Response(null, { status: 101, webSocket: client });
+    }
+
+    if (url.pathname.endsWith("/update") && request.method === "POST") {
+      const update = await request.json();
+      const previous = (await this.currentState()) || {};
+
+      const next = {
+        ...previous,
+        ...update,
+        jobId: update.jobId ?? previous.jobId,
+        createdAt: previous.createdAt ?? new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      };
+
+      await this.state.storage.put("state", next);
+      this.broadcast(next);
+      return new Response(null, { status: 204 });
+    }
+
+    if (url.pathname.endsWith("/state")) {
+      return new Response(JSON.stringify((await this.currentState()) || {}), {
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+
+    return new Response("Not found", { status: 404 });
+  }
+
+  broadcast(state) {
+    const message = JSON.stringify(publicEvent(state));
+    for (const socket of this.state.getWebSockets()) {
+      try {
+        socket.send(message);
+      } catch {
+        /* the runtime reaps dead sockets; one bad peer must not stop the others */
+      }
+    }
+  }
+
+  // Clients are listeners, not commanders: nothing they send can change job state.
+  async webSocketMessage() {}
+
+  async webSocketClose(socket) {
+    try {
+      socket.close();
+    } catch {
+      /* already closed */
+    }
+  }
+}
+
+/** Map internal job state onto the stable public event shape. */
+export function publicEvent(state) {
+  const phase = state.phase || "queued";
+
+  if (phase === "completed") {
+    return {
+      type: "completed",
+      jobId: state.jobId,
+      video: state.video ? { url: `/jobs/${state.jobId}/video`, key: state.video.key } : undefined
+    };
+  }
+  if (phase === "failed") {
+    return {
+      type: "failed",
+      jobId: state.jobId,
+      error: state.error || { code: "unknown", message: "Generation failed" }
+    };
+  }
+  if (phase === "cancelled") {
+    return { type: "cancelled", jobId: state.jobId };
+  }
+
+  const event = { type: "progress", jobId: state.jobId, phase };
+  if (state.step !== undefined) event.step = state.step;
+  if (state.steps !== undefined) event.steps = state.steps;
+  if (state.percent !== undefined) event.percent = state.percent;
+  return event;
+}
+
+function jobChannel(env, jobId) {
+  if (!env.JOB_CHANNEL) {
+    throw new HttpError(500, "Missing Durable Object binding: JOB_CHANNEL");
+  }
+  return env.JOB_CHANNEL.get(env.JOB_CHANNEL.idFromName(safeJobSegment(jobId)));
+}
+
+async function pushJobState(env, jobId, update) {
+  const stub = jobChannel(env, jobId);
+  await stub.fetch(new Request("https://do/update", {
+    method: "POST",
+    body: JSON.stringify({ jobId, ...update }),
+    headers: { "Content-Type": "application/json" }
+  }));
+}
+
+function requireBucket(env) {
+  if (!env.MEDIA_BUCKET) {
+    throw new HttpError(500, "Missing R2 binding: MEDIA_BUCKET");
+  }
+  return env.MEDIA_BUCKET;
+}
+
+// Exported for tests. Cloudflare only uses the default export and JobChannel above.
 export { HttpError, MODES, QUALITY_PRESETS, ASPECT_RATIOS, MODEL_FILES, describeCapabilities };

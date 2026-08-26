@@ -163,7 +163,8 @@ test("an unknown mode is a 400", () => {
 });
 
 test("unimplemented modes return 501 rather than silently degrading", () => {
-  for (const mode of ["last_frame_to_video", "first_last_frame_to_video", "reference", "regenerate_2k"]) {
+  // Keyframe modes now ship; reference and 2k remain deliberately deferred.
+  for (const mode of ["reference", "regenerate_2k"]) {
     const error = expectHttpError(() => normalizeRequest({ ...base, mode }), 501);
     assert.match(error.message, new RegExp(mode));
   }
@@ -371,8 +372,16 @@ test("supplying two asset sources at once is a 400", () => {
   );
 });
 
-test("r2_key is validated but not yet deliverable", () => {
-  expectHttpError(() => normalizeAsset({ r2_key: "inputs/u/j/a.png" }, "first_frame"), 501, /R2 binding/);
+test("a valid r2_key resolves to an asset id", () => {
+  assert.deepEqual(normalizeAsset({ r2_key: "inputs/u/j/a.png" }, "first_frame"), {
+    kind: "r2",
+    value: "a"
+  });
+});
+
+test("an r2_key that fails validation is still rejected before it reaches R2", () => {
+  expectHttpError(() => normalizeAsset({ r2_key: "inputs/../a.png" }, "first_frame"), 400);
+  expectHttpError(() => normalizeAsset({ r2_key: "outputs/a.png" }, "first_frame"), 400);
 });
 
 test("validateR2Key rejects traversal, absolute paths and odd characters", () => {
