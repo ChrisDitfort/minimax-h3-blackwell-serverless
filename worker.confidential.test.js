@@ -108,6 +108,19 @@ function makeEnv(overrides = {}) {
 
     H3_OUTPUTS: {
       put: async (key, body, options) => {
+        /*
+         * Real R2 refuses a stream whose length it cannot know: only a request/response
+         * body or the readable half of a FixedLengthStream qualifies. The earlier stub
+         * accepted anything, which is how a confidential upload shipped that 500'd in
+         * production while every test passed - the peeked-and-replayed stream had no
+         * length. `__knownLength` is how the test marks a stream as qualifying.
+         */
+        if (body instanceof ReadableStream && body.__knownLength === undefined) {
+          throw new Error(
+            "Provided readable stream must have a known length (request/response body or " +
+              "readable half of FixedLengthStream)"
+          );
+        }
         const bytes = body instanceof ReadableStream ? await drain(body) : new Uint8Array(body);
         puts.push({ key, options, bytes });
         bucket.set(key, { bytes, options });
@@ -197,6 +210,22 @@ async function captureConsole(run) {
   } finally {
     Object.assign(console, original);
   }
+}
+
+/*
+ * Stand in for the Workers runtime's FixedLengthStream so withKnownLength() takes the same
+ * branch it takes in production. The readable it produces is marked with the length, which
+ * is what the R2 stub above checks for.
+ */
+if (typeof globalThis.FixedLengthStream !== "function") {
+  globalThis.FixedLengthStream = class {
+    constructor(length) {
+      const { readable, writable } = new TransformStream();
+      readable.__knownLength = length;
+      this.readable = readable;
+      this.writable = writable;
+    }
+  };
 }
 
 function post(path, body) {
@@ -710,18 +739,22 @@ async function upload(env, jobId, body, { mode = "confidential", cryptoVersion =
     3600,
     { pm: mode, ...(mode === "confidential" ? { cv: cryptoVersion } : {}) }
   );
-  return worker.fetch(
-    new Request(`https://worker.example/internal/jobs/${jobId}/output`, {
-      method: "PUT",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": contentType || (mode === "confidential" ? "application/octet-stream" : "video/mp4")
-      },
-      body,
-      duplex: "half"
-    }),
-    env
-  );
+  const request = new Request(`https://worker.example/internal/jobs/${jobId}/output`, {
+    method: "PUT",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Length": String(body.byteLength),
+      "Content-Type":
+        contentType || (mode === "confidential" ? "application/octet-stream" : "video/mp4")
+    },
+    body,
+    duplex: "half"
+  });
+  // A real request body carries a length R2 accepts; Node's ReadableStream does not model
+  // that, so mark it the way the runtime would. Without this the stub would reject the
+  // standard path too, which real R2 does not.
+  if (request.body) request.body.__knownLength = body.byteLength;
+  return worker.fetch(request, env);
 }
 
 test("a confidential upload of real ciphertext is stored under the .enc key", async () => {
@@ -744,6 +777,49 @@ test("a confidential upload of real ciphertext is stored under the .enc key", as
   assert.equal(put.options.customMetadata.cryptoVersion, "2");
   assert.equal(put.options.customMetadata.keyWrapAlgorithm, "RSA-OAEP-256");
   assert.equal(put.options.customMetadata.keyId, KEY_ID);
+});
+
+test("REGRESSION: the peeked body still has a length R2 will accept", async () => {
+  /*
+   * This shipped broken once. Reading the container header to prove the bytes are
+   * ciphertext replaces request.body with a replayed ReadableStream, and R2 rejects a
+   * stream whose length it cannot know - so every confidential upload 500'd in production
+   * while standard mode, which never peeks, was fine. The stub above now enforces the same
+   * rule the real binding does, and withKnownLength() restores the length.
+   */
+  const env = makeEnv();
+  const response = await upload(env, JOB, containerFor(JOB));
+
+  assert.equal(response.status, 201, await response.text());
+  assert.equal(env.__puts.length, 1, "the artefact must actually reach R2");
+  assert.ok(
+    env.__puts[0].bytes.byteLength > 0,
+    "a length-bearing stream must still deliver its bytes"
+  );
+});
+
+test("a confidential upload with no Content-Length is refused, not 500'd", async () => {
+  // Without a declared length there is nothing to hand FixedLengthStream, so this fails
+  // early and legibly rather than deep inside R2.
+  const env = makeEnv();
+  const container = containerFor(JOB);
+  const token = await signJobToken(
+    env.JOB_TOKEN_SECRET, JOB, workerConstants().TOKEN_PURPOSES.output, 3600,
+    { pm: "confidential", cv: 2 }
+  );
+  const response = await worker.fetch(
+    new Request(`https://worker.example/internal/jobs/${JOB}/output`, {
+      method: "PUT",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/octet-stream" },
+      body: container,
+      duplex: "half"
+    }),
+    env
+  );
+
+  assert.equal(response.status, 411);
+  assert.match((await response.json()).error, /Content-Length/);
+  assert.equal(env.__puts.length, 0, "nothing may be written without a known length");
 });
 
 test("REFUSED: a v1 container uploaded for a v2 job", async () => {
@@ -834,15 +910,19 @@ test("a token with no privacy claim is treated as standard, so old jobs keep wor
     3600
   );
 
-  const response = await worker.fetch(
-    new Request(`https://worker.example/internal/jobs/${JOB}/output`, {
-      method: "PUT",
-      headers: { Authorization: `Bearer ${token}`, "Content-Type": "video/mp4" },
-      body: new Uint8Array(32).fill(7),
-      duplex: "half"
-    }),
-    env
-  );
+  const payload = new Uint8Array(32).fill(7);
+  const request = new Request(`https://worker.example/internal/jobs/${JOB}/output`, {
+    method: "PUT",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "video/mp4",
+      "Content-Length": String(payload.byteLength)
+    },
+    body: payload,
+    duplex: "half"
+  });
+  if (request.body) request.body.__knownLength = payload.byteLength;
+  const response = await worker.fetch(request, env);
 
   assert.equal(response.status, 201);
   assert.equal((await response.json()).key, outputKey(JOB));

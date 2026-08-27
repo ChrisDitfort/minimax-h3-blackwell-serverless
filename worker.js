@@ -2694,12 +2694,35 @@ async function receiveOutput(request, env, headers, jobId) {
 
   let body = request.body;
   let artifact = { privacyMode: mode, encrypted: false, contentType: "video/mp4" };
+  const declaredSize = Number(request.headers.get("Content-Length") || 0);
 
   if (spec.encrypts) {
+    /*
+     * R2 will not accept a stream of unknown length, and peeking costs us the one we had.
+     *
+     * `request.body` carries an implicit length from Content-Length, which is why the
+     * standard path can hand it straight to put(). Reading the header to prove the bytes
+     * are ciphertext means replaying them through a *new* ReadableStream, and that new
+     * stream has no length - put() then fails with "Provided readable stream must have a
+     * known length". Piping through a FixedLengthStream gives the length back without
+     * buffering the payload, so memory stays flat regardless of video size.
+     *
+     * This reached production once: the confidential upload 500'd while standard mode was
+     * unaffected, because only the confidential path peeks. The test stub accepted any
+     * stream, so nothing caught it until a real generation ran.
+     */
+    if (!(declaredSize > 0)) {
+      throw new HttpError(
+        411,
+        "A confidential artefact upload must declare Content-Length: the container header " +
+          "has to be read before the body can be stored, and R2 needs a known length."
+      );
+    }
+
     // Peek only as far as the header. The payload itself is never buffered, so Worker
     // memory stays flat regardless of video size.
     const peeked = await peekStream(body, CONTAINER_PREAMBLE_BYTES + CONTAINER_MAX_HEADER_BYTES);
-    body = peeked.stream;
+    body = withKnownLength(peeked.stream, declaredSize);
 
     let container;
     try {
@@ -2789,7 +2812,6 @@ async function receiveOutput(request, env, headers, jobId) {
     }
   });
 
-  const declaredSize = Number(request.headers.get("Content-Length") || 0);
   const size = object?.size ?? (declaredSize > 0 ? declaredSize : undefined);
 
   await pushJobState(env, jobId, {
@@ -2857,6 +2879,27 @@ async function peekStream(stream, limit) {
   });
 
   return { prefix, stream: replay };
+}
+
+/**
+ * Give a reconstructed stream a length R2 will accept, without buffering it.
+ *
+ * `FixedLengthStream` is a Workers runtime global. It is absent under plain Node, where
+ * the tests run, so the fallback returns the stream unchanged - and the R2 stub in
+ * worker.confidential.test.js enforces the same known-length rule the real binding does,
+ * which is what makes the absence safe rather than a blind spot.
+ */
+function withKnownLength(stream, length) {
+  if (typeof FixedLengthStream !== "function") {
+    return stream;
+  }
+  const fixed = new FixedLengthStream(length);
+  // Deliberately not awaited: R2 consumes `readable` while this fills `writable`. Awaiting
+  // would deadlock on anything larger than the internal queue.
+  stream.pipeTo(fixed.writable).catch(() => {
+    /* R2 surfaces the failure through put(); a duplicate rejection here helps nobody */
+  });
+  return fixed.readable;
 }
 
 /**
