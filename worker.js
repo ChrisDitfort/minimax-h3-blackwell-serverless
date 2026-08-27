@@ -2073,7 +2073,17 @@ function corsHeaders() {
       "Content-Type, Authorization, CF-Access-Client-Id, CF-Access-Client-Secret",
     "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
     "Access-Control-Max-Age": "86400",
-    "Cache-Control": "no-store"
+    // Every JSON response here is a job's state or an error; none of it is cacheable and
+    // some of it describes a confidential generation.
+    "Cache-Control": "no-store",
+    /*
+     * Hardening for the JSON surface. These responses are never a document, so the
+     * strictest possible policy costs nothing: nothing may be loaded, framed or executed
+     * if a browser is ever persuaded to render one as HTML.
+     */
+    "X-Content-Type-Options": "nosniff",
+    "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'; sandbox",
+    "Referrer-Policy": "no-referrer"
   };
 }
 

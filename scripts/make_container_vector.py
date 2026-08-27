@@ -56,6 +56,10 @@ KEY = hashlib.pbkdf2_hmac("sha256", PASSPHRASE.encode("utf-8"), KDF_SALT, KDF_IT
 
 
 def main() -> int:
+    # Force LF regardless of platform. .gitattributes pins *.json to LF, so a CRLF write on
+    # Windows would show as a diff on every regeneration and hide real changes.
+    sys.stdout.reconfigure(newline="\n")
+
     header = artifacts.build_header(
         generation_id=GENERATION_ID,
         content_type="video/mp4",

@@ -445,6 +445,8 @@ class JobTimer:
         self.steps_total: int | None = None
         self.output_bytes: int | None = None
         self.progress_callbacks: tuple[int, int] | None = None
+        #: Set once the job's privacy mode is known, so a perf line can be read per mode.
+        self.privacy_mode: str | None = None
 
     # -- marks -------------------------------------------------------------------------
 
@@ -537,6 +539,17 @@ class JobTimer:
             f"decode={_secs(self.between('sampling_end', 'execution_end'))}",
             f"output={_secs(self.spans.get('output'))}",
         ]
+        # Encryption is broken out so the cost of Confidential Generation is a number
+        # somebody can read off a log line rather than an argument. It sits inside
+        # `output`, alongside the upload.
+        #
+        # In milliseconds, not the seconds every other field uses, because encrypting a
+        # five-second clip takes single-digit milliseconds - at this line's one-decimal
+        # precision it would always print 0.0s, which is exactly not the point.
+        if self.privacy_mode:
+            fields.append(f"privacy={self.privacy_mode}")
+        if "encryption" in self.spans:
+            fields.append(f"encryption_ms={round(self.spans['encryption'] * 1000)}")
         # Upload is broken out from `output` so a slow R2 write is never mistaken for
         # slow inference, and callback latency is reported separately from both.
         if "output_upload" in self.spans:
@@ -2072,6 +2085,7 @@ def handler(job: dict) -> dict:
         # it asked should cost zero GPU seconds, not fail after two minutes of sampling.
         protector = build_protector_for_job(job_input)
         generation_id = str(_spec(job_input, "progress").get("jobId") or job_id)
+        timer.privacy_mode = protector.mode
         log(
             f"generation_id={generation_id} privacy_mode={protector.mode} "
             f"encryption={'AES-256-GCM' if protector.encrypts else 'none'} "

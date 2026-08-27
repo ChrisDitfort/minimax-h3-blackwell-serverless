@@ -887,6 +887,28 @@ test("the parser rejects anything that is not a container", () => {
  * Capabilities
  * ================================================================================== */
 
+/* ====================================================================================
+ * Response hardening
+ * ================================================================================== */
+
+test("JSON responses carry the strict browser controls", async () => {
+  const response = await worker.fetch(new Request("https://worker.example/health"), makeEnv());
+
+  assert.equal(response.headers.get("Cache-Control"), "no-store");
+  assert.equal(response.headers.get("X-Content-Type-Options"), "nosniff");
+  assert.equal(response.headers.get("Referrer-Policy"), "no-referrer");
+  assert.match(response.headers.get("Content-Security-Policy"), /default-src 'none'/);
+});
+
+test("preflight allows the verbs the artefact routes actually use", async () => {
+  const response = await worker.fetch(
+    new Request("https://worker.example/jobs/x/artifact", { method: "OPTIONS" }),
+    makeEnv()
+  );
+  assert.equal(response.status, 204);
+  assert.match(response.headers.get("Access-Control-Allow-Methods"), /DELETE/);
+});
+
 test("capabilities advertises the privacy modes and their availability", async () => {
   const response = await worker.fetch(
     new Request("https://worker.example/capabilities"),

@@ -407,6 +407,136 @@ place; the weights are a deliberate, separately-costed decision.
 Nothing installed and nothing measured. `regenerate_2k` exists only as a reserved mode
 name so the routing layer does not need reshaping later.
 
+## Confidential Generation
+
+Optional per-request privacy mode. The video is encrypted **inside the RunPod container**
+with a key the browser derived, before it reaches R2. Persistent storage receives ciphertext
+only; the browser decrypts for playback.
+
+Standard generation is unchanged. A request with no `privacyMode` behaves exactly as before.
+
+Full design, trust boundaries and threat model: **[docs/confidential-generation.md](docs/confidential-generation.md)**.
+Product wording: **[docs/privacy-statement.md](docs/privacy-statement.md)**.
+
+### Request
+
+```json
+{
+  "backend": "h3-blackwell",
+  "prompt": "A cinematic ocean scene",
+  "quality": "standard",
+  "duration": 5,
+
+  "privacyMode": "confidential",
+  "encryption": {
+    "algorithm": "AES-256-GCM",
+    "key": "<base64url-encoded 256-bit key>",
+    "keyId": "customer-key-1",
+    "kdf": {
+      "name": "argon2id",
+      "salt": "<base64url salt>",
+      "parameters": { "memorySize": 65536, "iterations": 3 }
+    }
+  }
+}
+```
+
+`privacyMode` defaults to `standard`. `keyId` is an opaque client label - it is stored and
+returned, so it must not be the key (the Worker rejects a request where it is). The `kdf`
+block is not executed anywhere on the backend; it is recorded so the same passphrase
+reproduces the same key later.
+
+### Status
+
+```jsonc
+{
+  "id": "…", "status": "COMPLETED", "backend": "h3-blackwell",
+  "privacyMode": "confidential",
+
+  "artifact": {
+    "url": "/jobs/…/artifact",
+    "key": "outputs/…/artifact.enc",
+    "size": 2196269,
+    "encrypted": true,
+    "encryptionVersion": 1,
+    "algorithm": "AES-256-GCM",
+    "contentType": "application/octet-stream",
+    "originalContentType": "video/mp4",
+    "kdf": { "name": "argon2id", "salt": "…", "parameters": {…} },
+    "keyId": "customer-key-1",
+    "deleted": false
+  },
+
+  // unchanged, for every existing client
+  "video": { "url": "/jobs/…/video", "key": "outputs/…/artifact.enc", "size": 2196269, "deleted": false }
+}
+```
+
+`encryption.key` is never returned - not here, not in `/generate`, not in an error. A job
+recorded before this release has no `privacyMode` and reads as `standard` / `encrypted:
+false`; old status records stay valid.
+
+### Retrieval
+
+`GET /jobs/:id/artifact` serves ciphertext as `application/octet-stream` with
+`Cache-Control: private, no-store`, `X-Content-Type-Options: nosniff`, an attachment
+disposition, and the crypto facts in `X-Artifact-*` headers (exposed to cross-origin
+readers). Standard artefacts stream as before: `video/mp4`, cacheable, seekable.
+
+### Browser
+
+`client/confidential-generation.js` is a zero-dependency ES module. `client/demo.html` is a
+minimal working UI.
+
+```js
+import { newKdfParams, deriveKey, generate, fetchAndDecrypt, attachToVideo }
+  from "./client/confidential-generation.js";
+
+const kdf = newKdfParams();                       // random salt + cost
+const key = await deriveKey(passphrase, kdf);     // 32 bytes, never leaves the browser
+const job = await generate(API, { prompt, quality: "standard" }, { key, kdf });
+
+// …later, after the job completes
+const { blob } = await fetchAndDecrypt(API, job.jobId, key);
+attachToVideo(document.querySelector("video"), blob);
+```
+
+The default KDF is PBKDF2-HMAC-SHA256 at 600k iterations, not Argon2id: no browser ships
+Argon2id natively, and this repository has no frontend build step. Argon2id works today by
+passing an implementation (`deriveKey(pass, kdf, { argon2id })`) - the backend records the
+KDF, it never runs one, so it costs the server nothing either way.
+
+### Fail closed
+
+| Situation | Outcome |
+|---|---|
+| Confidential with no/short/malformed key | 400, reporting the decoded length, never the value |
+| Unsupported algorithm, KDF, or unknown mode | 400 |
+| `private` / `ephemeral` | 501 with the reason - declared, not yet implemented |
+| `standard` **with** an `encryption` block | 400 - ignoring it would leave the caller believing they were encrypted |
+| No `JOB_TOKEN_SECRET` (no authenticated upload path) | 503; the job is never submitted |
+| Encryption or upload fails | job fails; plaintext and ciphertext both deleted; nothing stored |
+| A plaintext MP4 uploaded for a confidential job | **422; nothing written to R2** |
+| Ciphertext whose header names a different generation | **422; nothing written to R2** |
+
+The last two are enforced without trusting the uploader: the job's privacy mode is signed
+into its output token, so the upload endpoint reads the mode from an HMAC rather than from
+the request or a storage lookup, then requires the body to parse as a container whose
+authenticated header names that same job.
+
+### Recovery
+
+There is none. If the passphrase is lost the video is unrecoverable - nothing the platform
+stores can decrypt it. That is the property, not a defect.
+
+### This is not zero-knowledge
+
+The model needs the plaintext prompt and produces plaintext frames; both exist inside the
+inference container while the job runs. The true claim is narrower: *plaintext exists
+transiently only where inference requires it; persistent storage contains ciphertext only.*
+See [docs/privacy-statement.md](docs/privacy-statement.md) for the terminology to use and
+the terminology to avoid.
+
 ## Realtime progress and R2 output
 
 The browser never talks to RunPod. Cloudflare owns the public API, the storage and the
@@ -443,8 +573,15 @@ an output token for one job cannot write to another; all of them expire. The sig
 | Route | Notes |
 |---|---|
 | `POST /jobs/:id/assets` | Upload a keyframe. PNG/JPEG/WebP, 32 MB cap |
-| `GET /jobs/:id/video` | Streams from R2. Range supported, so browsers can seek |
+| `GET /jobs/:id/artifact` | Streams from R2. Range supported, so browsers can seek |
+| `GET /jobs/:id/video` | Alias of the above, kept for existing callers |
+| `DELETE /jobs/:id/artifact` | Removes the artefact. Alias: `/video` |
+| `DELETE /jobs/:id` | Removes the artefact **and** that generation's input keyframes |
 | `GET /ws/jobs/:id` | WebSocket. Current state on connect, then live events |
+
+`artifact` is the mode-neutral name: a confidential artefact is not a playable video until
+the browser has decrypted it, and the API should not say otherwise. `/video` still works
+and still serves the right bytes in both modes.
 
 ### WebSocket protocol
 
@@ -465,8 +602,15 @@ during `sampling`.
 
 ```
 inputs/{jobId}/{assetId}.{png|jpg|webp}
-outputs/{jobId}/video.mp4
+outputs/{jobId}/video.mp4        standard
+outputs/{jobId}/artifact.enc     confidential (ciphertext)
 ```
+
+Two names, one prefix. A confidential artefact is not an MP4 and is not called one: anyone
+looking at the bucket during an incident should be able to tell ciphertext from video at a
+glance, and nothing should be able to hand `artifact.enc` to a `<video>` tag by mistake.
+The prefix stays `outputs/` because the lifecycle rules below are prefix-scoped - moving it
+would silently drop encrypted artefacts out of retention. Neither name contains the prompt.
 
 Keys are chosen by the Worker, never by RunPod: the handler uploads to a route that
 already knows where the object belongs, so a compromised or buggy worker cannot write
@@ -482,16 +626,26 @@ aggressive cleanup that could race a job still writing.
 ### Deleting an output
 
 ```
-DELETE /jobs/{jobId}/video
+DELETE /jobs/{jobId}/artifact     the artefact only (alias: /video)
+DELETE /jobs/{jobId}              the artefact plus that generation's input keyframes
 ```
 
 ```json
-{ "id": "08ad4ace-d847-46b4-a1d6-a919d7e3a0c9", "deleted": true }
+{ "id": "08ad4ace-d847-46b4-a1d6-a919d7e3a0c9", "deleted": true, "scope": "output", "removed": 1 }
 ```
 
-The key is derived from the job id inside the Worker via `outputKey()`, so a caller cannot
-name an arbitrary object - and there is deliberately **no** generic "delete this key"
-route anywhere in the API. A malformed job id is a 400 before R2 is touched at all.
+`removed` counts objects that actually existed. Both artefact names are always named for
+deletion whether or not the listing mentioned them, so a listing that is momentarily behind
+cannot leave ciphertext in the bucket - but naming a key is not evidence an object was
+there, so those do not inflate the count.
+
+**One code path for both privacy modes.** A confidential artefact is deleted by exactly the
+same function as a standard one, because "we forgot to handle deletion for the encrypted
+kind" is precisely the bug a second code path invites.
+
+Keys are derived from the job id inside the Worker, so a caller cannot name an arbitrary
+object - and there is deliberately **no** generic "delete this key" route anywhere in the
+API. A malformed job id is a 400 before R2 is touched at all.
 
 Idempotent: R2's delete does not fail on a missing key and the job is marked deleted either
 way, so a retry after a dropped connection returns the same answer rather than an error.
@@ -737,19 +891,45 @@ In the worker log you should see:
 
 ### Automated tests
 
-30 tests cover input validation, node detection, staging and cleanup. They stub `runpod`
-and `websocket`, so they run without a GPU, ComfyUI or a RunPod account:
+Everything runs without a GPU, ComfyUI, a RunPod account or a network. The Python tests stub
+`runpod` and `websocket`; the JavaScript tests drive the Worker's real `fetch` handler
+against stub R2 and Durable Object bindings, and the browser module against Node's WebCrypto
+- the same API the browser exposes.
 
 ```bash
-python -m unittest discover -s tests -v
+python -m pytest tests -q     # 211 tests
+node --test                   # 170 tests: Worker + browser client
 ```
 
-Coverage includes: text-to-video is a no-op; both image inputs rejected; PNG/JPEG/WebP
-accepted; `data:` URI prefix; non-image and forged-magic-byte payloads rejected; oversized
-input rejected with no temp file left; SSRF guards (loopback, private, link-local,
-`169.254.169.254`, non-HTTPS schemes); detection through an intermediate node with a decoy
-loader present; ambiguous workflows requiring `image_node_id`; cleanup removing only its own
-files; and the shipped examples behaving as documented.
+**Handler and image input** — text-to-video is a no-op; both image inputs rejected;
+PNG/JPEG/WebP accepted; `data:` URI prefix; non-image and forged-magic-byte payloads
+rejected; oversized input rejected with no temp file left; SSRF guards (loopback, private,
+link-local, `169.254.169.254`, non-HTTPS schemes); detection through an intermediate node
+with a decoy loader present; ambiguous workflows requiring `image_node_id`; cleanup removing
+only its own files; upload truthfulness (a 302 to an Access login page is not a success);
+FlashBoot preload; phase timing.
+
+**Confidential Generation** (`tests/test_confidential_artifacts.py`,
+`worker.confidential.test.js`, `client/confidential-generation.test.js`) — the canonical test
+runs a known plaintext video through the whole artefact path, captures the bytes that would
+have reached R2, and proves `stored != plaintext`, `decrypt(stored, client_key) == plaintext`
+and `decrypt(stored, other_key)` fails. Around it: container framing; wrong key, modified
+ciphertext, modified tag and rewritten header all failing authentication; a fresh nonce on
+every encryption across 32 runs; plaintext deleted after success, after encryption failure
+and after upload failure; `H3_KEEP_OUTPUTS` unable to preserve confidential plaintext; every
+validation rejection; the 422 refusals; ciphertext response headers; status never returning
+the key; deletion of both modes through one path.
+
+**Redaction** (`tests/test_redaction.py`, and the log assertions in the Worker suite) — keys,
+passphrases, `Authorization` and Cloudflare Access credentials removed; `keyId` and R2 object
+keys preserved; and an assertion that the redaction lists in `worker.js` and `artifacts.py`
+are identical, because they had already drifted once.
+
+**Cross-language conformance** (`tests/vectors/confidential_container.json`) — one passphrase,
+through one KDF, produces the key that opens one container whose bytes are pinned exactly.
+Python must reproduce those bytes, `worker.js` must parse that framing, and the browser must
+decrypt it back to the video. A change to the layout, the canonical header serialization or
+the AAD binding fails at least one of the three suites.
 
 ### Status
 
@@ -811,7 +991,19 @@ Worker and Vince's `worker-comfyui` behaviour. Guarded by `H3_MAX_BASE64_BYTES` 
 180 MB) so an oversized video fails with a clear message rather than an opaque payload
 error.
 
-### `r2` — encrypted upload to Cloudflare R2
+### `r2` — encrypted upload to Cloudflare R2 (server-held key)
+
+> **Not Confidential Generation.** These are two different schemes and the difference is the
+> whole point. This mode encrypts with a **server-held** key-encryption key
+> (`H3_KEY_WRAP_KEY`) and uploads directly from the worker to R2 with baked-in R2
+> credentials; the platform can decrypt what it stores.
+> [Confidential Generation](#confidential-generation) encrypts with a **client-derived** key
+> that the platform never holds, and travels the normal Worker upload path.
+>
+> They are not alternatives to each other: this is at-rest encryption under a key you
+> manage, that one is user-controlled encryption. Confidential Generation is what a request
+> asks for per job; this is a deployment-wide setting for the direct-to-R2 path, and is
+> unused when the Cloudflare Worker supplies an `output` block (which it always does).
 
 Set `H3_OUTPUT_MODE=r2` to encrypt every video **inside the worker** and upload only
 ciphertext. Plaintext MP4s never reach R2.
@@ -931,6 +1123,7 @@ mp4 = AESGCM(dek).decrypt(
 | `H3_MAX_IMAGE_PIXELS` | `64000000` | Max input image pixels (bomb guard) |
 | `H3_IMAGE_TIMEOUT` | `30` | `image_url` download timeout, seconds |
 | `H3_ALLOW_INSECURE_IMAGE_URL` | `0` | `1` permits http image URLs (testing only) |
+| `H3_OVERWRITE_PLAINTEXT` | `1` | Overwrite a plaintext artefact with random bytes before unlinking it. Worth something on ext4, close to nothing on overlayfs or an SSD with wear levelling - see docs/confidential-generation.md §7. `0` skips it |
 
 SageAttention3 is controlled by an environment variable rather than removed, so it can be
 turned off without rebuilding if it proves unstable under Serverless.
@@ -961,10 +1154,21 @@ roughly 124–362).
 ```
 Dockerfile                      Serverless image: replaces the Pod entrypoint
 handler.py                      RunPod handler, ComfyUI supervision, output stores
+artifacts.py                    Model-independent privacy layer: privacy modes, the
+                                encrypted container format, plaintext hygiene, redaction
+worker.js                       Cloudflare Worker: public API, workflow builder, R2, DO
+wrangler.toml                   Worker bindings, mirrored from the live deployment
 models.tsv                      Model URLs, exact sizes and SHA-256 checksums
+client/confidential-generation.js   Browser key derivation and local decryption
+client/demo.html                Minimal Confidential Generation UI
+docs/confidential-generation.md Architecture, trust boundaries, threat model, key lifecycle
+docs/privacy-statement.md       Product wording, and the claims never to make
 scripts/build_model_layer.py    Streams a model from HF straight into a Docker layer
+scripts/make_container_vector.py    Regenerates the cross-language conformance vector
+scripts/set_r2_lifecycle.sh     Applies the prefix-scoped R2 retention policy
 examples/fl2va-text-to-video.json    Ready-to-run FL2VA text-to-video workflow
 examples/fl2va-image-to-video.json  Same, plus a LoadImage feeding first_frame
-tests/test_image_input.py       Tests for image validation, detection and cleanup
+tests/                          Python suites; tests/vectors/ holds the format vector
+worker.*.test.js                Worker suites, driven through the real fetch handler
 .github/workflows/build.yml     Two-stage build: code image, then four model layers
 ```

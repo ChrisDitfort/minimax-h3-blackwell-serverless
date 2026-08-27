@@ -753,6 +753,21 @@ class TestHandlerWiring(unittest.TestCase):
         self.assertEqual(result["artifact"]["algorithm"], "AES-256-GCM")
         self.assertNotIn("key", result["artifact"])
 
+    def test_the_perf_line_quantifies_what_encryption_cost(self):
+        """The point of measuring is being able to answer 'how much does this cost?'."""
+        timer = handler.JobTimer({})
+        timer.privacy_mode = "confidential"
+        timer.add_span("encryption", 0.084)
+        line = timer.summary(job_index=1, status="ok")
+
+        self.assertIn("privacy=confidential", line)
+        self.assertIn("encryption_ms=84", line)
+
+    def test_the_perf_line_is_unchanged_for_standard_jobs(self):
+        line = handler.JobTimer({}).summary(job_index=1, status="ok")
+        self.assertNotIn("privacy=", line)
+        self.assertNotIn("encryption_ms=", line)
+
     def test_standard_uploads_are_unchanged(self):
         sent = {}
 
