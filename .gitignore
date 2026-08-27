@@ -1,7 +1,12 @@
 __pycache__/
 *.py[cod]
 
-# Local wrangler dev secrets - never committed
+# Local secrets - never committed.
+# .env holds Cloudflare Access service tokens for live validation; this repository is
+# public, so an unignored .env is one `git add .` away from publishing a credential.
 .dev.vars
+.env
+.env.*
+!.env.example
 .wrangler/
 node_modules/
