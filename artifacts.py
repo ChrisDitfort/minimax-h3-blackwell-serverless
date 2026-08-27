@@ -852,6 +852,15 @@ def build_protector(
 # --------------------------------------------------------------------------------------
 
 #: Field names whose value is secret wherever it appears.
+#:
+#: Kept identical to SECRET_FIELDS in worker.js - tests/test_redaction.py asserts that,
+#: because a name redacted on one side of the system and not the other is exactly the kind
+#: of gap nobody notices until it is in a log.
+#:
+#: The Access *client id* is in here alongside the secret. On its own it is closer to a
+#: username than a credential, but it identifies which service token is in play, and the
+#: one place this codebase deliberately prints it (log_callback_configuration) prints a
+#: truncated form on purpose. A generic structural dump should not undo that.
 SECRET_FIELDS = frozenset(
     {
         "encryptionkey",
@@ -860,6 +869,9 @@ SECRET_FIELDS = frozenset(
         "password",
         "secret",
         "authorization",
+        "cf-access-client-id",
+        "cf_access_client_id",
+        "cloudflare_access_client_id",
         "cf-access-client-secret",
         "cf_access_client_secret",
         "cloudflare_access_client_secret",
@@ -867,6 +879,8 @@ SECRET_FIELDS = frozenset(
         "api_key",
         "apikey",
         "token",
+        "job_token_secret",
+        "runpod_api_key",
         "dek",
         "data_key",
         "datakey",

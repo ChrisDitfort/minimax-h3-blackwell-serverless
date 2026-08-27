@@ -1285,7 +1285,31 @@ function describeCapabilities() {
         name,
         spec.implemented ? { available: true } : { available: false, reason: spec.reason }
       ])
-    )
+    ),
+
+    /*
+     * Privacy is discoverable for the same reason generation modes are: a client should be
+     * able to find out that `ephemeral` is not available yet, and why, without having to
+     * send a request and read a 501.
+     */
+    defaultPrivacyMode: DEFAULT_PRIVACY_MODE,
+    privacyModes: Object.fromEntries(
+      Object.entries(PRIVACY_MODES).map(([name, spec]) => [
+        name,
+        spec.implemented
+          ? { available: true, encrypts: spec.encrypts, description: spec.description }
+          : { available: false, encrypts: spec.encrypts, description: spec.description, reason: spec.reason }
+      ])
+    ),
+    encryption: {
+      algorithms: [...SUPPORTED_ENCRYPTION_ALGORITHMS],
+      keyBytes: ENCRYPTION_KEY_BYTES,
+      containerVersion: CONTAINER_VERSION,
+      // The Worker never runs a KDF - derivation is the client's job. This is the list of
+      // descriptions it will accept and store, so a client knows what it may record.
+      kdfs: Object.keys(SUPPORTED_KDFS),
+      retentionSeconds: { min: MIN_RETENTION_SECONDS, max: MAX_RETENTION_SECONDS }
+    }
   };
 }
 
@@ -1929,7 +1953,13 @@ function routeDescriptions() {
  *                    that is backwards, and one new field would be enough to break it.
  * ---------------------------------------------------------------------------------- */
 
-/** Field names whose value is secret wherever it appears. */
+/**
+ * Field names whose value is secret wherever it appears.
+ *
+ * Kept identical to SECRET_FIELDS in artifacts.py - tests/test_redaction.py asserts that,
+ * because a name redacted on one side of the system and not the other is exactly the kind
+ * of gap nobody notices until it is in a log.
+ */
 const SECRET_FIELDS = new Set([
   "encryptionkey",
   "encryption_key",
@@ -1938,8 +1968,11 @@ const SECRET_FIELDS = new Set([
   "secret",
   "authorization",
   "cf-access-client-id",
+  "cf_access_client_id",
+  "cloudflare_access_client_id",
   "cf-access-client-secret",
   "cf_access_client_secret",
+  "cloudflare_access_client_secret",
   "x-api-key",
   "api_key",
   "apikey",
@@ -1948,7 +1981,10 @@ const SECRET_FIELDS = new Set([
   "runpod_api_key",
   "dek",
   "data_key",
-  "wrapped_key"
+  "datakey",
+  "wrapped_key",
+  "wrappedkey",
+  "h3_key_wrap_key"
 ]);
 
 /*

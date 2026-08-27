@@ -1,0 +1,355 @@
+<!doctype html>
+<!--
+  Confidential Generation - minimal reference UI.
+
+  This repository has no frontend, so this page is the integration example rather than the
+  product: it is the smallest thing that exercises the whole path end to end and shows what
+  a real form has to get right.
+
+  Open it directly (file://) or serve it from anywhere; set the API base in the field at
+  the top. It imports ./confidential-generation.js and nothing else.
+
+  WHAT THIS PAGE DELIBERATELY DOES NOT DO
+  - The passphrase is never sent anywhere. Only a key derived from it is, once, at
+    submission.
+  - The passphrase is never written to localStorage, sessionStorage, the URL, a query
+    string, a cookie or an analytics call. It lives in one JavaScript variable for as long
+    as the tab is open, and in the password inputs the user typed it into.
+  - There is no "remember my passphrase". There is no recovery. Both are the point.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Confidential Generation</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #ffffff;
+    --fg: #16181d;
+    --muted: #5b6270;
+    --line: #d9dce3;
+    --accent: #2f5fe0;
+    --warn-bg: #fff6e5;
+    --warn-line: #e8c37a;
+    --warn-fg: #6b4a05;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14161a; --fg: #e7e9ee; --muted: #99a0ad; --line: #2c3038;
+      --accent: #7fa0ff; --warn-bg: #2a2313; --warn-line: #6b5620; --warn-fg: #f0d9a4;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0 auto; padding: 2rem 1.25rem 4rem; max-width: 46rem;
+    background: var(--bg); color: var(--fg);
+    font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  h1 { font-size: 1.35rem; margin: 0 0 .25rem; }
+  h2 { font-size: 1rem; margin: 2rem 0 .6rem; }
+  p.sub { color: var(--muted); margin: 0 0 1.75rem; }
+  fieldset { border: 1px solid var(--line); border-radius: 8px; padding: 1rem 1.1rem 1.2rem; margin: 0 0 1.25rem; }
+  legend { padding: 0 .4rem; font-weight: 600; font-size: .9rem; }
+  label { display: block; font-weight: 500; margin: .85rem 0 .3rem; }
+  input[type=text], input[type=password], input[type=number], textarea, select {
+    width: 100%; padding: .5rem .6rem; border: 1px solid var(--line); border-radius: 6px;
+    background: var(--bg); color: var(--fg); font: inherit;
+  }
+  textarea { min-height: 4.5rem; resize: vertical; }
+  .row { display: flex; gap: .75rem; flex-wrap: wrap; }
+  .row > * { flex: 1 1 8rem; }
+  .choice { display: flex; align-items: baseline; gap: .5rem; margin: .35rem 0; font-weight: 400; }
+  .choice input { flex: none; }
+  button {
+    font: inherit; font-weight: 600; padding: .55rem 1.1rem; border-radius: 6px;
+    border: 1px solid var(--accent); background: var(--accent); color: #fff; cursor: pointer;
+  }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  button.secondary { background: transparent; color: var(--accent); }
+  .note { background: var(--warn-bg); border: 1px solid var(--warn-line); color: var(--warn-fg);
+          border-radius: 6px; padding: .7rem .85rem; margin: .85rem 0 0; font-size: .9rem; }
+  .status { margin: 1rem 0 0; padding: .7rem .85rem; border: 1px solid var(--line);
+            border-radius: 6px; font-size: .9rem; white-space: pre-wrap; }
+  .status.error { border-color: #d05252; color: #d05252; }
+  video { width: 100%; margin-top: 1rem; border-radius: 6px; background: #000; }
+  code { font: .88em ui-monospace, SFMono-Regular, Menlo, monospace; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+
+<h1>Confidential Generation</h1>
+<p class="sub">
+  A reference client for encrypting generated video before it reaches persistent storage.
+</p>
+
+<form id="form">
+  <fieldset>
+    <legend>Endpoint</legend>
+    <label for="api">API base URL</label>
+    <input id="api" type="text" value="http://127.0.0.1:8787" spellcheck="false">
+  </fieldset>
+
+  <fieldset>
+    <legend>Generation</legend>
+    <label for="prompt">Prompt</label>
+    <textarea id="prompt">A cinematic ocean scene at dusk, slow drifting camera</textarea>
+
+    <div class="row">
+      <div>
+        <label for="quality">Quality</label>
+        <select id="quality">
+          <option value="fast">fast</option>
+          <option value="standard" selected>standard</option>
+          <option value="hd">hd</option>
+        </select>
+      </div>
+      <div>
+        <label for="aspect">Aspect ratio</label>
+        <select id="aspect">
+          <option>16:9</option><option>9:16</option><option>1:1</option>
+          <option>4:3</option><option>3:4</option>
+        </select>
+      </div>
+      <div>
+        <label for="duration">Duration (s)</label>
+        <input id="duration" type="number" value="5" min="1" max="20" step="1">
+      </div>
+    </div>
+  </fieldset>
+
+  <fieldset>
+    <legend>Privacy</legend>
+
+    <label class="choice">
+      <input type="radio" name="privacy" value="standard" checked>
+      <span><strong>Standard</strong> — the video is stored as-is and streams normally.</span>
+    </label>
+    <label class="choice">
+      <input type="radio" name="privacy" value="confidential">
+      <span><strong>Confidential</strong> — the video is encrypted before it is stored.</span>
+    </label>
+
+    <div id="passphrase-fields" hidden>
+      <label for="passphrase">Passphrase</label>
+      <input id="passphrase" type="password" autocomplete="new-password">
+
+      <label for="passphrase2">Confirm passphrase</label>
+      <input id="passphrase2" type="password" autocomplete="new-password">
+
+      <p class="note">
+        Your video will be encrypted before persistent storage. You will need this
+        passphrase to decrypt it later. <strong>We cannot recover a lost passphrase.</strong>
+      </p>
+    </div>
+  </fieldset>
+
+  <button id="submit" type="submit">Generate</button>
+</form>
+
+<div id="status" class="status" hidden></div>
+
+<section id="playback" hidden>
+  <h2>Encrypted video</h2>
+  <p class="sub" id="playback-detail"></p>
+
+  <label for="unlock">Enter passphrase to decrypt</label>
+  <input id="unlock" type="password" autocomplete="current-password">
+  <p style="margin:.75rem 0 0">
+    <button id="decrypt" type="button">Decrypt &amp; Play</button>
+    <button id="delete" type="button" class="secondary">Delete</button>
+  </p>
+
+  <video id="video" controls playsinline></video>
+</section>
+
+<script type="module">
+import {
+  newKdfParams, deriveKey, wipe, generate, fetchAndDecrypt, attachToVideo, DecryptionError
+} from "./confidential-generation.js";
+
+const $ = (id) => document.getElementById(id);
+const statusBox = $("status");
+
+/*
+ * Session-memory retention, stated out loud because §32 requires it to be deliberate:
+ *
+ * `session` holds the derived key for the current tab so that the user is not asked for
+ * the passphrase again between submitting and playing back the same generation. It is a
+ * plain JavaScript object - not sessionStorage, not localStorage - so it dies with the
+ * tab, is not readable by another origin, and never touches disk. The passphrase itself is
+ * not kept even here: only the derived key, and only until the page is closed or a new
+ * generation replaces it.
+ */
+const session = { key: null, kdf: null, jobId: null, revoke: null };
+
+function say(message, isError = false) {
+  statusBox.hidden = false;
+  statusBox.textContent = message;
+  statusBox.classList.toggle("error", isError);
+}
+
+function privacyMode() {
+  return document.querySelector('input[name="privacy"]:checked').value;
+}
+
+for (const radio of document.querySelectorAll('input[name="privacy"]')) {
+  radio.addEventListener("change", () => {
+    $("passphrase-fields").hidden = privacyMode() !== "confidential";
+  });
+}
+
+$("form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const api = $("api").value.trim();
+  const confidential = privacyMode() === "confidential";
+
+  let key = null;
+  let kdf = null;
+
+  if (confidential) {
+    const passphrase = $("passphrase").value;
+    if (passphrase.length < 8) return say("Use a passphrase of at least 8 characters.", true);
+    if (passphrase !== $("passphrase2").value) return say("The passphrases do not match.", true);
+
+    kdf = newKdfParams();
+    say("Deriving key…");
+    key = await deriveKey(passphrase, kdf);
+
+    // The passphrase has done its job. Clearing the inputs is cosmetic - the browser may
+    // still hold copies - but there is no reason to leave it on screen.
+    $("passphrase").value = "";
+    $("passphrase2").value = "";
+  }
+
+  $("submit").disabled = true;
+  try {
+    say("Submitting…");
+    const job = await generate(
+      api,
+      {
+        backend: "h3-blackwell",
+        prompt: $("prompt").value,
+        quality: $("quality").value,
+        aspect_ratio: $("aspect").value,
+        duration: Number($("duration").value)
+      },
+      { key, kdf }
+    );
+
+    session.key = key;
+    session.kdf = kdf;
+    session.jobId = job.jobId;
+
+    say(
+      `Submitted.\nprivacyMode = ${job.privacyMode}\njobId = ${job.jobId}\n` +
+        `RunPod id = ${job.id}\n\nWatching progress…`
+    );
+    watch(api, job);
+  } catch (error) {
+    say(error.message, true);
+    wipe(key);
+  } finally {
+    $("submit").disabled = false;
+  }
+});
+
+/** Follow the realtime channel to completion. */
+function watch(api, job) {
+  const socket = new WebSocket(
+    api.replace(/^http/, "ws") + `/ws/jobs/${encodeURIComponent(job.jobId)}`
+  );
+
+  socket.addEventListener("message", (event) => {
+    const message = JSON.parse(event.data);
+    if (message.type === "progress") {
+      say(`${message.phase}${message.percent !== undefined ? ` — ${message.percent}%` : ""}`);
+    } else if (message.type === "completed") {
+      socket.close();
+      onComplete(api, job);
+    } else if (message.type === "failed") {
+      socket.close();
+      say(`Generation failed: ${message.error?.message || "unknown error"}`, true);
+    }
+  });
+
+  socket.addEventListener("error", () => say("Lost the progress connection.", true));
+}
+
+async function onComplete(api, job) {
+  if (job.privacyMode !== "confidential") {
+    say("Done. Standard generation - playing directly from storage.");
+    $("playback").hidden = false;
+    $("unlock").hidden = true;
+    $("decrypt").hidden = true;
+    $("video").src = `${api.replace(/\/+$/, "")}/jobs/${encodeURIComponent(job.jobId)}/video`;
+    return;
+  }
+
+  say("Done. The stored artefact is ciphertext; decrypt it below to watch it.");
+  $("playback").hidden = false;
+  $("playback-detail").textContent =
+    `AES-256-GCM · key derived with ${session.kdf.name} · nothing stored by the platform ` +
+    "can decrypt this.";
+
+  // The key is already in memory from submission, so no second prompt is needed in this
+  // tab. Someone opening the page fresh types the passphrase into the field below.
+  $("unlock").hidden = Boolean(session.key);
+  await decryptAndPlay(api, job.jobId);
+}
+
+$("decrypt").addEventListener("click", () => decryptAndPlay($("api").value.trim(), session.jobId));
+
+async function decryptAndPlay(api, jobId) {
+  if (!jobId) return say("No generation to decrypt yet.", true);
+
+  let key = session.key;
+  let derived = false;
+
+  try {
+    if (!key) {
+      const passphrase = $("unlock").value;
+      if (!passphrase) return say("Enter the passphrase.", true);
+      if (!session.kdf) return say("The KDF parameters for this artefact are unknown.", true);
+      say("Deriving key…");
+      key = await deriveKey(passphrase, session.kdf);
+      derived = true;
+    }
+
+    say("Downloading and decrypting…");
+    const { blob } = await fetchAndDecrypt(api, jobId, key);
+
+    // Revoke the previous object URL before creating another, or every decrypt leaks a
+    // copy of the video for as long as the tab lives.
+    if (session.revoke) session.revoke();
+    session.revoke = attachToVideo($("video"), blob);
+
+    say(`Decrypted locally — ${blob.size.toLocaleString()} bytes. Nothing was sent to decrypt it.`);
+    $("video").play().catch(() => {});
+  } catch (error) {
+    say(error instanceof DecryptionError ? error.message : `Failed: ${error.message}`, true);
+  } finally {
+    if (derived) wipe(key);
+  }
+}
+
+$("delete").addEventListener("click", async () => {
+  const api = $("api").value.trim();
+  if (!session.jobId) return;
+  const response = await fetch(`${api.replace(/\/+$/, "")}/jobs/${encodeURIComponent(session.jobId)}`, {
+    method: "DELETE"
+  });
+  const body = await response.json();
+  say(`Deleted: ${JSON.stringify(body)}`);
+  if (session.revoke) session.revoke();
+});
+
+window.addEventListener("pagehide", () => {
+  wipe(session.key);
+  if (session.revoke) session.revoke();
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,50 @@
+{
+  "_comment": "Conformance vector for the CGEN confidential container. Regenerate with scripts/make_container_vector.py. The key and nonce are fixed for reproducibility and must never appear in production.",
+  "container_base64": "Q0dFTgEBARh7ImFsZyI6IkFFUy0yNTYtR0NNIiwiYXJ0aWZhY3RJZCI6IjExMTExMTExLTIyMjItMzMzMy00NDQ0LTU1NTU1NTU1NTU1NSIsImNvbnRlbnRUeXBlIjoidmlkZW8vbXA0IiwiY3JlYXRlZEF0IjoiMjAyNi0wMS0wMVQwMDowMDowMFoiLCJrZGYiOnsibmFtZSI6InBia2RmMi1zaGEyNTYiLCJwYXJhbWV0ZXJzIjp7Iml0ZXJhdGlvbnMiOjYwMDAwMH0sInNhbHQiOiJZMjl1Wm05eWJXRnVZMlV0YzJGc2RBIn0sImtleUlkIjoiZGVtby1rZXktMSIsInBsYWludGV4dEJ5dGVzIjoxMTYsInYiOjF9ZGVmZ2hpamtsbW5vrl4Wxtnr4QFHDheKo0fIDo9QRwUS+bu22q84o/K319Wc2X8O/OuYb4GJpmEMvt1UO4EwnyyBZ9lDKhA85A1/ftkVSSwW4I8AypFbJJVSCiKab+t+LjFtUYLjzcJ36G87X5RZcK7ZuwJgeojXwFE9W9lmtKPiP/2No4k/cV4CcZc9/uAN",
+  "container_bytes": 432,
+  "container_hex": "4347454e010101187b22616c67223a224145532d3235362d47434d222c2261727469666163744964223a2231313131313131312d323232322d333333332d343434342d353535353535353535353535222c22636f6e74656e7454797065223a22766964656f2f6d7034222c22637265617465644174223a22323032362d30312d30315430303a30303a30305a222c226b6466223a7b226e616d65223a2270626b6466322d736861323536222c22706172616d6574657273223a7b22697465726174696f6e73223a3630303030307d2c2273616c74223a22593239755a6d39796257467559325574633246736441227d2c226b65794964223a2264656d6f2d6b65792d31222c22706c61696e746578744279746573223a3131362c2276223a317d6465666768696a6b6c6d6e6fae5e16c6d9ebe101470e178aa347c80e8f50470512f9bbb6daaf38a3f2b7d7d59cd97f0efceb986f8189a6610cbedd543b81309f2c8167d9432a103ce40d7f7ed915492c16e08f00ca915b2495520a229a6feb7e2e316d5182e3cdc277e86f3b5f945970aed9bb02607a88d7c0513d5bd966b4a3e23ffd8da3893f715e0271973dfee00d",
+  "created_at": "2026-01-01T00:00:00Z",
+  "facts": {
+    "algorithm": "AES-256-GCM",
+    "ciphertext_bytes": 116,
+    "plaintext_bytes": 116,
+    "suite": 1,
+    "version": 1
+  },
+  "generation_id": "11111111-2222-3333-4444-555555555555",
+  "header": {
+    "alg": "AES-256-GCM",
+    "artifactId": "11111111-2222-3333-4444-555555555555",
+    "contentType": "video/mp4",
+    "createdAt": "2026-01-01T00:00:00Z",
+    "kdf": {
+      "name": "pbkdf2-sha256",
+      "parameters": {
+        "iterations": 600000
+      },
+      "salt": "Y29uZm9ybWFuY2Utc2FsdA"
+    },
+    "keyId": "demo-key-1",
+    "plaintextBytes": 116,
+    "v": 1
+  },
+  "header_length": 280,
+  "kdf": {
+    "derived_key_hex": "02d486f8386de63a955c1bead3a18108f582eec2e2b6cef0988b4e6e230ffe40",
+    "name": "pbkdf2-sha256",
+    "parameters": {
+      "iterations": 600000
+    },
+    "passphrase": "correct horse battery staple",
+    "salt": "Y29uZm9ybWFuY2Utc2FsdA",
+    "salt_utf8": "conformance-salt"
+  },
+  "key_hex": "02d486f8386de63a955c1bead3a18108f582eec2e2b6cef0988b4e6e230ffe40",
+  "nonce_hex": "6465666768696a6b6c6d6e6f",
+  "offsets": {
+    "ciphertext": 300,
+    "nonce": 288,
+    "preamble": 8
+  },
+  "plaintext_hex": "00000018667479706d703432636f6e666f726d616e636520766563746f72207061796c6f6164636f6e666f726d616e636520766563746f72207061796c6f6164636f6e666f726d616e636520766563746f72207061796c6f6164636f6e666f726d616e636520766563746f72207061796c6f6164"
+}
