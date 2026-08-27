@@ -1940,6 +1940,20 @@ def collect_outputs(
             if path is None:
                 path = download_output(entry, os.path.join(scratch, entry["filename"]))
 
+            # Confidential mode's contract includes destroying the plaintext, and this is
+            # the only place that deletes a file without the directory guard
+            # _discard_output_file applies. So the guard moves here instead: an artefact
+            # that resolved outside a directory we own is refused rather than encrypted
+            # and shredded. `path` is built from ComfyUI's own history entry, which is
+            # trustworthy in normal operation and is exactly the wrong thing to trust when
+            # the next step is an unconditional delete.
+            if protector.encrypts and not _is_owned_artifact(path, scratch):
+                raise WorkflowError(
+                    f"Refusing to encrypt {entry['filename']}: it resolved outside this "
+                    "worker's own output directories, and confidential mode would have to "
+                    "delete it."
+                )
+
             protected = protector.protect(
                 GeneratedArtifact(
                     path=path,
@@ -1988,6 +2002,22 @@ _ARTIFACT_MIME_TYPES = {
 
 def _artifact_mime_type(filename: str) -> str:
     return _ARTIFACT_MIME_TYPES.get(os.path.splitext(filename)[1].lower(), "application/octet-stream")
+
+
+def _is_owned_artifact(path: str, scratch: str) -> bool:
+    """Is this file somewhere this worker put it?
+
+    The same question _discard_output_file asks, plus the per-job scratch directory that
+    download_output writes into.
+    """
+    try:
+        resolved = os.path.realpath(path)
+    except OSError:
+        return False
+    roots = (COMFY_OUTPUT_DIR, COMFY_TEMP_DIR, scratch)
+    return any(
+        resolved.startswith(os.path.realpath(root) + os.sep) for root in roots if root
+    )
 
 
 def _discard_output_file(path: str) -> None:
@@ -2084,7 +2114,15 @@ def handler(job: dict) -> dict:
         # Resolved before anything expensive starts: a job that cannot be protected the way
         # it asked should cost zero GPU seconds, not fail after two minutes of sampling.
         protector = build_protector_for_job(job_input)
-        generation_id = str(_spec(job_input, "progress").get("jobId") or job_id)
+        # The id the artefact is filed under. Taken from the output block first, because
+        # that is the one the storage key is derived from: an encrypted container records
+        # this id in its authenticated header, and the upload endpoint refuses a container
+        # whose header names a different job.
+        generation_id = str(
+            _spec(job_input, "output").get("jobId")
+            or _spec(job_input, "progress").get("jobId")
+            or job_id
+        )
         timer.privacy_mode = protector.mode
         log(
             f"generation_id={generation_id} privacy_mode={protector.mode} "
@@ -2097,7 +2135,6 @@ def handler(job: dict) -> dict:
             # this job's RunPod result, which is a copy of the artefact in a store we do not
             # control. Refusing is the honest answer; silently returning the plaintext MP4
             # would be the dangerous one.
-            status = "bad_request"
             raise WorkflowError(
                 "privacyMode 'confidential' requires an output upload endpoint. This job "
                 "arrived without one, and returning the artefact inline is not an option "

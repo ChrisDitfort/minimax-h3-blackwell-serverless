@@ -657,6 +657,42 @@ class TestCleanup(unittest.TestCase):
         finally:
             os.rmdir(scratch)
 
+    def test_an_artefact_outside_our_own_directories_is_refused_not_shredded(self):
+        """Confidential mode deletes the plaintext, so it must not accept a stray path.
+
+        `path` comes from ComfyUI's history entry. That is trustworthy in normal operation
+        and is exactly the wrong thing to trust when the next step is an unconditional
+        delete, so the escape is refused before anything is encrypted.
+        """
+        outside = os.path.join(tempfile.mkdtemp(prefix="not-ours-"), "elsewhere.mp4")
+        with open(outside, "wb") as handle:
+            handle.write(sample_video())
+
+        history = {
+            "outputs": {
+                "9": {
+                    "images": [
+                        {
+                            # Escapes COMFY_OUTPUT_DIR via the subfolder.
+                            "filename": "elsewhere.mp4",
+                            "subfolder": os.path.relpath(
+                                os.path.dirname(outside), handler.COMFY_OUTPUT_DIR
+                            ),
+                            "type": "output",
+                        }
+                    ]
+                }
+            }
+        }
+
+        store = CapturingStore()
+        with self.assertRaisesRegex(handler.WorkflowError, "resolved outside"):
+            handler.collect_outputs(history, store=store, protector=confidential_protector())
+
+        self.assertEqual(store.calls, [], "nothing may be uploaded")
+        self.assertTrue(os.path.exists(outside), "a file we do not own must not be deleted")
+        os.remove(outside)
+
     def test_shred_removes_a_file_and_tolerates_a_missing_one(self):
         path = write_output("shred.mp4")
         self.assertTrue(artifacts.shred(path))
@@ -752,6 +788,28 @@ class TestHandlerWiring(unittest.TestCase):
         self.assertTrue(result["encrypted"])
         self.assertEqual(result["artifact"]["algorithm"], "AES-256-GCM")
         self.assertNotIn("key", result["artifact"])
+
+    def test_the_generation_id_comes_from_the_block_the_storage_key_is_derived_from(self):
+        """The container header must name the same job the upload endpoint will check."""
+        self.assertEqual(
+            handler.build_protector_for_job({"privacy": {"mode": "standard"}}).mode, "standard"
+        )
+
+        captured = {}
+
+        class Recording(artifacts.PassthroughProtector):
+            def protect(self, artifact):
+                captured["id"] = artifact.generation_id
+                return super().protect(artifact)
+
+        write_output("genid.mp4")
+        handler.collect_outputs(
+            history_for("genid.mp4"),
+            store=CapturingStore(),
+            protector=Recording(),
+            generation_id="worker-job-id",
+        )
+        self.assertEqual(captured["id"], "worker-job-id")
 
     def test_the_perf_line_quantifies_what_encryption_cost(self):
         """The point of measuring is being able to answer 'how much does this cost?'."""

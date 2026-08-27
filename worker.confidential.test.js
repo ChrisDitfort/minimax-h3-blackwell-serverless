@@ -856,6 +856,66 @@ test("deleting a confidential artefact twice is safe", async () => {
 });
 
 /* ====================================================================================
+ * End to end, through every real component
+ * ================================================================================== */
+
+test("a real Python-encrypted video survives upload, storage, retrieval and decryption", async () => {
+  /*
+   * Everything in this test is the production article except the R2 binding and the GPU:
+   * the ciphertext was produced by artifacts.py, it goes in through the Worker's real
+   * upload gate, comes back out through the real retrieval route, and is opened by the
+   * real browser module using only a passphrase.
+   *
+   * If any one of those four disagrees about the format, this fails - which is the point.
+   */
+  const { deriveKey, decryptArtifact } = await import("./client/confidential-generation.js");
+
+  const jobId = VECTOR.generation_id;
+  const container = Uint8Array.from(Buffer.from(VECTOR.container_hex, "hex"));
+  const env = makeEnv();
+
+  // 1. RunPod uploads what it encrypted.
+  const uploaded = await upload(env, jobId, container);
+  assert.equal(uploaded.status, 201);
+  assert.equal((await uploaded.json()).key, `outputs/${jobId}/artifact.enc`);
+
+  // 2. R2 holds ciphertext - not the video, and not anything that looks like one.
+  const stored = env.__bucket.get(`outputs/${jobId}/artifact.enc`).bytes;
+  const plaintext = Uint8Array.from(Buffer.from(VECTOR.plaintext_hex, "hex"));
+  assert.notDeepEqual([...stored], [...plaintext]);
+  assert.ok(!Buffer.from(stored).includes(Buffer.from(plaintext)));
+  assert.ok(
+    !Buffer.from(stored.subarray(0, 12)).includes(Buffer.from("ftyp")),
+    "the stored object must not begin with an MP4 signature"
+  );
+
+  // 3. The browser fetches it back through the public route.
+  const response = await worker.fetch(
+    new Request(`https://worker.example/jobs/${jobId}/artifact`),
+    env
+  );
+  assert.equal(response.headers.get("X-Artifact-Encrypted"), "true");
+  const downloaded = new Uint8Array(await response.arrayBuffer());
+
+  // 4. A passphrase, and only a passphrase, opens it.
+  const key = await deriveKey(VECTOR.kdf.passphrase, VECTOR.kdf);
+  const { blob, header } = await decryptArtifact(downloaded, key, { expectArtifactId: jobId });
+
+  assert.deepEqual([...new Uint8Array(await blob.arrayBuffer())], [...plaintext]);
+  assert.equal(blob.type, "video/mp4");
+  assert.equal(header.artifactId, jobId);
+
+  // 5. Nothing the platform kept could have done that.
+  const everythingStored = JSON.stringify({
+    r2: [...env.__bucket.entries()].map(([k, v]) => [k, v.options]),
+    jobState: env.__state()
+  });
+  assert.ok(!everythingStored.includes(VECTOR.key_hex));
+  assert.ok(!everythingStored.includes(Buffer.from(VECTOR.key_hex, "hex").toString("base64")));
+  assert.ok(!everythingStored.includes(VECTOR.kdf.passphrase));
+});
+
+/* ====================================================================================
  * Container parsing conformance
  * ================================================================================== */
 

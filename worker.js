@@ -1514,6 +1514,11 @@ async function buildCallbackBlocks(env, jobId, origin, settings, privacy) {
     },
     output: {
       url: `${base}/internal/jobs/${jobId}/output`,
+      // Repeated here, not only in the progress block: the handler stamps this id into the
+      // encrypted container's authenticated header, and the upload endpoint checks it
+      // matches. Deriving it from a *different* block would make the two agree only by
+      // coincidence.
+      jobId,
       token: await signJobToken(secret, jobId, TOKEN_PURPOSES.output, ttl, {
         pm: privacy?.mode ?? DEFAULT_PRIVACY_MODE,
         ...(privacy?.expiresAt ? { exa: privacy.expiresAt } : {})
