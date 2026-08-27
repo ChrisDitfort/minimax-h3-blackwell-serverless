@@ -1,21 +1,28 @@
 <!doctype html>
 <!--
-  Confidential Generation - minimal reference UI.
+  Confidential Generation - minimal reference UI (crypto v2, hybrid).
 
   This repository has no frontend, so this page is the integration example rather than the
-  product: it is the smallest thing that exercises the whole path end to end and shows what
-  a real form has to get right.
+  product: the smallest thing that exercises the whole path and shows what a real form has
+  to get right.
 
-  Open it directly (file://) or serve it from anywhere; set the API base in the field at
-  the top. It imports ./confidential-generation.js and nothing else.
+  Open it directly (file://) or serve it from anywhere; set the API base at the top. It
+  imports ./confidential-generation.js and nothing else.
 
   WHAT THIS PAGE DELIBERATELY DOES NOT DO
-  - The passphrase is never sent anywhere. Only a key derived from it is, once, at
-    submission.
-  - The passphrase is never written to localStorage, sessionStorage, the URL, a query
-    string, a cookie or an analytics call. It lives in one JavaScript variable for as long
-    as the tab is open, and in the password inputs the user typed it into.
-  - There is no "remember my passphrase". There is no recovery. Both are the point.
+  - The passphrase is never sent anywhere. It derives a key-encryption key locally, and
+    that key never leaves this page either.
+  - The private key is never sent anywhere. Only the public half goes with a request.
+  - The passphrase is never written to localStorage, the URL, a query string, a cookie or
+    an analytics call.
+  - There is no "remember my passphrase" and no recovery. Both are the point.
+
+  WHAT IT DOES STORE, AND WHY THAT IS SAFE
+  - The key *bundle* is kept in localStorage. It holds a public key and a private key that
+    is AES-256-GCM ciphertext under a passphrase-derived key. Without the passphrase it is
+    inert. Storing it is what lets the same browser reuse one key pair across videos.
+  - Losing it is not fatal if it was exported; losing it *and* the export is the same as
+    losing the passphrase. The Export button exists for exactly that reason.
 -->
 <html lang="en">
 <head>
@@ -34,11 +41,13 @@
     --warn-bg: #fff6e5;
     --warn-line: #e8c37a;
     --warn-fg: #6b4a05;
+    --ok-fg: #1f6b4a;
   }
   @media (prefers-color-scheme: dark) {
     :root {
       --bg: #14161a; --fg: #e7e9ee; --muted: #99a0ad; --line: #2c3038;
       --accent: #7fa0ff; --warn-bg: #2a2313; --warn-line: #6b5620; --warn-fg: #f0d9a4;
+      --ok-fg: #6fcfa0;
     }
   }
   * { box-sizing: border-box; }
@@ -73,6 +82,8 @@
   .status { margin: 1rem 0 0; padding: .7rem .85rem; border: 1px solid var(--line);
             border-radius: 6px; font-size: .9rem; white-space: pre-wrap; }
   .status.error { border-color: #d05252; color: #d05252; }
+  .keyline { font: .82rem/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--muted); }
+  .keyline b { color: var(--ok-fg); }
   video { width: 100%; margin-top: 1rem; border-radius: 6px; background: #000; }
   code { font: .88em ui-monospace, SFMono-Regular, Menlo, monospace; }
   [hidden] { display: none !important; }
@@ -82,16 +93,56 @@
 
 <h1>Confidential Generation</h1>
 <p class="sub">
-  A reference client for encrypting generated video before it reaches persistent storage.
+  Hybrid encryption. The inference worker gets a public key; only your passphrase gets the
+  video back.
 </p>
 
-<form id="form">
-  <fieldset>
-    <legend>Endpoint</legend>
-    <label for="api">API base URL</label>
-    <input id="api" type="text" value="http://127.0.0.1:8787" spellcheck="false">
-  </fieldset>
+<fieldset>
+  <legend>Endpoint</legend>
+  <label for="api">API base URL</label>
+  <input id="api" type="text" value="http://127.0.0.1:8787" spellcheck="false">
+</fieldset>
 
+<fieldset>
+  <legend>Your key</legend>
+
+  <div id="no-key">
+    <p class="sub" style="margin:.25rem 0 0">
+      You do not have a key on this device yet. Creating one generates an RSA key pair in
+      your browser and encrypts the private half with your passphrase.
+    </p>
+    <label for="new-passphrase">Passphrase</label>
+    <input id="new-passphrase" type="password" autocomplete="new-password">
+    <label for="new-passphrase2">Confirm passphrase</label>
+    <input id="new-passphrase2" type="password" autocomplete="new-password">
+    <p class="note">
+      Your videos will be encrypted before persistent storage. You will need this passphrase
+      to decrypt them later. <strong>We cannot recover a lost passphrase.</strong>
+    </p>
+    <p style="margin:.85rem 0 0">
+      <button id="create-key" type="button">Create key</button>
+      <button id="import-key" type="button" class="secondary">Import a bundle</button>
+    </p>
+  </div>
+
+  <div id="have-key" hidden>
+    <p class="keyline">
+      key id <b id="key-id"></b> · <span id="key-alg"></span> · private key encrypted with
+      <span id="key-kdf"></span>
+    </p>
+    <p style="margin:.85rem 0 0">
+      <button id="export-key" type="button" class="secondary">Export bundle</button>
+      <button id="forget-key" type="button" class="secondary">Forget this key</button>
+    </p>
+    <p class="note" style="font-size:.85rem">
+      The bundle contains your public key and your <em>encrypted</em> private key. It is
+      useless without the passphrase — but if you lose both, every confidential video you
+      have made becomes unrecoverable. Export it somewhere safe.
+    </p>
+  </div>
+</fieldset>
+
+<form id="form">
   <fieldset>
     <legend>Generation</legend>
     <label for="prompt">Prompt</label>
@@ -122,28 +173,15 @@
 
   <fieldset>
     <legend>Privacy</legend>
-
     <label class="choice">
       <input type="radio" name="privacy" value="standard" checked>
       <span><strong>Standard</strong> — the video is stored as-is and streams normally.</span>
     </label>
     <label class="choice">
       <input type="radio" name="privacy" value="confidential">
-      <span><strong>Confidential</strong> — the video is encrypted before it is stored.</span>
+      <span><strong>Confidential</strong> — encrypted to your public key before storage.</span>
     </label>
-
-    <div id="passphrase-fields" hidden>
-      <label for="passphrase">Passphrase</label>
-      <input id="passphrase" type="password" autocomplete="new-password">
-
-      <label for="passphrase2">Confirm passphrase</label>
-      <input id="passphrase2" type="password" autocomplete="new-password">
-
-      <p class="note">
-        Your video will be encrypted before persistent storage. You will need this
-        passphrase to decrypt it later. <strong>We cannot recover a lost passphrase.</strong>
-      </p>
-    </div>
+    <p id="need-key" class="note" hidden>Create or import a key first.</p>
   </fieldset>
 
   <button id="submit" type="submit">Generate</button>
@@ -167,23 +205,26 @@
 
 <script type="module">
 import {
-  newKdfParams, deriveKey, wipe, generate, fetchAndDecrypt, attachToVideo, DecryptionError
+  createKeyBundle, unlockKeyBundle, exportKeyBundle, importKeyBundle,
+  generate, fetchAndDecrypt, attachToVideo, DecryptionError
 } from "./confidential-generation.js";
 
 const $ = (id) => document.getElementById(id);
 const statusBox = $("status");
+const BUNDLE_STORAGE_KEY = "confidential-generation.keyBundle.v1";
 
 /*
- * Session-memory retention, stated out loud because §32 requires it to be deliberate:
+ * Session state, stated out loud because it is the part worth scrutinising.
  *
- * `session` holds the derived key for the current tab so that the user is not asked for
- * the passphrase again between submitting and playing back the same generation. It is a
- * plain JavaScript object - not sessionStorage, not localStorage - so it dies with the
- * tab, is not readable by another origin, and never touches disk. The passphrase itself is
- * not kept even here: only the derived key, and only until the page is closed or a new
- * generation replaces it.
+ * `unlocked` holds a non-extractable CryptoKey for the current tab, so the user is not
+ * asked for the passphrase again between generating and playing back. It is a plain
+ * JavaScript object - not sessionStorage, not localStorage - so it dies with the tab and
+ * never touches disk. The passphrase itself is not kept even here.
+ *
+ * `bundle` is persisted, and safely: the private key inside it is ciphertext.
  */
-const session = { key: null, kdf: null, jobId: null, revoke: null };
+const session = { unlocked: null, jobId: null, revoke: null, privacyMode: "standard" };
+let bundle = loadBundle();
 
 function say(message, isError = false) {
   statusBox.hidden = false;
@@ -191,38 +232,102 @@ function say(message, isError = false) {
   statusBox.classList.toggle("error", isError);
 }
 
+function loadBundle() {
+  try {
+    const stored = localStorage.getItem(BUNDLE_STORAGE_KEY);
+    return stored ? importKeyBundle(stored) : null;
+  } catch {
+    return null;
+  }
+}
+
+function renderKey() {
+  $("no-key").hidden = Boolean(bundle);
+  $("have-key").hidden = !bundle;
+  if (bundle) {
+    $("key-id").textContent = bundle.keyId;
+    $("key-alg").textContent = bundle.publicKeyAlgorithm;
+    $("key-kdf").textContent = bundle.kdf.name;
+  }
+  $("need-key").hidden = Boolean(bundle) || privacyMode() !== "confidential";
+}
+
 function privacyMode() {
   return document.querySelector('input[name="privacy"]:checked').value;
 }
 
 for (const radio of document.querySelectorAll('input[name="privacy"]')) {
-  radio.addEventListener("change", () => {
-    $("passphrase-fields").hidden = privacyMode() !== "confidential";
-  });
+  radio.addEventListener("change", renderKey);
 }
+
+/* -- key management ------------------------------------------------------------------ */
+
+$("create-key").addEventListener("click", async () => {
+  const passphrase = $("new-passphrase").value;
+  if (passphrase.length < 8) return say("Use a passphrase of at least 8 characters.", true);
+  if (passphrase !== $("new-passphrase2").value) return say("The passphrases do not match.", true);
+
+  $("create-key").disabled = true;
+  try {
+    say("Generating a key pair and encrypting the private half…");
+    bundle = await createKeyBundle(passphrase);
+    localStorage.setItem(BUNDLE_STORAGE_KEY, exportKeyBundle(bundle));
+
+    // Unlock immediately so the first generation does not ask again.
+    session.unlocked = await unlockKeyBundle(bundle, passphrase);
+
+    $("new-passphrase").value = "";
+    $("new-passphrase2").value = "";
+    renderKey();
+    say(`Key ${bundle.keyId} created. Export the bundle before you rely on it.`);
+  } catch (error) {
+    say(error.message, true);
+  } finally {
+    $("create-key").disabled = false;
+  }
+});
+
+$("export-key").addEventListener("click", () => {
+  // A textarea rather than a download: the artifact sandbox blocks page-initiated
+  // downloads, and copy-paste works everywhere.
+  const text = exportKeyBundle(bundle);
+  navigator.clipboard?.writeText(text).then(
+    () => say("Key bundle copied to the clipboard. Store it somewhere you trust."),
+    () => say(text)
+  );
+});
+
+$("import-key").addEventListener("click", () => {
+  const text = prompt("Paste a key bundle");
+  if (!text) return;
+  try {
+    bundle = importKeyBundle(text);
+    localStorage.setItem(BUNDLE_STORAGE_KEY, exportKeyBundle(bundle));
+    session.unlocked = null;
+    renderKey();
+    say(`Imported key ${bundle.keyId}.`);
+  } catch (error) {
+    say(error.message, true);
+  }
+});
+
+$("forget-key").addEventListener("click", () => {
+  if (!confirm("Forget this key? Videos encrypted to it become unrecoverable unless you have exported the bundle.")) return;
+  localStorage.removeItem(BUNDLE_STORAGE_KEY);
+  bundle = null;
+  session.unlocked = null;
+  renderKey();
+  say("Key removed from this device.");
+});
+
+/* -- generation ---------------------------------------------------------------------- */
 
 $("form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const api = $("api").value.trim();
   const confidential = privacyMode() === "confidential";
 
-  let key = null;
-  let kdf = null;
-
-  if (confidential) {
-    const passphrase = $("passphrase").value;
-    if (passphrase.length < 8) return say("Use a passphrase of at least 8 characters.", true);
-    if (passphrase !== $("passphrase2").value) return say("The passphrases do not match.", true);
-
-    kdf = newKdfParams();
-    say("Deriving key…");
-    key = await deriveKey(passphrase, kdf);
-
-    // The passphrase has done its job. Clearing the inputs is cosmetic - the browser may
-    // still hold copies - but there is no reason to leave it on screen.
-    $("passphrase").value = "";
-    $("passphrase2").value = "";
-  }
+  if (confidential && !bundle) return say("Create or import a key first.", true);
 
   $("submit").disabled = true;
   try {
@@ -236,27 +341,25 @@ $("form").addEventListener("submit", async (event) => {
         aspect_ratio: $("aspect").value,
         duration: Number($("duration").value)
       },
-      { key, kdf }
+      confidential ? { bundle } : {}
     );
 
-    session.key = key;
-    session.kdf = kdf;
     session.jobId = job.jobId;
+    session.privacyMode = job.privacyMode;
 
     say(
       `Submitted.\nprivacyMode = ${job.privacyMode}\njobId = ${job.jobId}\n` +
-        `RunPod id = ${job.id}\n\nWatching progress…`
+        (job.encryption ? `crypto v${job.encryption.version}, key ${job.encryption.keyId}\n` : "") +
+        "\nWatching progress…"
     );
     watch(api, job);
   } catch (error) {
     say(error.message, true);
-    wipe(key);
   } finally {
     $("submit").disabled = false;
   }
 });
 
-/** Follow the realtime channel to completion. */
 function watch(api, job) {
   const socket = new WebSocket(
     api.replace(/^http/, "ws") + `/ws/jobs/${encodeURIComponent(job.jobId)}`
@@ -279,9 +382,10 @@ function watch(api, job) {
 }
 
 async function onComplete(api, job) {
+  $("playback").hidden = false;
+
   if (job.privacyMode !== "confidential") {
     say("Done. Standard generation - playing directly from storage.");
-    $("playback").hidden = false;
     $("unlock").hidden = true;
     $("decrypt").hidden = true;
     $("video").src = `${api.replace(/\/+$/, "")}/jobs/${encodeURIComponent(job.jobId)}/video`;
@@ -289,15 +393,14 @@ async function onComplete(api, job) {
   }
 
   say("Done. The stored artefact is ciphertext; decrypt it below to watch it.");
-  $("playback").hidden = false;
   $("playback-detail").textContent =
-    `AES-256-GCM · key derived with ${session.kdf.name} · nothing stored by the platform ` +
-    "can decrypt this.";
+    "AES-256-GCM, file key wrapped to your public key with RSA-OAEP-256. Nothing the " +
+    "platform stores can open it.";
 
-  // The key is already in memory from submission, so no second prompt is needed in this
-  // tab. Someone opening the page fresh types the passphrase into the field below.
-  $("unlock").hidden = Boolean(session.key);
-  await decryptAndPlay(api, job.jobId);
+  // Already unlocked in this tab? Then no second prompt is needed.
+  $("unlock").hidden = Boolean(session.unlocked);
+  $("decrypt").hidden = false;
+  if (session.unlocked) await decryptAndPlay(api, job.jobId);
 }
 
 $("decrypt").addEventListener("click", () => decryptAndPlay($("api").value.trim(), session.jobId));
@@ -305,21 +408,18 @@ $("decrypt").addEventListener("click", () => decryptAndPlay($("api").value.trim(
 async function decryptAndPlay(api, jobId) {
   if (!jobId) return say("No generation to decrypt yet.", true);
 
-  let key = session.key;
-  let derived = false;
-
   try {
-    if (!key) {
+    if (!session.unlocked) {
       const passphrase = $("unlock").value;
       if (!passphrase) return say("Enter the passphrase.", true);
-      if (!session.kdf) return say("The KDF parameters for this artefact are unknown.", true);
-      say("Deriving key…");
-      key = await deriveKey(passphrase, session.kdf);
-      derived = true;
+      if (!bundle) return say("No key on this device. Import your bundle first.", true);
+      say("Unlocking your private key…");
+      session.unlocked = await unlockKeyBundle(bundle, passphrase);
+      $("unlock").value = "";
     }
 
     say("Downloading and decrypting…");
-    const { blob } = await fetchAndDecrypt(api, jobId, key);
+    const { blob } = await fetchAndDecrypt(api, jobId, session.unlocked);
 
     // Revoke the previous object URL before creating another, or every decrypt leaks a
     // copy of the video for as long as the tab lives.
@@ -330,8 +430,6 @@ async function decryptAndPlay(api, jobId) {
     $("video").play().catch(() => {});
   } catch (error) {
     say(error instanceof DecryptionError ? error.message : `Failed: ${error.message}`, true);
-  } finally {
-    if (derived) wipe(key);
   }
 }
 
@@ -341,15 +439,16 @@ $("delete").addEventListener("click", async () => {
   const response = await fetch(`${api.replace(/\/+$/, "")}/jobs/${encodeURIComponent(session.jobId)}`, {
     method: "DELETE"
   });
-  const body = await response.json();
-  say(`Deleted: ${JSON.stringify(body)}`);
+  say(`Deleted: ${JSON.stringify(await response.json())}`);
   if (session.revoke) session.revoke();
 });
 
 window.addEventListener("pagehide", () => {
-  wipe(session.key);
+  session.unlocked = null;
   if (session.revoke) session.revoke();
 });
+
+renderKey();
 </script>
 </body>
 </html>

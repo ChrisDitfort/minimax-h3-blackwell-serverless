@@ -1954,14 +1954,23 @@ def collect_outputs(
                     "delete it."
                 )
 
-            protected = protector.protect(
-                GeneratedArtifact(
-                    path=path,
-                    mime_type=_artifact_mime_type(entry["filename"]),
-                    generation_id=generation_id or entry["filename"],
-                    filename=entry["filename"],
+            try:
+                protected = protector.protect(
+                    GeneratedArtifact(
+                        path=path,
+                        mime_type=_artifact_mime_type(entry["filename"]),
+                        generation_id=generation_id or entry["filename"],
+                        filename=entry["filename"],
+                    )
                 )
-            )
+            except ArtifactError as error:
+                # A protection failure is the caller's problem to see, not an unexplained
+                # crash: it means their key was unusable or the artefact could not be
+                # sealed. Either way `store()` is never reached, so nothing is uploaded -
+                # the exception type here changes how the failure reads, never whether it
+                # fails closed.
+                raise WorkflowError(str(error)) from error
+
             protected_artifacts.append(protected)
 
             results.append(store.store(protected.path, entry, protected))

@@ -2085,7 +2085,31 @@ const SECRET_FIELDS = new Set([
   "datakey",
   "wrapped_key",
   "wrappedkey",
-  "h3_key_wrap_key"
+  "h3_key_wrap_key",
+  // Crypto v2. A private key, the key that protects it, and the per-video file key are
+  // the three values whose exposure would undo the whole design.
+  "privatekey",
+  "private_key",
+  "privateencryptionkey",
+  "private_encryption_key",
+  "encryptedprivatekey",
+  "encrypted_private_key",
+  "keyencryptionkey",
+  "key_encryption_key",
+  "kek",
+  "fileencryptionkey",
+  "file_encryption_key",
+  "fek",
+  "decryptionkey",
+  "decryption_key",
+  "derivedkey",
+  "derived_key",
+  "aeskey",
+  "aes_key",
+  "symmetrickey",
+  "symmetric_key",
+  "secretkey",
+  "secret_key"
 ]);
 
 /*
@@ -2096,8 +2120,30 @@ const SECRET_FIELDS = new Set([
  */
 const CRYPTO_PARENTS = new Set(["encryption", "crypto", "kdf", "confidential", "privacy"]);
 
-/** Never redacted: opaque client-chosen labels whose whole purpose is to be visible. */
-const NEVER_REDACT = new Set(["keyid", "key_id", "r2_key", "storage_key", "object_key"]);
+/*
+ * Never redacted. Each is public by construction, and scrubbing them would destroy the
+ * fields an operator needs to answer "which key was this encrypted to?" without helping
+ * anyone decrypt anything. A public key encrypts and cannot decrypt; a wrapped file key is
+ * useless without the private key; a KDF salt is not a secret.
+ */
+const NEVER_REDACT = new Set([
+  "keyid",
+  "key_id",
+  "r2_key",
+  "storage_key",
+  "object_key",
+  "publickey",
+  "public_key",
+  "publickeyalgorithm",
+  "public_key_algorithm",
+  "keywrapalgorithm",
+  "key_wrap_algorithm",
+  "wrappedfilekey",
+  "wrapped_file_key",
+  "cryptoversion",
+  "crypto_version",
+  "salt"
+]);
 
 const REDACTED = "[redacted]";
 

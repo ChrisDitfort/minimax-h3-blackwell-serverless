@@ -20,23 +20,41 @@ Three stages, three types:
 Only the middle stage lives here. Storage belongs to the caller, because where the bytes
 go is a deployment decision and encryption is not.
 
+HYBRID ENCRYPTION (crypto v2)
+----------------------------
+The worker never receives anything that can decrypt what it produces. It is handed an
+*encryption-only public key*, and for each artefact it:
+
+    1. draws a fresh random 256-bit file-encryption key (FEK)
+    2. encrypts the media with AES-256-GCM under that key
+    3. wraps the FEK to the public key with RSA-OAEP-256
+    4. destroys the FEK and deletes the plaintext
+
+The wrapped FEK travels inside the container. The unwrapped one exists only in this
+process, for the duration of one encryption. So a complete copy of the job payload, the job
+result and the stored object is not enough to recover the media: that needs the private
+key, which lives in the caller's browser and never crosses the boundary.
+
+Crypto v1 - where the caller derived a symmetric key from a passphrase and *sent it* -
+remains readable so existing artefacts keep working, and is no longer creatable.
+
 WHAT THIS IS NOT
 ----------------
 This is not zero-knowledge anything. The model needs the plaintext prompt, and it produces
-plaintext frames. Both exist, in the clear, inside the inference process while it runs. The
-property this module provides is narrower and true: *persistent storage receives ciphertext
-only*, and the key that would decrypt it is supplied per request by the caller and is never
-written down here.
+plaintext frames. Both exist, in the clear, inside the inference process while it runs, as
+does the file key for the moment it is in use. The property this module provides is
+narrower and true: *persistent storage receives ciphertext only*, and nothing that reaches
+this process can decrypt it afterwards.
 
 THE CONTAINER FORMAT
 --------------------
 Encrypted artefacts are self-describing, so that a file recovered on its own - from a
-backup, a download folder, an object listing - can still be identified and decrypted with
-nothing but the passphrase. Layout, all integers big-endian::
+backup, a download folder, an object listing - can still be identified and decrypted by
+whoever holds the private key. Layout, all integers big-endian::
 
     offset          size          field
     0               4             MAGIC = b"CGEN"
-    4               1             FORMAT_VERSION (currently 1)
+    4               1             CONTAINER VERSION (1 = symmetric, 2 = hybrid)
     5               1             SUITE (1 = AES-256-GCM, 96-bit nonce, 128-bit tag)
     6               2             HEADER_LEN (uint16)
     8               HEADER_LEN    HEADER, canonical UTF-8 JSON - also the AEAD's
@@ -44,12 +62,18 @@ nothing but the passphrase. Layout, all integers big-endian::
     8 + HEADER_LEN  12            NONCE
     20 + HEADER_LEN ...           CIPHERTEXT followed immediately by the 16-byte TAG
 
-Two deliberate choices in that layout:
+A v2 header carries the key-wrapping block::
 
-* **The header is the AAD.** Nobody can rewrite the recorded algorithm, KDF parameters,
-  content type or artefact id without the key: doing so breaks authentication. So a client
-  that checks ``header["artifactId"]`` against the generation it asked for will detect a
-  substituted object, not merely a corrupted one.
+    "kw": {"alg": "RSA-OAEP-256", "wrappedFileKey": "<base64url>", "keyId": "<derived>"}
+
+Three deliberate choices in that layout:
+
+* **The header is the AAD.** Nobody can rewrite the recorded algorithm, content type,
+  artefact id *or the wrapped file key* without the file key: doing so breaks
+  authentication. That last one matters most - an attacker cannot substitute a file key
+  wrapped to their own public key, because the swap invalidates the tag over the video.
+  The container is bound to one key pair and one generation, not merely accompanied by a
+  claim about them.
 
 * **The tag trails the ciphertext.** That is exactly the byte range WebCrypto's
   ``crypto.subtle.decrypt`` expects for AES-GCM, so a browser decrypts by slicing from the
@@ -57,9 +81,13 @@ Two deliberate choices in that layout:
   forward pass with no seeking, which is what allows a large file to be encrypted in
   constant memory.
 
-The format is versioned at two levels - FORMAT_VERSION for the framing, SUITE for the
-cipher - so a future XChaCha20-Poly1305 or chunked-streaming variant can be added without
-invalidating a single existing artefact. See ``docs/confidential-generation.md``.
+* **No KDF metadata in a v2 container.** The passphrase KDF protects the caller's *private
+  key*, which is account-scoped and never sent here. Repeating it inside every video would
+  imply the platform had a role in deriving it, and it does not.
+
+The format is versioned at two levels - the container version for the framing, SUITE for
+the cipher - so a future XChaCha20-Poly1305 or chunked-streaming variant can be added
+without invalidating a single existing artefact. See ``docs/confidential-generation.md``.
 """
 
 from __future__ import annotations
@@ -1314,6 +1342,30 @@ SECRET_FIELDS = frozenset(
         "wrapped_key",
         "wrappedkey",
         "h3_key_wrap_key",
+        # Crypto v2. A private key, the key that protects it, and the per-video file key
+        # are the three values whose exposure would undo the whole design.
+        "privatekey",
+        "private_key",
+        "privateencryptionkey",
+        "private_encryption_key",
+        "encryptedprivatekey",
+        "encrypted_private_key",
+        "keyencryptionkey",
+        "key_encryption_key",
+        "kek",
+        "fileencryptionkey",
+        "file_encryption_key",
+        "fek",
+        "decryptionkey",
+        "decryption_key",
+        "derivedkey",
+        "derived_key",
+        "aeskey",
+        "aes_key",
+        "symmetrickey",
+        "symmetric_key",
+        "secretkey",
+        "secret_key",
     }
 )
 
@@ -1322,7 +1374,30 @@ SECRET_FIELDS = frozenset(
 CRYPTO_PARENTS = frozenset({"encryption", "crypto", "kdf", "confidential", "privacy"})
 
 #: Never redacted: an opaque client-chosen label whose whole purpose is to be visible.
-NEVER_REDACT = frozenset({"keyid", "key_id", "r2_key", "storage_key", "object_key"})
+#: Never redacted. Each is public by construction, and scrubbing them would destroy the
+#: fields an operator needs to answer "which key was this encrypted to?" without helping
+#: anyone decrypt anything. A public key encrypts and cannot decrypt; a wrapped file key is
+#: useless without the private key; a KDF salt is not a secret.
+NEVER_REDACT = frozenset(
+    {
+        "keyid",
+        "key_id",
+        "r2_key",
+        "storage_key",
+        "object_key",
+        "publickey",
+        "public_key",
+        "publickeyalgorithm",
+        "public_key_algorithm",
+        "keywrapalgorithm",
+        "key_wrap_algorithm",
+        "wrappedfilekey",
+        "wrapped_file_key",
+        "cryptoversion",
+        "crypto_version",
+        "salt",
+    }
+)
 
 REDACTED = "[redacted]"
 

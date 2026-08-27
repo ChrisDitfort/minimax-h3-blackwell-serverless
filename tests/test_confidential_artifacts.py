@@ -711,7 +711,10 @@ class TestCleanup(unittest.TestCase):
                 raise artifacts.ArtifactError("encryption exploded")
 
         store = CapturingStore()
-        with self.assertRaises(artifacts.ArtifactError):
+        # Surfaces as a WorkflowError: a protection failure is something the caller needs
+        # to see, not an unexplained crash. What matters either way is the two assertions
+        # below - nothing uploaded, nothing left behind.
+        with self.assertRaises(handler.WorkflowError):
             handler.collect_outputs(
                 history_for("cleanup-fail.mp4"),
                 store=store,
