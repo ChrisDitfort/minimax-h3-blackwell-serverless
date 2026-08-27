@@ -409,14 +409,34 @@ name so the routing layer does not need reshaping later.
 
 ## Confidential Generation
 
-Optional per-request privacy mode. The video is encrypted **inside the RunPod container**
-with a key the browser derived, before it reaches R2. Persistent storage receives ciphertext
-only; the browser decrypts for playback.
+Optional per-request privacy mode using **hybrid encryption**. The inference worker receives
+an encryption-only public key, generates a fresh random file key per video, encrypts with
+AES-256-GCM, and wraps that file key to the public key. Persistent storage receives
+ciphertext only; the browser unwraps and decrypts for playback.
+
+The property this buys:
+
+> A complete copy of the RunPod job input, the RunPod job output, Cloudflare application
+> state and R2 storage is **not enough** to decrypt an artefact without the user's
+> passphrase or an unlocked private key.
 
 Standard generation is unchanged. A request with no `privacyMode` behaves exactly as before.
 
 Full design, trust boundaries and threat model: **[docs/confidential-generation.md](docs/confidential-generation.md)**.
 Product wording: **[docs/privacy-statement.md](docs/privacy-statement.md)**.
+
+### The five keys
+
+Named explicitly throughout the code, because conflating any two is how these systems go
+wrong.
+
+| Name | What | Lives where |
+|---|---|---|
+| `passphrase` | typed by the user | browser only |
+| `keyEncryptionKey` | 256-bit, derived from the passphrase | browser only |
+| `privateKey` | RSA-3072, unwraps file keys | browser; stored **encrypted** |
+| `publicKey` | RSA-3072, wraps file keys | sent with the request; not secret |
+| `fileEncryptionKey` | 256-bit random, one per artefact | inference worker; persisted **wrapped only** |
 
 ### Request
 
@@ -429,111 +449,127 @@ Product wording: **[docs/privacy-statement.md](docs/privacy-statement.md)**.
 
   "privacyMode": "confidential",
   "encryption": {
+    "version": 2,
     "algorithm": "AES-256-GCM",
-    "key": "<base64url-encoded 256-bit key>",
-    "keyId": "customer-key-1",
-    "kdf": {
-      "name": "argon2id",
-      "salt": "<base64url salt>",
-      "parameters": { "memorySize": 65536, "iterations": 3 }
-    }
+    "keyWrapAlgorithm": "RSA-OAEP-256",
+    "publicKey": "<base64url SPKI, RSA >= 3072 bits>",
+    "keyId": "<optional; must match the key's own fingerprint>"
   }
 }
 ```
 
-`privacyMode` defaults to `standard`. `keyId` is an opaque client label - it is stored and
-returned, so it must not be the key (the Worker rejects a request where it is). The `kdf`
-block is not executed anywhere on the backend; it is recorded so the same passphrase
-reproduces the same key later.
+`keyId` is derived from the public key (truncated SHA-256 of the SPKI), so it can never name
+a key it does not belong to. Supplying a disagreeing one is a 400.
+
+**Rejected outright**, at any depth and regardless of case or separators:
+`passphrase`, `password`, `privateKey`, `privateEncryptionKey`, `encryptedPrivateKey`,
+`keyEncryptionKey`, `kek`, `fileEncryptionKey`, `fek`, `decryptionKey`, `derivedKey`,
+`aesKey`, `symmetricKey`, `secretKey`. Nothing downstream reads them — the point is that a
+frontend which starts sending one should fail loudly rather than silently reintroduce a
+weakness.
 
 ### Status
 
 ```jsonc
 {
-  "id": "…", "status": "COMPLETED", "backend": "h3-blackwell",
-  "privacyMode": "confidential",
-
+  "id": "…", "status": "COMPLETED", "privacyMode": "confidential",
   "artifact": {
     "url": "/jobs/…/artifact",
-    "key": "outputs/…/artifact.enc",
-    "size": 2196269,
     "encrypted": true,
-    "encryptionVersion": 1,
-    "algorithm": "AES-256-GCM",
+    "cryptoVersion": 2,
+    "videoAlgorithm": "AES-256-GCM",
+    "keyWrapAlgorithm": "RSA-OAEP-256",
+    "keyId": "…",
     "contentType": "application/octet-stream",
-    "originalContentType": "video/mp4",
-    "kdf": { "name": "argon2id", "salt": "…", "parameters": {…} },
-    "keyId": "customer-key-1",
-    "deleted": false
+    "originalContentType": "video/mp4"
   },
-
-  // unchanged, for every existing client
-  "video": { "url": "/jobs/…/video", "key": "outputs/…/artifact.enc", "size": 2196269, "deleted": false }
+  "video": { "url": "/jobs/…/video", "…": "unchanged, for existing clients" }
 }
 ```
 
-`encryption.key` is never returned - not here, not in `/generate`, not in an error. A job
-recorded before this release has no `privacyMode` and reads as `standard` / `encrypted:
-false`; old status records stay valid.
-
-### Retrieval
-
-`GET /jobs/:id/artifact` serves ciphertext as `application/octet-stream` with
-`Cache-Control: private, no-store`, `X-Content-Type-Options: nosniff`, an attachment
-disposition, and the crypto facts in `X-Artifact-*` headers (exposed to cross-origin
-readers). Standard artefacts stream as before: `video/mp4`, cacheable, seekable.
+Never returned: a passphrase, a KEK, a private key, or a plaintext file key. The wrapped file
+key is not in the status response either — it lives inside the container's authenticated
+header, where it cannot be swapped.
 
 ### Browser
 
-`client/confidential-generation.js` is a zero-dependency ES module. `client/demo.html` is a
+`client/confidential-generation.js` is a zero-dependency ES module; `client/demo.html` is a
 minimal working UI.
 
 ```js
-import { newKdfParams, deriveKey, generate, fetchAndDecrypt, attachToVideo }
+import { createKeyBundle, unlockKeyBundle, generate, fetchAndDecrypt, attachToVideo }
   from "./client/confidential-generation.js";
 
-const kdf = newKdfParams();                       // random salt + cost
-const key = await deriveKey(passphrase, kdf);     // 32 bytes, never leaves the browser
-const job = await generate(API, { prompt, quality: "standard" }, { key, kdf });
+// Once per user. The private key is encrypted with a passphrase-derived key.
+const bundle = await createKeyBundle(passphrase);      // persist this; it holds no usable secret
 
-// …later, after the job completes
-const { blob } = await fetchAndDecrypt(API, job.jobId, key);
+// Per generation. Only the public half is sent.
+const job = await generate(API, { prompt, quality: "standard" }, { bundle });
+
+// Playback.
+const unlocked = await unlockKeyBundle(bundle, passphrase);
+const { blob } = await fetchAndDecrypt(API, job.jobId, unlocked);
 attachToVideo(document.querySelector("video"), blob);
 ```
 
-The default KDF is PBKDF2-HMAC-SHA256 at 600k iterations, not Argon2id: no browser ships
-Argon2id natively, and this repository has no frontend build step. Argon2id works today by
-passing an implementation (`deriveKey(pass, kdf, { argon2id })`) - the backend records the
-KDF, it never runs one, so it costs the server nothing either way.
+### Crypto versions
+
+| | v1 (symmetric) | v2 (hybrid) |
+|---|---|---|
+| Request carries | a 256-bit AES key | an RSA public key |
+| File key origin | derived from the passphrase | random, generated in the worker |
+| Readable | **yes** | yes |
+| Creatable | **no** — 400 naming the replacement | yes |
+
+Existing v1 artefacts stay decryptable and no data migration is needed. New v1 jobs are
+refused: a compatibility path would preserve the exact property v2 removes, so there is no
+flag to re-enable it.
 
 ### Fail closed
 
 | Situation | Outcome |
 |---|---|
-| Confidential with no/short/malformed key | 400, reporting the decoded length, never the value |
-| Unsupported algorithm, KDF, or unknown mode | 400 |
-| `private` / `ephemeral` | 501 with the reason - declared, not yet implemented |
-| `standard` **with** an `encryption` block | 400 - ignoring it would leave the caller believing they were encrypted |
-| No `JOB_TOKEN_SECRET` (no authenticated upload path) | 503; the job is never submitted |
-| Encryption or upload fails | job fails; plaintext and ciphertext both deleted; nothing stored |
+| A symmetric `encryption.key`, or `version: 1` | 400 naming the v2 replacement |
+| Any field that could decrypt the result | 400, at any depth |
+| Public key not SPKI, wrong type, or under 3072 bits | 400 |
+| `keyId` disagreeing with the public key | 400 |
+| Unsupported algorithm / key-wrap algorithm / version | 400 |
+| `standard` **with** an `encryption` block | 400 |
+| No `JOB_TOKEN_SECRET` | 503; the job is never submitted |
+| FEK generation, wrapping, encryption or upload fails | job fails; plaintext deleted; nothing stored |
 | A plaintext MP4 uploaded for a confidential job | **422; nothing written to R2** |
-| Ciphertext whose header names a different generation | **422; nothing written to R2** |
+| A **v1** container uploaded for a **v2** job | **422; nothing written to R2** |
+| A v2 container with no valid `kw` block | **422; nothing written to R2** |
+| Container header naming a different generation | **422; nothing written to R2** |
 
-The last two are enforced without trusting the uploader: the job's privacy mode is signed
-into its output token, so the upload endpoint reads the mode from an HMAC rather than from
-the request or a storage lookup, then requires the body to parse as a container whose
-authenticated header names that same job.
+Enforced without trusting the uploader: the job's privacy mode **and crypto version** are
+signed into its output token, so the upload endpoint reads both from an HMAC rather than from
+the request or a storage lookup.
+
+### Cost
+
+The asymmetric step applies only to a 32-byte key, so it is invisible next to inference.
+
+| Operation | Median |
+|---|---|
+| RSA-OAEP-3072 wrap (worker) | 0.05 ms |
+| Encrypt a 2 MB / 5 s clip, end to end | 13.6 ms |
+| RSA-3072 keygen (browser, once per user) | 129 ms |
+| Unlock the private key (PBKDF2-dominated) | 236 ms |
+| Unwrap the file key (browser) | 1.65 ms |
+| Decrypt 2 MB (browser) | 2 ms |
 
 ### Recovery
 
-There is none. If the passphrase is lost the video is unrecoverable - nothing the platform
-stores can decrypt it. That is the property, not a defect.
+There is none. If the passphrase is lost and no bundle was exported, the encrypted private
+key cannot be unlocked, the wrapped file key cannot be unwrapped, and the video is
+unrecoverable. No master key, no admin override, no escrow. That is the property, not a
+defect.
 
 ### This is not zero-knowledge
 
 The model needs the plaintext prompt and produces plaintext frames; both exist inside the
-inference container while the job runs. The true claim is narrower: *plaintext exists
-transiently only where inference requires it; persistent storage contains ciphertext only.*
+inference container while the job runs, as does the file key for the moment it is in use.
 See [docs/privacy-statement.md](docs/privacy-statement.md) for the terminology to use and
 the terminology to avoid.
 
@@ -897,8 +933,8 @@ against stub R2 and Durable Object bindings, and the browser module against Node
 - the same API the browser exposes.
 
 ```bash
-python -m pytest tests -q     # 211 tests
-node --test                   # 170 tests: Worker + browser client
+python -m pytest tests -q     # 250 tests
+node --test                   # 210 tests: Worker + browser client
 ```
 
 **Handler and image input** — text-to-video is a no-op; both image inputs rejected;
@@ -909,27 +945,41 @@ with a decoy loader present; ambiguous workflows requiring `image_node_id`; clea
 only its own files; upload truthfulness (a 302 to an Access login page is not a success);
 FlashBoot preload; phase timing.
 
-**Confidential Generation** (`tests/test_confidential_artifacts.py`,
-`worker.confidential.test.js`, `client/confidential-generation.test.js`) — the canonical test
-runs a known plaintext video through the whole artefact path, captures the bytes that would
-have reached R2, and proves `stored != plaintext`, `decrypt(stored, client_key) == plaintext`
-and `decrypt(stored, other_key)` fails. Around it: container framing; wrong key, modified
-ciphertext, modified tag and rewritten header all failing authentication; a fresh nonce on
-every encryption across 32 runs; plaintext deleted after success, after encryption failure
-and after upload failure; `H3_KEEP_OUTPUTS` unable to preserve confidential plaintext; every
-validation rejection; the 422 refusals; ciphertext response headers; status never returning
-the key; deletion of both modes through one path.
+**Confidential Generation** (`tests/test_confidential_v2.py`,
+`tests/test_confidential_artifacts.py`, `worker.confidential.test.js`,
+`client/confidential-generation.test.js`).
+
+The security invariant is tested from both languages: hand an attacker the RunPod job input,
+the job output, the stored bytes, the object metadata, the job state, the status response,
+the public key, the wrapped file key and the container header; derive a candidate key from
+every one of them; prove none decrypts. Then decrypt with the private key, which never
+crossed the boundary.
+
+Around it: the public key wraps and cannot decrypt; the private key unwraps; a wrong private
+key fails; a modified wrapped key fails safely; **a file key wrapped to an attacker's own
+public key, swapped into the header, breaks the video's authentication**; sixteen encryptions
+of one generation id yield sixteen distinct file keys, nonces and ciphertexts; the plaintext
+file key appears in neither the container nor the metadata; a correct passphrase unlocks the
+private key and a wrong one fails; editing a bundle's public key, key id or KDF parameters
+breaks the unlock; plaintext deleted after success, after wrapping failure, after encryption
+failure and after upload failure; `H3_KEEP_OUTPUTS` unable to preserve confidential
+plaintext; every validation and forbidden-field rejection; all four 422 refusals; ciphertext
+response headers; status never returning a decryption secret; deletion of both modes through
+one path; and v1 artefacts still parsing and decrypting.
 
 **Redaction** (`tests/test_redaction.py`, and the log assertions in the Worker suite) — keys,
 passphrases, `Authorization` and Cloudflare Access credentials removed; `keyId` and R2 object
 keys preserved; and an assertion that the redaction lists in `worker.js` and `artifacts.py`
 are identical, because they had already drifted once.
 
-**Cross-language conformance** (`tests/vectors/confidential_container.json`) — one passphrase,
-through one KDF, produces the key that opens one container whose bytes are pinned exactly.
-Python must reproduce those bytes, `worker.js` must parse that framing, and the browser must
-decrypt it back to the video. A change to the layout, the canonical header serialization or
-the AAD binding fails at least one of the three suites.
+**Cross-language conformance** (`tests/vectors/confidential_container.json`) — two vectors.
+The v1 vector pins one container's exact bytes: one passphrase, through one KDF, produces the
+key that opens it, and Python must reproduce those bytes byte for byte. The v2 vector pins a
+hybrid container produced by Python from nothing but a public key, which `worker.js` must
+parse and the browser must open with the matching private key. Its ciphertext is deliberately
+not byte-pinned — RSA-OAEP is randomised, and a fixed seed is something no sane API exposes.
+A change to the layout, the canonical header serialization, the AAD binding or the RSA-OAEP
+parameters fails at least one of the three suites.
 
 ### Status
 
@@ -1155,11 +1205,12 @@ roughly 124–362).
 Dockerfile                      Serverless image: replaces the Pod entrypoint
 handler.py                      RunPod handler, ComfyUI supervision, output stores
 artifacts.py                    Model-independent privacy layer: privacy modes, the
-                                encrypted container format, plaintext hygiene, redaction
+                                container format, public-key wrapping, plaintext hygiene
 worker.js                       Cloudflare Worker: public API, workflow builder, R2, DO
 wrangler.toml                   Worker bindings, mirrored from the live deployment
 models.tsv                      Model URLs, exact sizes and SHA-256 checksums
-client/confidential-generation.js   Browser key derivation and local decryption
+client/confidential-generation.js   Browser key pair, passphrase-encrypted private key,
+                                local unwrapping and decryption
 client/demo.html                Minimal Confidential Generation UI
 docs/confidential-generation.md Architecture, trust boundaries, threat model, key lifecycle
 docs/privacy-statement.md       Product wording, and the claims never to make
@@ -1168,7 +1219,7 @@ scripts/make_container_vector.py    Regenerates the cross-language conformance v
 scripts/set_r2_lifecycle.sh     Applies the prefix-scoped R2 retention policy
 examples/fl2va-text-to-video.json    Ready-to-run FL2VA text-to-video workflow
 examples/fl2va-image-to-video.json  Same, plus a LoadImage feeding first_frame
-tests/                          Python suites; tests/vectors/ holds the format vector
+tests/                          Python suites; tests/vectors/ holds the format vectors
 worker.*.test.js                Worker suites, driven through the real fetch handler
 .github/workflows/build.yml     Two-stage build: code image, then four model layers
 ```
