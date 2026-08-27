@@ -774,8 +774,11 @@ export function normalizeRequest(body) {
  * Resolve `privacyMode` and validate any `encryption` block that came with it.
  *
  * Returns `{ mode, spec, encryption, expiresAt }`. `encryption` is null in standard mode
- * and, in confidential mode, holds the raw key alongside its non-secret metadata. The
- * caller must treat `encryption.key` as request-scoped: forward it once, never store it.
+ * and, in confidential mode, holds only non-secret material: the caller's public key, the
+ * algorithm names, the crypto version and the key id derived from the key itself.
+ *
+ * Nothing this function returns can decrypt anything. That is the point of v2, and it is
+ * why there is no "handle this carefully" note here: there is no secret to mishandle.
  */
 export async function normalizePrivacy(body) {
   const requested = firstPresent(body.privacyMode, body.privacy_mode);
@@ -818,7 +821,8 @@ export async function normalizePrivacy(body) {
   if (!hasBlock) {
     throw new HttpError(
       400,
-      "privacyMode 'confidential' requires an encryption block with a client-derived key. " +
+      "privacyMode 'confidential' requires an encryption block carrying your public key: " +
+        '{ "version": 2, "publicKey": "<base64url SPKI>" }. ' +
         "See docs/confidential-generation.md."
     );
   }
@@ -2196,7 +2200,10 @@ async function logGeneration({ jobId, backend, settings, privacy }) {
     `prompt_chars=${settings.userPrompt.length}`
   ];
   if (privacy.encryption?.keyId) fields.push(`key_id=${privacy.encryption.keyId}`);
-  if (privacy.encryption?.kdf) fields.push(`kdf=${privacy.encryption.kdf.name}`);
+  if (privacy.encryption?.keyWrapAlgorithm) {
+    fields.push(`key_wrap=${privacy.encryption.keyWrapAlgorithm}`);
+    fields.push(`crypto_version=${privacy.encryption.version}`);
+  }
   if (privacy.expiresAt) fields.push(`expires_at=${privacy.expiresAt}`);
   fields.push(`prompt_sha256=${await promptDigest(settings.userPrompt)}`);
 
