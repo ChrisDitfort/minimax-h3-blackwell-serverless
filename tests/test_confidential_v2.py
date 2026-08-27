@@ -570,3 +570,130 @@ class TestV1Compatibility(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ======================================================================================
+# The RunPod job output
+# ======================================================================================
+
+
+class TestJobOutput(unittest.TestCase):
+    """What the worker hands back to RunPod, driven through the real handler().
+
+    RunPod retains job results as well as job inputs, so the output JSON is a second place
+    a decryption-capable secret could leak into permanent storage. It must not.
+    """
+
+    def run_confidential_job(self, plaintext: bytes):
+        """One full pass through handler(), with ComfyUI and the upload endpoint stubbed."""
+        private, spki, spki_b64 = keypair()
+        name = f"output-{secrets.token_hex(4)}.mp4"
+        write_output(name, plaintext)
+
+        uploaded = {}
+
+        class FakeResponse:
+            status_code = 201
+            text = '{"key":"outputs/gen-out/artifact.enc"}'
+
+            @staticmethod
+            def json():
+                return {"key": "outputs/gen-out/artifact.enc", "url": "/jobs/gen-out/artifact"}
+
+        def fake_put(url, data=None, headers=None, **kwargs):
+            uploaded["body"] = data.read()
+            uploaded["headers"] = dict(headers or {})
+            return FakeResponse()
+
+        originals = (
+            handler.start_comfyui,
+            handler.queue_prompt,
+            handler.await_execution,
+            handler.requests.put,
+        )
+        handler.start_comfyui = lambda: None
+        handler.queue_prompt = lambda workflow, client_id: "prompt-1"
+        handler.await_execution = lambda *a, **k: history_for(name)
+        handler.requests.put = fake_put
+        try:
+            result = handler.handler(
+                {
+                    "id": "runpod-job-1",
+                    "input": {
+                        "workflow": {"1": {"class_type": "SaveVideo", "inputs": {}}},
+                        "privacy": {"mode": "confidential"},
+                        "encryption": {
+                            "version": 2,
+                            "algorithm": "AES-256-GCM",
+                            "keyWrapAlgorithm": "RSA-OAEP-256",
+                            "publicKey": spki_b64,
+                        },
+                        "output": {"url": "https://worker.example/internal/jobs/gen-out/output",
+                                   "token": "job-token", "jobId": "gen-out"},
+                    },
+                }
+            )
+        finally:
+            (
+                handler.start_comfyui,
+                handler.queue_prompt,
+                handler.await_execution,
+                handler.requests.put,
+            ) = originals
+
+        return result, uploaded, private
+
+    def test_the_job_output_carries_no_decryption_capable_secret(self):
+        plaintext = sample_video(2048)
+        result, uploaded, private = self.run_confidential_job(plaintext)
+
+        self.assertNotIn("error", result, result.get("error"))
+        serialized = json.dumps(result)
+
+        # What the artefact was actually encrypted with, recovered from the upload.
+        parsed = artifacts.parse_container_prefix(uploaded["body"])
+        padded = parsed["key_wrap"]["wrappedFileKey"] + "=="
+        file_key = artifacts.unwrap_file_key(base64.urlsafe_b64decode(padded), private).bytes
+
+        self.assertNotIn(file_key.hex(), serialized, "the file key must not be in the output")
+        self.assertNotIn(base64.b64encode(file_key).decode(), serialized)
+        self.assertNotIn(
+            base64.urlsafe_b64encode(file_key).decode().rstrip("="), serialized
+        )
+        for forbidden in ("privateKey", "passphrase", "kek", "fileEncryptionKey", "aesKey"):
+            self.assertNotIn(forbidden, serialized)
+
+        # No base64 of the plaintext either - the inline delivery path must not have run.
+        self.assertNotIn("data", result["images"][0])
+        self.assertNotIn(base64.b64encode(plaintext).decode()[:64], serialized)
+
+    def test_the_job_output_describes_the_artefact_in_public_terms(self):
+        result, _, _ = self.run_confidential_job(sample_video(2048))
+
+        self.assertEqual(result["privacyMode"], "confidential")
+        artifact = result["images"][0]["artifact"]
+        self.assertEqual(artifact["cryptoVersion"], 2)
+        self.assertEqual(artifact["algorithm"], "AES-256-GCM")
+        self.assertEqual(artifact["keyWrapAlgorithm"], "RSA-OAEP-256")
+        self.assertEqual(artifact["keyId"], public_key().key_id)
+        self.assertEqual(artifact["contentType"], "application/octet-stream")
+        self.assertEqual(artifact["originalContentType"], "video/mp4")
+        self.assertEqual(result["images"][0]["key"], "outputs/gen-out/artifact.enc")
+
+    def test_what_is_uploaded_is_a_v2_container_for_this_generation(self):
+        plaintext = sample_video(2048)
+        _, uploaded, private = self.run_confidential_job(plaintext)
+
+        self.assertEqual(uploaded["headers"]["Content-Type"], "application/octet-stream")
+        self.assertNotIn(plaintext, uploaded["body"])
+
+        recovered, header = artifacts.decrypt_v2_container(uploaded["body"], private)
+        self.assertEqual(recovered, plaintext)
+        # The generation id comes from the output block, which is what the storage key is
+        # derived from - so the Worker's header check will agree.
+        self.assertEqual(header["artifactId"], "gen-out")
+
+    def test_the_plaintext_is_gone_when_the_job_returns(self):
+        result, _, _ = self.run_confidential_job(sample_video(2048))
+        name = result["images"][0]["filename"]
+        self.assertFalse(os.path.exists(os.path.join(handler.COMFY_OUTPUT_DIR, name)))
