@@ -146,6 +146,100 @@ const MODES = Object.freeze({
 
 const DEFAULT_MODE = "text_to_video";
 
+/* ------------------------------------------------------------------------------------
+ * Privacy modes
+ *
+ * The registry, mirrored in artifacts.py. Nothing else in this file compares privacy-mode
+ * strings: code asks this table what a mode *does*. That is what stops a future mode from
+ * needing edits scattered through the request path, and it is why `private` and
+ * `ephemeral` can be declared here honestly - as a 501 with a reason, exactly like the
+ * unimplemented generation MODES above - instead of being silently treated as `standard`.
+ * ---------------------------------------------------------------------------------- */
+
+const PRIVACY_MODES = Object.freeze({
+  standard: Object.freeze({
+    implemented: true,
+    encrypts: false,
+    restrictsPromptLogging: false,
+    description: "Current behaviour. The MP4 is stored as-is and streamed back normally."
+  }),
+
+  confidential: Object.freeze({
+    implemented: true,
+    encrypts: true,
+    restrictsPromptLogging: true,
+    description:
+      "The artefact is encrypted inside the inference environment with a key the caller " +
+      "derived. Persistent storage receives ciphertext only; the browser decrypts for " +
+      "playback."
+  }),
+
+  private: Object.freeze({
+    implemented: false,
+    encrypts: false,
+    restrictsPromptLogging: true,
+    description: "Unencrypted storage with restricted logging and a short default retention.",
+    reason:
+      "Needs a retention enforcer to be meaningful. Today's retention is a prefix-wide R2 " +
+      "lifecycle rule, which cannot express a per-job lifetime, so 'private' would promise " +
+      "a shorter life than the platform can deliver."
+  }),
+
+  ephemeral: Object.freeze({
+    implemented: false,
+    encrypts: true,
+    restrictsPromptLogging: true,
+    description:
+      "Confidential, plus the server-side copy is deleted as soon as delivery succeeds.",
+    reason:
+      "Needs a reliable definition of 'delivery succeeded'. A ranged or aborted GET is not " +
+      "a delivery, and deleting on the first byte read would destroy the artefact " +
+      "mid-download."
+  })
+});
+
+const DEFAULT_PRIVACY_MODE = "standard";
+
+/*
+ * Encrypted container framing, mirrored from artifacts.py. The Worker only ever *reads*
+ * this - it parses enough of an upload to prove the bytes really are ciphertext before
+ * they are allowed into R2. tests/vectors/confidential_container.json pins the layout so
+ * the two implementations cannot drift apart unnoticed.
+ */
+const CONTAINER_MAGIC = "CGEN";
+const CONTAINER_VERSION = 1;
+const CONTAINER_SUITES = Object.freeze({ 1: "AES-256-GCM" });
+const CONTAINER_PREAMBLE_BYTES = 8;
+const CONTAINER_MAX_HEADER_BYTES = 8192;
+const CONTAINER_NONCE_BYTES = 12;
+const CONTAINER_TAG_BYTES = 16;
+
+const ENCRYPTED_CONTENT_TYPE = "application/octet-stream";
+
+/*
+ * Supported client-side key derivation functions.
+ *
+ * The Worker never runs a KDF - derivation happens in the browser and only the derived key
+ * is ever transmitted. This list exists so that unrecognised metadata is rejected at the
+ * door rather than stored and echoed back to a client that would not know what to do with
+ * it. Adding a KDF here costs nothing on the backend, which is the point: the choice
+ * belongs to the client.
+ */
+const SUPPORTED_KDFS = Object.freeze({
+  argon2id: { saltMin: 8, saltMax: 64 },
+  scrypt: { saltMin: 8, saltMax: 64 },
+  "pbkdf2-sha256": { saltMin: 8, saltMax: 64 },
+  "pbkdf2-sha512": { saltMin: 8, saltMax: 64 }
+});
+
+const SUPPORTED_ENCRYPTION_ALGORITHMS = Object.freeze(["AES-256-GCM"]);
+const ENCRYPTION_KEY_BYTES = 32;
+
+// Retention bounds for the advisory expiresAt recorded on an artefact. One minute is the
+// shortest that is not simply a mistake; 90 days is past any lifecycle rule we ship.
+const MIN_RETENTION_SECONDS = 60;
+const MAX_RETENTION_SECONDS = 90 * 24 * 3600;
+
 // Model filenames, matching what models.tsv bakes into the RunPod image.
 const MODEL_FILES = Object.freeze({
   unet: "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
@@ -209,24 +303,36 @@ export default {
         return await uploadAsset(request, env, headers, segments[1], url);
       }
 
-      // GET /jobs/:jobId/video  - stream the finished MP4 out of R2
+      /*
+       * GET /jobs/:jobId/video  - stream the finished artefact out of R2
+       * GET /jobs/:jobId/artifact  - the same route under a mode-neutral name
+       *
+       * `video` is kept because callers already use it and it still works for both modes.
+       * `artifact` exists because a confidential artefact is not a video until the browser
+       * has decrypted it, and an API should not say otherwise.
+       */
       if (
         request.method === "GET" &&
         segments.length === 3 &&
         segments[0] === "jobs" &&
-        segments[2] === "video"
+        (segments[2] === "video" || segments[2] === "artifact")
       ) {
         return await streamVideo(request, env, segments[1]);
       }
 
-      // DELETE /jobs/:jobId/video  - remove that job's output from R2
+      // DELETE /jobs/:jobId/video|artifact  - remove that job's output from R2
       if (
         request.method === "DELETE" &&
         segments.length === 3 &&
         segments[0] === "jobs" &&
-        segments[2] === "video"
+        (segments[2] === "video" || segments[2] === "artifact")
       ) {
-        return await deleteVideo(env, headers, segments[1]);
+        return await deleteGeneration(env, headers, segments[1], "output");
+      }
+
+      // DELETE /jobs/:jobId  - the whole generation: artefact plus its input keyframes
+      if (request.method === "DELETE" && segments.length === 2 && segments[0] === "jobs") {
+        return await deleteGeneration(env, headers, segments[1], "generation");
       }
 
       // GET /ws/jobs/:jobId  - realtime progress
@@ -621,6 +727,291 @@ export function normalizeRequest(body) {
   };
 }
 
+/* ------------------------------------------------------------------------------------
+ * Privacy and encryption validation
+ *
+ * Everything a malformed confidential request could do wrong is caught here, before a job
+ * is submitted. The rule throughout: reject rather than reinterpret. A request that thinks
+ * it is being encrypted and is not is the single worst outcome this endpoint can produce,
+ * so every ambiguity is a 400.
+ * ---------------------------------------------------------------------------------- */
+
+/**
+ * Resolve `privacyMode` and validate any `encryption` block that came with it.
+ *
+ * Returns `{ mode, spec, encryption, expiresAt }`. `encryption` is null in standard mode
+ * and, in confidential mode, holds the raw key alongside its non-secret metadata. The
+ * caller must treat `encryption.key` as request-scoped: forward it once, never store it.
+ */
+export function normalizePrivacy(body) {
+  const requested = firstPresent(body.privacyMode, body.privacy_mode);
+  const mode = requested ? String(requested).trim().toLowerCase() : DEFAULT_PRIVACY_MODE;
+  const spec = PRIVACY_MODES[mode];
+
+  if (!spec) {
+    throw new HttpError(
+      400,
+      `Unknown privacyMode '${mode}'. Supported: ${Object.keys(PRIVACY_MODES).join(", ")}`
+    );
+  }
+
+  if (!spec.implemented) {
+    throw new HttpError(501, `privacyMode '${mode}' is not available yet. ${spec.reason}`, {
+      privacyMode: mode,
+      implementedPrivacyModes: Object.keys(PRIVACY_MODES).filter((m) => PRIVACY_MODES[m].implemented)
+    });
+  }
+
+  const block = body.encryption;
+  const hasBlock = block !== undefined && block !== null;
+
+  if (hasBlock && (typeof block !== "object" || Array.isArray(block))) {
+    throw new HttpError(400, "encryption must be an object");
+  }
+
+  if (!spec.encrypts) {
+    // Not ignored: a caller who sent a key believes their artefact is being encrypted.
+    if (hasBlock) {
+      throw new HttpError(
+        400,
+        `privacyMode '${mode}' does not encrypt, but an encryption block was supplied. ` +
+          "Use privacyMode 'confidential', or remove the block."
+      );
+    }
+    return { mode, spec, encryption: null, expiresAt: resolveExpiry(body) };
+  }
+
+  if (!hasBlock) {
+    throw new HttpError(
+      400,
+      "privacyMode 'confidential' requires an encryption block with a client-derived key. " +
+        "See docs/confidential-generation.md."
+    );
+  }
+
+  const algorithm = hasNonEmptyValue(block.algorithm)
+    ? String(block.algorithm).trim()
+    : SUPPORTED_ENCRYPTION_ALGORITHMS[0];
+
+  if (!SUPPORTED_ENCRYPTION_ALGORITHMS.includes(algorithm)) {
+    throw new HttpError(
+      400,
+      `Unsupported encryption algorithm '${algorithm}'. Supported: ` +
+        SUPPORTED_ENCRYPTION_ALGORITHMS.join(", ")
+    );
+  }
+
+  const key = validateEncryptionKey(block.key);
+  const keyId = validateKeyId(firstPresent(block.keyId, block.key_id), key);
+  const kdf = validateKdf(block.kdf);
+
+  return {
+    mode,
+    spec,
+    encryption: { algorithm, key, keyId, kdf },
+    expiresAt: resolveExpiry(body)
+  };
+}
+
+/**
+ * Check a base64url-encoded 256-bit key without ever putting it in an error message.
+ *
+ * Every rejection describes the shape of what arrived - "decoded to 16 bytes" - and never
+ * its content, because a 400 body is exactly the kind of thing that ends up in a log.
+ */
+function validateEncryptionKey(value) {
+  if (!hasNonEmptyValue(value)) {
+    throw new HttpError(400, "encryption.key is required in confidential mode");
+  }
+  if (typeof value !== "string") {
+    throw new HttpError(400, "encryption.key must be a base64url-encoded string");
+  }
+
+  const text = value.trim();
+  if (!/^[A-Za-z0-9_\-+/]+={0,2}$/.test(text)) {
+    throw new HttpError(400, "encryption.key is not valid base64url");
+  }
+
+  let bytes;
+  try {
+    bytes = b64urlDecodeToBytes(text);
+  } catch {
+    throw new HttpError(400, "encryption.key is not valid base64url");
+  }
+
+  if (bytes.length !== ENCRYPTION_KEY_BYTES) {
+    throw new HttpError(
+      400,
+      `encryption.key must decode to ${ENCRYPTION_KEY_BYTES} bytes (256 bits), got ${bytes.length}`
+    );
+  }
+
+  return text;
+}
+
+/**
+ * `keyId` is an opaque client label, and its whole job is to be safe to show.
+ *
+ * The one check worth making is that the client has not simply pasted the key into it:
+ * that mistake would take a value we go to lengths never to persist and put it into
+ * metadata, status responses and logs.
+ */
+function validateKeyId(value, key) {
+  if (!hasNonEmptyValue(value)) return null;
+
+  const keyId = String(value).trim();
+  if (keyId.length > 128) {
+    throw new HttpError(400, "encryption.keyId must be 128 characters or fewer");
+  }
+  if (!/^[A-Za-z0-9._:\-]+$/.test(keyId)) {
+    throw new HttpError(400, "encryption.keyId may contain only [A-Za-z0-9._:-]");
+  }
+  if (key && keyId === key) {
+    throw new HttpError(
+      400,
+      "encryption.keyId must not be the key itself. keyId is stored and returned; the key " +
+        "never is."
+    );
+  }
+  return keyId;
+}
+
+/**
+ * Validate the KDF description the client will need to reconstruct its own key later.
+ *
+ * None of this is secret and none of it is executed here - it is recorded so that a user
+ * who returns tomorrow with the same passphrase derives the same key. Which is exactly why
+ * it has to be well-formed: a corrupted salt makes an artefact permanently undecryptable.
+ */
+function validateKdf(value) {
+  if (value === undefined || value === null) return null;
+
+  if (typeof value !== "object" || Array.isArray(value)) {
+    throw new HttpError(400, "encryption.kdf must be an object");
+  }
+
+  const name = String(value.name ?? "").trim().toLowerCase();
+  const spec = SUPPORTED_KDFS[name];
+  if (!spec) {
+    throw new HttpError(
+      400,
+      `Unsupported encryption.kdf.name '${name || "(missing)"}'. Supported: ` +
+        Object.keys(SUPPORTED_KDFS).join(", ")
+    );
+  }
+
+  if (!hasNonEmptyValue(value.salt)) {
+    throw new HttpError(400, "encryption.kdf.salt is required");
+  }
+  if (typeof value.salt !== "string" || !/^[A-Za-z0-9_\-+/]+={0,2}$/.test(value.salt.trim())) {
+    throw new HttpError(400, "encryption.kdf.salt must be base64url");
+  }
+
+  let salt;
+  try {
+    salt = b64urlDecodeToBytes(value.salt.trim());
+  } catch {
+    throw new HttpError(400, "encryption.kdf.salt must be base64url");
+  }
+  if (salt.length < spec.saltMin || salt.length > spec.saltMax) {
+    throw new HttpError(
+      400,
+      `encryption.kdf.salt must decode to ${spec.saltMin}-${spec.saltMax} bytes, got ${salt.length}`
+    );
+  }
+
+  const parameters = value.parameters ?? {};
+  if (typeof parameters !== "object" || Array.isArray(parameters)) {
+    throw new HttpError(400, "encryption.kdf.parameters must be an object");
+  }
+
+  // Flat, small and scalar. These end up inside the artefact's authenticated header, whose
+  // size is capped; an unbounded object here would fail much later, at encryption time.
+  const entries = Object.entries(parameters);
+  if (entries.length > 12) {
+    throw new HttpError(400, "encryption.kdf.parameters may hold at most 12 values");
+  }
+  const cleaned = {};
+  for (const [name_, raw] of entries) {
+    if (!/^[A-Za-z0-9_]{1,32}$/.test(name_)) {
+      throw new HttpError(400, `encryption.kdf.parameters key '${name_}' is not a simple name`);
+    }
+    if (typeof raw === "number") {
+      if (!Number.isFinite(raw)) {
+        throw new HttpError(400, `encryption.kdf.parameters.${name_} must be finite`);
+      }
+      cleaned[name_] = raw;
+    } else if (typeof raw === "string") {
+      if (raw.length > 64) {
+        throw new HttpError(400, `encryption.kdf.parameters.${name_} is too long`);
+      }
+      cleaned[name_] = raw;
+    } else if (typeof raw === "boolean") {
+      cleaned[name_] = raw;
+    } else {
+      throw new HttpError(
+        400,
+        `encryption.kdf.parameters.${name_} must be a number, string or boolean`
+      );
+    }
+  }
+
+  return { name, salt: value.salt.trim(), parameters: cleaned };
+}
+
+/**
+ * Resolve an advisory expiry from `retentionSeconds` or `expiresAt`.
+ *
+ * Advisory is the honest word. Nothing in this Worker deletes on a timer: enforcement is
+ * the bucket's prefix-scoped R2 lifecycle rule (scripts/set_r2_lifecycle.sh), which is
+ * age-based and cannot express a per-object lifetime. Recording the intent means the API
+ * can report it and a future scheduled sweep has something to act on. See "Retention" in
+ * docs/confidential-generation.md - a Worker-internal pseudo-scheduler is deliberately not
+ * implemented, because a timer that only fires while requests happen to arrive is worse
+ * than no promise at all.
+ */
+function resolveExpiry(body) {
+  const hasSeconds = hasNonEmptyValue(body.retentionSeconds);
+  const hasAt = hasNonEmptyValue(body.expiresAt);
+
+  if (hasSeconds && hasAt) {
+    throw new HttpError(400, "Supply retentionSeconds or expiresAt, not both");
+  }
+  if (!hasSeconds && !hasAt) return null;
+
+  if (hasSeconds) {
+    const seconds = toInteger(body.retentionSeconds, NaN);
+    if (!Number.isFinite(seconds) || seconds < MIN_RETENTION_SECONDS || seconds > MAX_RETENTION_SECONDS) {
+      throw new HttpError(
+        400,
+        `retentionSeconds must be between ${MIN_RETENTION_SECONDS} and ${MAX_RETENTION_SECONDS}`
+      );
+    }
+    return new Date(Date.now() + seconds * 1000).toISOString();
+  }
+
+  const at = new Date(String(body.expiresAt));
+  if (Number.isNaN(at.getTime())) {
+    throw new HttpError(400, "expiresAt must be an ISO-8601 timestamp");
+  }
+  const delta = (at.getTime() - Date.now()) / 1000;
+  if (delta < MIN_RETENTION_SECONDS || delta > MAX_RETENTION_SECONDS) {
+    throw new HttpError(
+      400,
+      `expiresAt must be between ${MIN_RETENTION_SECONDS} seconds and ` +
+        `${MAX_RETENTION_SECONDS} seconds from now`
+    );
+  }
+  return at.toISOString();
+}
+
+function firstPresent(...values) {
+  for (const value of values) {
+    if (hasNonEmptyValue(value)) return value;
+  }
+  return undefined;
+}
+
 function nearestLegalFrames(n) {
   const up = alignFrameCount(n);
   let down = up;
@@ -909,6 +1300,7 @@ async function generateVideo(request, env, headers, url) {
   const config = getRunPodConfig(backend, env);
 
   const settings = normalizeRequest(body);
+  const privacy = normalizePrivacy(body);
   const workflow = buildWorkflowForSettings(settings);
 
   /*
@@ -918,7 +1310,7 @@ async function generateVideo(request, env, headers, url) {
    */
   const jobId = crypto.randomUUID();
   const callbacks = env.JOB_TOKEN_SECRET
-    ? await buildCallbackBlocks(env, jobId, url.origin, settings)
+    ? await buildCallbackBlocks(env, jobId, url.origin, settings, privacy)
     : null;
 
   if (!callbacks) {
@@ -926,6 +1318,23 @@ async function generateVideo(request, env, headers, url) {
     // channel and no R2 output.
     console.warn("JOB_TOKEN_SECRET is unset: progress callbacks and R2 output are disabled");
   }
+
+  /*
+   * Fail closed. Without callbacks the artefact comes back inline in RunPod's job result,
+   * which means a copy of it living in a store we do not control - and, in confidential
+   * mode, a promise we cannot keep. A 503 is the honest answer; running the job anyway and
+   * hoping is not.
+   */
+  if (privacy.spec.encrypts && !callbacks) {
+    throw new HttpError(
+      503,
+      "Confidential generation is unavailable on this deployment: JOB_TOKEN_SECRET is not " +
+        "configured, so there is no authenticated path for the encrypted artefact to " +
+        "reach storage. Standard generation is unaffected."
+    );
+  }
+
+  await logGeneration({ jobId, backend, settings, privacy });
 
   const runpodUrl = `https://api.runpod.ai/v2/${config.endpointId}/run`;
 
@@ -936,7 +1345,7 @@ async function generateVideo(request, env, headers, url) {
       Authorization: `Bearer ${config.apiKey}`
     },
     body: JSON.stringify({
-      input: buildRunPodInput(backend, workflow, settings, callbacks),
+      input: buildRunPodInput(backend, workflow, settings, callbacks, privacy),
       policy: { executionTimeout: 600000, ttl: 1800000 }
     })
   });
@@ -977,7 +1386,11 @@ async function generateVideo(request, env, headers, url) {
         phase: "queued",
         percent: 0,
         runpodId: data.id,
-        backend
+        backend,
+        // Non-secret, and recorded now so /status can describe the job's privacy before
+        // there is any artefact to describe. Never the key: see redactJobState().
+        privacyMode: privacy.mode,
+        ...(privacy.expiresAt ? { expiresAt: privacy.expiresAt } : {})
       });
     } catch (error) {
       console.warn(`Could not seed job channel: ${error?.message || error}`);
@@ -994,6 +1407,23 @@ async function generateVideo(request, env, headers, url) {
       mode: settings.mode,
       quality: settings.quality,
       aspectRatio: settings.aspectRatio,
+
+      /*
+       * Echoed so a client can confirm what it got rather than what it asked for, and so
+       * `standard` callers see the field appear without having to change anything. The
+       * key is not here, is not anywhere in this response, and is not stored.
+       */
+      privacyMode: privacy.mode,
+      ...(privacy.encryption
+        ? {
+            encryption: {
+              algorithm: privacy.encryption.algorithm,
+              ...(privacy.encryption.keyId ? { keyId: privacy.encryption.keyId } : {}),
+              ...(privacy.encryption.kdf ? { kdf: privacy.encryption.kdf } : {})
+            }
+          }
+        : {}),
+      ...(privacy.expiresAt ? { expiresAt: privacy.expiresAt } : {}),
 
       // Preserved shape: width/height/frames/fps/durationSeconds/steps as before.
       settings: {
@@ -1018,7 +1448,12 @@ async function generateVideo(request, env, headers, url) {
         cancel: `/cancel/${encodedBackend}/${encodedJobId}?jobId=${encodeURIComponent(jobId)}`,
         events: `/ws/jobs/${encodeURIComponent(jobId)}`,
         video: `/jobs/${encodeURIComponent(jobId)}/video`,
-        deleteVideo: `/jobs/${encodeURIComponent(jobId)}/video`
+        deleteVideo: `/jobs/${encodeURIComponent(jobId)}/video`,
+        // Mode-neutral names. `video` still works and still means the same thing; these
+        // are what a client should use once it stops assuming the artefact is a playable
+        // MP4, which a confidential artefact is not until the browser decrypts it.
+        artifact: `/jobs/${encodeURIComponent(jobId)}/artifact`,
+        deleteGeneration: `/jobs/${encodeURIComponent(jobId)}`
       }
     },
     202,
@@ -1033,11 +1468,20 @@ async function generateVideo(request, env, headers, url) {
  * video and the output token cannot read another job's assets. RunPod holds nothing
  * permanent - the tokens expire on their own.
  */
-async function buildCallbackBlocks(env, jobId, origin, settings) {
+async function buildCallbackBlocks(env, jobId, origin, settings, privacy) {
   const secret = env.JOB_TOKEN_SECRET;
   const ttl = Number(env.JOB_TOKEN_TTL_SECONDS || 3600);
   const base = String(env.PUBLIC_BASE_URL || origin).replace(/\/+$/, "");
 
+  /*
+   * The job's privacy mode is signed into its output token.
+   *
+   * This is what makes a downgrade impossible rather than merely unlikely. When the upload
+   * arrives, the Worker does not ask the uploader what kind of job this was, and does not
+   * look it up in a Durable Object that might be unavailable or stale - it reads the mode
+   * out of the HMAC-signed token the uploader had to present. RunPod cannot change it
+   * without the signing secret, which never leaves Cloudflare.
+   */
   const blocks = {
     progress: {
       url: `${base}/internal/jobs/${jobId}/progress`,
@@ -1046,7 +1490,10 @@ async function buildCallbackBlocks(env, jobId, origin, settings) {
     },
     output: {
       url: `${base}/internal/jobs/${jobId}/output`,
-      token: await signJobToken(secret, jobId, TOKEN_PURPOSES.output, ttl)
+      token: await signJobToken(secret, jobId, TOKEN_PURPOSES.output, ttl, {
+        pm: privacy?.mode ?? DEFAULT_PRIVACY_MODE,
+        ...(privacy?.expiresAt ? { exa: privacy.expiresAt } : {})
+      })
     }
   };
 
@@ -1107,32 +1554,83 @@ async function getJobStatus(backend, jobId, env, headers, url) {
    * before. This adds a way to get the video, it does not remove one.
    */
   const workerJobId = url?.searchParams.get("jobId");
-  const video = result?.output?.video;
-  if (workerJobId && video && typeof video === "object") {
+  if (workerJobId) {
     try {
-      const key = outputKey(workerJobId);
-
-      /*
-       * A deleted output must not be advertised as playable. The job stays COMPLETED -
-       * deleting an artefact afterwards is not a retrospective failure of the generation -
-       * but the response says so explicitly rather than handing back a URL that 404s.
-       */
-      if (await isVideoDeleted(env, workerJobId)) {
-        result.video = { deleted: true };
-      } else {
-        result.video = {
-          url: `/jobs/${encodeURIComponent(workerJobId)}/video`,
-          key,
-          size: video.size,
-          deleted: false
-        };
-      }
+      // One read of the job channel now answers three questions - privacy mode, artefact
+      // description, deletion - where it previously answered only the last.
+      const state = await readJobState(env, workerJobId);
+      Object.assign(result, describeArtifactForStatus(workerJobId, state, result?.output?.video));
     } catch {
-      /* an unusable job id simply means no video route is advertised */
+      /* an unusable job id simply means no artefact is advertised */
     }
   }
 
   return json(result, 200, headers);
+}
+
+/**
+ * Build the privacy half of a status response from stored job state.
+ *
+ * Split out because it is pure and worth testing directly, and because §34-style migration
+ * lives here: a job recorded before privacy modes existed has no `privacyMode` and no
+ * `artifact`, and is reported as `standard` / `encrypted: false`. Old status records stay
+ * valid and old clients keep seeing the `video` block they already read.
+ *
+ * The key is not a field this function could return. It is not in `state` - nothing ever
+ * writes it there - and there is no branch below that looks for one.
+ */
+export function describeArtifactForStatus(jobId, state, runpodVideo) {
+  const encoded = encodeURIComponent(jobId);
+  const stored = (state && state.artifact) || null;
+  const privacyMode = state?.privacyMode || stored?.privacyMode || DEFAULT_PRIVACY_MODE;
+  const deleted = Boolean(state?.video?.deleted || stored?.deleted);
+
+  // Present if the handler reported one, or if the upload endpoint recorded one. Either is
+  // enough to say an artefact exists; neither on its own is enough to say it does not.
+  const exists = Boolean(stored || (runpodVideo && typeof runpodVideo === "object"));
+  const out = { privacyMode };
+
+  if (state?.expiresAt || stored?.expiresAt) {
+    out.expiresAt = stored?.expiresAt || state.expiresAt;
+  }
+
+  if (!exists) return out;
+
+  if (deleted) {
+    out.video = { deleted: true };
+    out.artifact = { deleted: true, privacyMode, encrypted: Boolean(stored?.encrypted) };
+    return out;
+  }
+
+  const encrypted = Boolean(stored?.encrypted);
+  const size = stored?.size ?? runpodVideo?.size;
+  const key = stored?.key ?? outputKey(jobId, encrypted);
+
+  // Kept for every existing client that reads `video`. For a confidential job the URL is
+  // the same one - it just serves ciphertext, and `artifact` below says so.
+  out.video = { url: `/jobs/${encoded}/video`, key, size, deleted: false };
+
+  out.artifact = {
+    url: `/jobs/${encoded}/artifact`,
+    key,
+    size,
+    deleted: false,
+    privacyMode,
+    encrypted,
+    contentType: stored?.contentType || (encrypted ? ENCRYPTED_CONTENT_TYPE : "video/mp4"),
+    originalContentType: stored?.originalContentType || "video/mp4"
+  };
+
+  if (encrypted) {
+    out.artifact.encryptionVersion = stored?.encryptionVersion ?? CONTAINER_VERSION;
+    out.artifact.algorithm = stored?.algorithm || CONTAINER_SUITES[1];
+    // Everything the browser needs to derive the same key from the same passphrase - and
+    // nothing that would let anyone else do it.
+    if (stored?.kdf) out.artifact.kdf = stored.kdf;
+    if (stored?.keyId) out.artifact.keyId = stored.keyId;
+  }
+
+  return out;
 }
 
 async function cancelJob(backend, jobId, env, headers, url) {
@@ -1183,11 +1681,33 @@ async function cancelJob(backend, jobId, env, headers, url) {
  * Keyframes ride along in the fields handler.py already understands (image_url /
  * image_base64), so no image rebuild is needed for the modes enabled here.
  */
-function buildRunPodInput(backend, workflow, settings, callbacks) {
+function buildRunPodInput(backend, workflow, settings, callbacks, privacy) {
   switch (backend) {
     case "h3":
     case "h3-blackwell": {
       const input = { workflow };
+
+      /*
+       * The one place the encryption key is ever written to an outbound payload.
+       *
+       * It has to be here: encryption must happen where the plaintext is, and that is
+       * inside the inference container. The key is request-scoped and travels no further -
+       * it is not stored in R2, KV, D1, a Durable Object or a log, and no response the API
+       * produces contains it. What it does mean is that the key is present in the job
+       * payload RunPod holds for that job's retention window, which is a real exposure and
+       * is documented as one in docs/confidential-generation.md.
+       */
+      if (privacy) {
+        input.privacy = { mode: privacy.mode };
+        if (privacy.encryption) {
+          input.encryption = {
+            algorithm: privacy.encryption.algorithm,
+            key: privacy.encryption.key,
+            ...(privacy.encryption.keyId ? { keyId: privacy.encryption.keyId } : {}),
+            ...(privacy.encryption.kdf ? { kdf: privacy.encryption.kdf } : {})
+          };
+        }
+      }
 
       if (callbacks) {
         input.progress = callbacks.progress;
@@ -1383,8 +1903,9 @@ function routeDescriptions() {
     "GET /health",
     "GET /capabilities",
     "POST /jobs/:jobId/assets",
-    "GET /jobs/:jobId/video",
-    "DELETE /jobs/:jobId/video",
+    "GET /jobs/:jobId/artifact (alias: /video)",
+    "DELETE /jobs/:jobId/artifact (alias: /video)",
+    "DELETE /jobs/:jobId",
     "GET /ws/jobs/:jobId",
     "POST /generate",
     "GET /status/:backend/:jobId",
@@ -1394,19 +1915,147 @@ function routeDescriptions() {
   ];
 }
 
+/* ------------------------------------------------------------------------------------
+ * Redaction and safe logging
+ *
+ * Two separate jobs, deliberately not merged:
+ *
+ *   redactSecrets()  cleans a *structure* - anything about to be logged, or echoed back
+ *                    from an upstream service. Structural rather than a regex over a
+ *                    serialized blob, so it can tell an R2 object key from a crypto key.
+ *
+ *   logGeneration()  emits an explicit, hand-picked set of fields. Nothing here ever
+ *                    serializes a request body and hopes redaction catches everything;
+ *                    that is backwards, and one new field would be enough to break it.
+ * ---------------------------------------------------------------------------------- */
+
+/** Field names whose value is secret wherever it appears. */
+const SECRET_FIELDS = new Set([
+  "encryptionkey",
+  "encryption_key",
+  "passphrase",
+  "password",
+  "secret",
+  "authorization",
+  "cf-access-client-id",
+  "cf-access-client-secret",
+  "cf_access_client_secret",
+  "x-api-key",
+  "api_key",
+  "apikey",
+  "token",
+  "job_token_secret",
+  "runpod_api_key",
+  "dek",
+  "data_key",
+  "wrapped_key"
+]);
+
+/*
+ * `key` is only a secret in a cryptographic context. Everywhere else in this Worker it is
+ * an R2 object key - returned by the upload endpoint, shown in /status, and exactly what a
+ * support question needs. Redacting it by name would destroy a useful field to protect one
+ * that lives somewhere specific.
+ */
+const CRYPTO_PARENTS = new Set(["encryption", "crypto", "kdf", "confidential", "privacy"]);
+
+/** Never redacted: opaque client-chosen labels whose whole purpose is to be visible. */
+const NEVER_REDACT = new Set(["keyid", "key_id", "r2_key", "storage_key", "object_key"]);
+
+const REDACTED = "[redacted]";
+
+export function redactSecrets(value, parent = "", depth = 0) {
+  if (depth > 12) return "[omitted: nesting too deep]";
+  if (value === null || value === undefined) return value;
+
+  if (Array.isArray(value)) {
+    return value.map((item) => redactSecrets(item, parent, depth + 1));
+  }
+
+  if (typeof value === "object") {
+    const out = {};
+    for (const [name, child] of Object.entries(value)) {
+      const lowered = String(name).trim().toLowerCase();
+      if (NEVER_REDACT.has(lowered)) {
+        out[name] = child;
+      } else if (SECRET_FIELDS.has(lowered) || (lowered === "key" && CRYPTO_PARENTS.has(parent.toLowerCase()))) {
+        out[name] = REDACTED;
+      } else {
+        out[name] = redactSecrets(child, name, depth + 1);
+      }
+    }
+    return out;
+  }
+
+  return value;
+}
+
+/**
+ * One structured line per submitted generation.
+ *
+ * Every field is chosen by hand and every one of them is non-secret. The prompt is not
+ * here in any mode - only its length and a truncated digest, which is enough to correlate
+ * two log lines about the same generation and not enough to reconstruct the text. That is
+ * a correlation handle, not a privacy guarantee: prompts are low entropy, and anyone with
+ * a candidate list can confirm a match by hashing it.
+ */
+async function logGeneration({ jobId, backend, settings, privacy }) {
+  const fields = [
+    `generation_id=${jobId}`,
+    `privacy_mode=${privacy.mode}`,
+    `backend=${backend}`,
+    `mode=${settings.mode}`,
+    `width=${settings.width}`,
+    `height=${settings.height}`,
+    `frames=${settings.frames}`,
+    `steps=${settings.steps}`,
+    `encryption=${privacy.encryption ? privacy.encryption.algorithm : "none"}`,
+    `prompt_chars=${settings.userPrompt.length}`
+  ];
+  if (privacy.encryption?.keyId) fields.push(`key_id=${privacy.encryption.keyId}`);
+  if (privacy.encryption?.kdf) fields.push(`kdf=${privacy.encryption.kdf.name}`);
+  if (privacy.expiresAt) fields.push(`expires_at=${privacy.expiresAt}`);
+  fields.push(`prompt_sha256=${await promptDigest(settings.userPrompt)}`);
+
+  console.log(fields.join(" "));
+}
+
+/** First 16 hex characters of the prompt's SHA-256. See the caveat on logGeneration. */
+async function promptDigest(prompt) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(prompt));
+  return [...new Uint8Array(digest)]
+    .slice(0, 8)
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+}
+
 function corsHeaders() {
   return {
     "Content-Type": "application/json; charset=utf-8",
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Headers":
       "Content-Type, Authorization, CF-Access-Client-Id, CF-Access-Client-Secret",
-    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
     "Access-Control-Max-Age": "86400",
     "Cache-Control": "no-store"
   };
 }
 
+/**
+ * Reduce an upstream RunPod response to the fields this API promises, with binary payloads
+ * stripped and any secret redacted.
+ *
+ * The redaction pass matters even though RunPod's status response does not normally echo a
+ * job's input: RunPod holds that input, error paths are the least predictable part of any
+ * upstream, and this is the one function every upstream body flows through. An encryption
+ * key that somehow appeared in an upstream payload must not be able to reach a client by
+ * being copied through here.
+ */
 function sanitizeRunPodResult(data) {
+  return redactSecrets(sanitizeRunPodShape(data));
+}
+
+function sanitizeRunPodShape(data) {
   if (!data || typeof data !== "object" || Array.isArray(data)) {
     return sanitizePayload(data, "result");
   }
@@ -1608,28 +2257,80 @@ async function uploadAsset(request, env, headers, jobId, url) {
  * The object body is handed to the Response directly and never read into a buffer, so
  * Worker memory does not scale with video size.
  */
+/**
+ * Serve a job's artefact from R2, with Range support so browsers can seek.
+ *
+ * Standard artefacts are streamed exactly as before: `video/mp4`, cacheable, seekable.
+ *
+ * Confidential artefacts are ciphertext and are labelled as such - `application/octet-
+ * stream`, `no-store`, `nosniff`, and an attachment disposition - because nothing here can
+ * play them and pretending otherwise would only produce a broken video element. The
+ * cryptographic facts a client needs travel in `X-Artifact-*` headers, exposed to
+ * cross-origin readers; the key is not among them and never will be.
+ *
+ * Which of the two it is comes from the object's own stored metadata, not from its name
+ * and not from a lookup that could be stale.
+ */
 async function streamVideo(request, env, jobId) {
   const bucket = requireBucket(env);
-  const key = outputKey(jobId);
   const range = request.headers.get("Range");
+  const options = range ? { range: request.headers } : undefined;
 
-  const object = await bucket.get(key, range ? { range: request.headers } : undefined);
+  let object = null;
+  let encrypted = false;
+
+  // Standard first, so the common path costs exactly one R2 read as it always has.
+  for (const [index, key] of outputKeyCandidates(jobId).entries()) {
+    object = await bucket.get(key, options);
+    if (object) {
+      encrypted = index === 1;
+      break;
+    }
+  }
 
   if (!object) {
-    return new Response(JSON.stringify({ error: "Video not found for this job" }), {
+    return new Response(JSON.stringify({ error: "No artefact found for this job" }), {
       status: 404,
       headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
     });
   }
 
+  const stored = object.customMetadata || {};
+  // Metadata wins; the key name is the fallback for objects written before it existed.
+  if (stored.encrypted !== undefined) {
+    encrypted = stored.encrypted === "true";
+  }
+
   const responseHeaders = new Headers();
   object.writeHttpMetadata(responseHeaders);
-  responseHeaders.set("Content-Type", "video/mp4");
   responseHeaders.set("etag", object.httpEtag);
   responseHeaders.set("Accept-Ranges", "bytes");
   responseHeaders.set("Access-Control-Allow-Origin", "*");
-  // Immutable: a job's video never changes once written.
-  responseHeaders.set("Cache-Control", "private, max-age=3600, immutable");
+  responseHeaders.set("X-Privacy-Mode", stored.privacyMode || (encrypted ? "confidential" : "standard"));
+
+  if (encrypted) {
+    responseHeaders.set("Content-Type", ENCRYPTED_CONTENT_TYPE);
+    responseHeaders.set("X-Artifact-Encrypted", "true");
+    responseHeaders.set("X-Artifact-Encryption-Version", stored.encryptionVersion || String(CONTAINER_VERSION));
+    responseHeaders.set("X-Artifact-Algorithm", stored.algorithm || CONTAINER_SUITES[1]);
+    responseHeaders.set("X-Artifact-Original-Content-Type", stored.originalContentType || "video/mp4");
+    responseHeaders.set("Content-Disposition", 'attachment; filename="artifact.enc"');
+    responseHeaders.set("X-Content-Type-Options", "nosniff");
+    // Ciphertext is useless to a cache and its presence there is one more copy to lose
+    // control of. The browser decrypts into memory; there is nothing to re-fetch.
+    responseHeaders.set("Cache-Control", "private, no-store");
+    responseHeaders.set(
+      "Access-Control-Expose-Headers",
+      "Content-Length, Content-Range, ETag, X-Privacy-Mode, X-Artifact-Encrypted, " +
+        "X-Artifact-Encryption-Version, X-Artifact-Algorithm, X-Artifact-Original-Content-Type"
+    );
+  } else {
+    responseHeaders.set("Content-Type", "video/mp4");
+    responseHeaders.set("X-Artifact-Encrypted", "false");
+    // Immutable: a job's video never changes once written.
+    responseHeaders.set("Cache-Control", "private, max-age=3600, immutable");
+    responseHeaders.set("Access-Control-Expose-Headers", "Content-Length, Content-Range, ETag");
+  }
 
   // Gate on the *request* header, not object.range: R2 populates object.range even for a
   // full read, and answering an unconditional GET with 206 confuses some players.
@@ -1658,22 +2359,75 @@ async function streamVideo(request, env, jobId) {
  * The generation itself stays COMPLETED. Removing an artefact afterwards is not a
  * retrospective failure of the job that produced it.
  */
-async function deleteVideo(env, headers, jobId) {
+/**
+ * Delete everything one generation owns.
+ *
+ * `scope` is "output" for DELETE /jobs/:id/video and /artifact - the artefact only, which
+ * is what those routes have always meant - or "generation" for DELETE /jobs/:id, which
+ * also removes the input keyframes that generation uploaded.
+ *
+ * Deliberately one function for both privacy modes. A confidential artefact is deleted by
+ * exactly the same code as a standard one, because "we forgot to handle deletion for the
+ * encrypted kind" is precisely the bug a second code path invites.
+ */
+async function deleteGeneration(env, headers, jobId, scope = "output") {
   const bucket = requireBucket(env);
-  const key = outputKey(jobId); // throws 400 on a malformed id, before touching R2
+  const segment = safeJobSegment(jobId); // throws 400 on a malformed id, before touching R2
 
-  await bucket.delete(key);
+  const prefixes =
+    scope === "generation" ? [`outputs/${segment}/`, `inputs/${segment}/`] : [`outputs/${segment}/`];
+
+  const found = new Set();
+  for (const prefix of prefixes) {
+    for (const key of await listAllKeys(bucket, prefix)) {
+      found.add(key);
+    }
+  }
+
+  // The artefact's two possible names are deleted whether or not the listing mentioned
+  // them, so a listing that is momentarily behind cannot leave ciphertext in the bucket.
+  // They are not counted as removed - naming a key is not evidence an object was there.
+  const doomed = new Set(found);
+  for (const key of outputKeyCandidates(jobId)) doomed.add(key);
+
+  const all = [...doomed];
+  if (all.length) {
+    // R2's delete accepts an array and does not fail on keys that are already gone, which
+    // is what makes a repeated call safe rather than merely tolerated.
+    await bucket.delete(all.length === 1 ? all[0] : all);
+  }
 
   // Record it so /status stops advertising a URL that would now 404.
   try {
-    await pushJobState(env, jobId, { video: { key, deleted: true } });
+    await pushJobState(env, jobId, {
+      video: { key: outputKey(jobId), deleted: true },
+      artifact: { deleted: true }
+    });
   } catch (error) {
-    // The object is gone either way; a channel that cannot be updated must not turn a
+    // The objects are gone either way; a channel that cannot be updated must not turn a
     // successful deletion into a failure the caller will retry forever.
-    console.warn(`Deleted ${key} but could not update its channel: ${error?.message || error}`);
+    console.warn(`Deleted ${found.size} object(s) but could not update the channel for ` +
+      `job ${segment}: ${error?.message || error}`);
   }
 
-  return json({ id: jobId, deleted: true }, 200, headers);
+  return json({ id: jobId, deleted: true, scope, removed: found.size }, 200, headers);
+}
+
+/** Every key under a prefix, following R2's cursor. */
+async function listAllKeys(bucket, prefix) {
+  if (typeof bucket.list !== "function") {
+    throw new HttpError(500, "R2 binding does not support list(); cannot delete safely");
+  }
+
+  const keys = [];
+  let cursor;
+  do {
+    const page = await bucket.list({ prefix, cursor, limit: 1000 });
+    for (const object of page?.objects || []) keys.push(object.key);
+    cursor = page?.truncated ? page.cursor : undefined;
+  } while (cursor);
+
+  return keys;
 }
 
 async function openJobSocket(request, env, jobId) {
@@ -1707,28 +2461,238 @@ async function receiveProgress(request, env, headers, jobId) {
   return json({ ok: true }, 200, headers);
 }
 
+/**
+ * Receive a finished artefact from RunPod and stream it into R2.
+ *
+ * For a confidential job this is the last gate before persistent storage, and it is the
+ * one that has to hold even if the inference worker is buggy or replaced. Three things are
+ * checked, in this order:
+ *
+ *   1. the token is valid for this job and this purpose (unchanged);
+ *   2. the job's privacy mode comes from the *signed token*, not from the uploader;
+ *   3. if that mode encrypts, the first bytes of the body must parse as a confidential
+ *      container whose authenticated header names this exact job.
+ *
+ * A plaintext MP4 offered for a confidential job is rejected with a 422 and never written.
+ * There is deliberately no override, no query parameter and no header that relaxes this.
+ */
 async function receiveOutput(request, env, headers, jobId) {
-  await verifyJobToken(env.JOB_TOKEN_SECRET, bearerToken(request), jobId, TOKEN_PURPOSES.output);
+  const claims = await verifyJobToken(
+    env.JOB_TOKEN_SECRET,
+    bearerToken(request),
+    jobId,
+    TOKEN_PURPOSES.output
+  );
 
   const bucket = requireBucket(env);
-  const key = outputKey(jobId);
+  const mode = PRIVACY_MODES[claims.pm] ? claims.pm : DEFAULT_PRIVACY_MODE;
+  const spec = PRIVACY_MODES[mode];
 
   if (!request.body) {
-    throw new HttpError(400, "Expected a raw video/mp4 request body");
+    throw new HttpError(400, "Expected a raw artefact body");
   }
 
-  // The stream goes straight into R2: the video is never buffered in Worker memory, and
+  let body = request.body;
+  let artifact = { privacyMode: mode, encrypted: false, contentType: "video/mp4" };
+
+  if (spec.encrypts) {
+    // Peek only as far as the header. The payload itself is never buffered, so Worker
+    // memory stays flat regardless of video size.
+    const peeked = await peekStream(body, CONTAINER_PREAMBLE_BYTES + CONTAINER_MAX_HEADER_BYTES);
+    body = peeked.stream;
+
+    let container;
+    try {
+      container = parseContainerPrefix(peeked.prefix);
+    } catch (error) {
+      throw new HttpError(
+        422,
+        `Refusing to store this artefact: job ${jobId} is confidential, and the uploaded ` +
+          `bytes are not an encrypted container (${error.message}). Nothing was written.`
+      );
+    }
+
+    /*
+     * The header is the AEAD's associated data, so an attacker cannot rewrite artifactId
+     * without breaking authentication. Checking it here means a ciphertext produced for
+     * another generation cannot be filed under this one.
+     */
+    if (container.header.artifactId && container.header.artifactId !== jobId) {
+      throw new HttpError(
+        422,
+        `Refusing to store this artefact: its authenticated header names generation ` +
+          `'${container.header.artifactId}', not '${jobId}'.`
+      );
+    }
+
+    artifact = {
+      privacyMode: mode,
+      encrypted: true,
+      encryptionVersion: container.version,
+      algorithm: container.algorithm,
+      contentType: ENCRYPTED_CONTENT_TYPE,
+      originalContentType: container.header.contentType || "application/octet-stream",
+      ...(container.header.kdf ? { kdf: container.header.kdf } : {}),
+      ...(container.header.keyId ? { keyId: container.header.keyId } : {})
+    };
+  }
+
+  const key = outputKey(jobId, artifact.encrypted);
+  const expiresAt = typeof claims.exa === "string" ? claims.exa : undefined;
+
+  // The stream goes straight into R2: the artefact is never buffered in Worker memory, and
   // the key comes from us, never from the uploader.
-  const object = await bucket.put(key, request.body, {
-    httpMetadata: { contentType: "video/mp4" }
+  const object = await bucket.put(key, body, {
+    httpMetadata: { contentType: artifact.contentType },
+    // Non-secret, and the reason an object recovered on its own is still identifiable.
+    // No key material appears here - there is no branch of this function that could put
+    // it here, because the Worker never holds the key at upload time.
+    customMetadata: {
+      privacyMode: artifact.privacyMode,
+      encrypted: String(artifact.encrypted),
+      ...(artifact.encrypted
+        ? {
+            encryptionVersion: String(artifact.encryptionVersion),
+            algorithm: artifact.algorithm,
+            originalContentType: artifact.originalContentType
+          }
+        : {}),
+      ...(expiresAt ? { expiresAt } : {})
+    }
   });
 
   const declaredSize = Number(request.headers.get("Content-Length") || 0);
   const size = object?.size ?? (declaredSize > 0 ? declaredSize : undefined);
 
-  await pushJobState(env, jobId, { video: { key, size } });
+  await pushJobState(env, jobId, {
+    privacyMode: artifact.privacyMode,
+    video: { key, size },
+    artifact: { ...artifact, key, size, deleted: false, ...(expiresAt ? { expiresAt } : {}) }
+  });
 
-  return json({ key, size, url: `/jobs/${jobId}/video` }, 201, headers);
+  return json(
+    {
+      key,
+      size,
+      url: `/jobs/${jobId}/artifact`,
+      privacyMode: artifact.privacyMode,
+      encrypted: artifact.encrypted,
+      contentType: artifact.contentType
+    },
+    201,
+    headers
+  );
+}
+
+/**
+ * Read the first `limit` bytes of a stream without consuming it.
+ *
+ * Returns the bytes seen so far plus a stream that replays them followed by the rest, so
+ * the caller can inspect a header and still hand the whole body to R2 unbuffered.
+ */
+async function peekStream(stream, limit) {
+  const reader = stream.getReader();
+  const chunks = [];
+  let seen = 0;
+
+  while (seen < limit) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    seen += value.byteLength;
+  }
+
+  const prefix = new Uint8Array(seen);
+  let offset = 0;
+  for (const chunk of chunks) {
+    prefix.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+
+  const replay = new ReadableStream({
+    async pull(controller) {
+      if (chunks.length) {
+        controller.enqueue(chunks.shift());
+        return;
+      }
+      const { value, done } = await reader.read();
+      if (done) {
+        controller.close();
+        reader.releaseLock();
+        return;
+      }
+      controller.enqueue(value);
+    },
+    cancel(reason) {
+      return reader.cancel(reason);
+    }
+  });
+
+  return { prefix, stream: replay };
+}
+
+/**
+ * Parse the framing and authenticated header of a confidential container.
+ *
+ * Mirrors artifacts.py::parse_container_prefix; tests/vectors/confidential_container.json
+ * pins the layout both sides must agree on. Throws for anything that is not a container,
+ * which is how "are these bytes really ciphertext?" is answered cheaply.
+ */
+export function parseContainerPrefix(data) {
+  if (data.byteLength < CONTAINER_PREAMBLE_BYTES) {
+    throw new Error(
+      `too short: ${data.byteLength} bytes, need at least ${CONTAINER_PREAMBLE_BYTES}`
+    );
+  }
+
+  const magic = String.fromCharCode(data[0], data[1], data[2], data[3]);
+  if (magic !== CONTAINER_MAGIC) {
+    throw new Error("missing container magic - these bytes are not ciphertext");
+  }
+
+  const version = data[4];
+  const suite = data[5];
+  if (version !== CONTAINER_VERSION) {
+    throw new Error(`unsupported container version ${version}`);
+  }
+  if (!CONTAINER_SUITES[suite]) {
+    throw new Error(`unsupported cipher suite ${suite}`);
+  }
+
+  const headerLength = (data[6] << 8) | data[7];
+  if (headerLength === 0 || headerLength > CONTAINER_MAX_HEADER_BYTES) {
+    throw new Error(`illegal header length ${headerLength}`);
+  }
+
+  const headerEnd = CONTAINER_PREAMBLE_BYTES + headerLength;
+  if (data.byteLength < headerEnd) {
+    throw new Error(`truncated header: need ${headerEnd} bytes, have ${data.byteLength}`);
+  }
+
+  let header;
+  try {
+    header = JSON.parse(
+      new TextDecoder("utf-8", { fatal: true }).decode(
+        data.subarray(CONTAINER_PREAMBLE_BYTES, headerEnd)
+      )
+    );
+  } catch (error) {
+    throw new Error(`header is not valid JSON: ${error.message}`);
+  }
+
+  if (!header || typeof header !== "object" || Array.isArray(header)) {
+    throw new Error("header must be a JSON object");
+  }
+
+  return {
+    version,
+    suite,
+    algorithm: CONTAINER_SUITES[suite],
+    header,
+    headerLength,
+    nonceOffset: headerEnd,
+    ciphertextOffset: headerEnd + CONTAINER_NONCE_BYTES
+  };
 }
 
 async function serveAsset(request, env, jobId, assetId) {
@@ -1795,12 +2759,29 @@ async function hmacKey(secret) {
   );
 }
 
-/** Mint a token binding jobId + purpose + expiry. */
-export async function signJobToken(secret, jobId, purpose, ttlSeconds = TOKEN_DEFAULT_TTL_SECONDS) {
+/**
+ * Mint a token binding jobId + purpose + expiry, plus any extra signed claims.
+ *
+ * `claims` are authenticated the same way everything else in the payload is: they ride
+ * inside the signed body, so the holder can read them but cannot change them. That is how
+ * a job's privacy mode reaches the upload endpoint without a storage lookup.
+ */
+export async function signJobToken(
+  secret,
+  jobId,
+  purpose,
+  ttlSeconds = TOKEN_DEFAULT_TTL_SECONDS,
+  claims = null
+) {
   if (!secret) {
     throw new HttpError(500, "Missing Cloudflare secret: JOB_TOKEN_SECRET");
   }
-  const payload = { jid: jobId, pur: purpose, exp: Math.floor(Date.now() / 1000) + ttlSeconds };
+  const payload = {
+    jid: jobId,
+    pur: purpose,
+    exp: Math.floor(Date.now() / 1000) + ttlSeconds,
+    ...(claims || {})
+  };
   const body = b64urlEncode(new TextEncoder().encode(JSON.stringify(payload)));
   const signature = await crypto.subtle.sign("HMAC", await hmacKey(secret), new TextEncoder().encode(body));
   return `${body}.${b64urlEncode(signature)}`;
@@ -1881,8 +2862,24 @@ function bearerToken(request) {
  * only places that need to change.
  * ---------------------------------------------------------------------------------- */
 
-export function outputKey(jobId) {
-  return `outputs/${safeJobSegment(jobId)}/video.mp4`;
+/**
+ * Where a job's finished artefact lives.
+ *
+ * Two names, one prefix. A confidential artefact is not an MP4 and must not be called one:
+ * anyone looking at the bucket during an incident should be able to tell ciphertext from
+ * video at a glance, and nothing should be able to hand `artifact.enc` to a `<video>` tag
+ * by mistake. The prefix stays `outputs/` because the bucket's R2 lifecycle rules are
+ * prefix-scoped - moving it would silently drop those artefacts out of retention.
+ *
+ * Neither name contains the prompt, the caller or anything else about the content.
+ */
+export function outputKey(jobId, encrypted = false) {
+  return `outputs/${safeJobSegment(jobId)}/${encrypted ? "artifact.enc" : "video.mp4"}`;
+}
+
+/** Every name a job's artefact could have. Ordered so the common case is tried first. */
+export function outputKeyCandidates(jobId) {
+  return [outputKey(jobId, false), outputKey(jobId, true)];
 }
 
 export function inputKey(jobId, assetId, extension) {
@@ -2049,20 +3046,20 @@ function jobChannel(env, jobId) {
 }
 
 /**
- * Has this job's output been deleted?
+ * Read a job's recorded state.
  *
- * Reads the Durable Object rather than probing R2: the DO is the record of intent, and a
- * missing object could equally mean the upload never happened. Any failure answers "not
- * deleted", so a channel problem degrades to the previous behaviour instead of hiding a
- * video that is really there.
+ * The Durable Object is the record of intent - it knows a video was deleted, where a
+ * missing R2 object could equally mean the upload never happened. Any failure answers
+ * `null`, so a channel problem degrades to "describe nothing extra" rather than hiding an
+ * artefact that is really there.
  */
-async function isVideoDeleted(env, jobId) {
+async function readJobState(env, jobId) {
   try {
     const response = await jobChannel(env, jobId).fetch(new Request("https://do/state"));
     const state = await response.json();
-    return Boolean(state?.video?.deleted);
+    return state && typeof state === "object" ? state : null;
   } catch {
-    return false;
+    return null;
   }
 }
 

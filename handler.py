@@ -14,6 +14,17 @@ Response shape (matches worker-comfyui / the existing Cloudflare Worker):
 Output delivery is pluggable (see OutputStore). H3_OUTPUT_MODE selects it:
   * "base64" (default) - inline base64, what the current Cloudflare Worker consumes.
   * "r2"               - AES-256-GCM encrypt in-worker, upload ciphertext only to R2.
+
+Artefact protection is a separate, model-independent concern (see artifacts.py). A job may
+carry a privacy mode and, for `confidential`, a caller-derived encryption key:
+
+    {"input": {"workflow": {...},
+               "privacy": {"mode": "confidential"},
+               "encryption": {"algorithm": "AES-256-GCM", "key": "<base64url 32 bytes>",
+                              "kdf": {...}, "keyId": "..."}}}
+
+In that mode the finished MP4 is encrypted here, inside the inference container, and the
+plaintext is deleted before anything is uploaded. Only ciphertext leaves this process.
 """
 
 from __future__ import annotations
@@ -38,6 +49,17 @@ from typing import Iterable
 import requests
 import runpod
 import websocket
+
+# Model-independent artefact protection: privacy modes, the encrypted container format,
+# plaintext hygiene and redaction. Nothing in it knows about H3, ComfyUI or R2, which is
+# what lets a second model reuse it unchanged.
+import artifacts
+from artifacts import (
+    ArtifactError,
+    GeneratedArtifact,
+    ProtectedArtifact,
+    redact,
+)
 
 # --------------------------------------------------------------------------------------
 # Configuration
@@ -1537,11 +1559,15 @@ def cleanup_input_image(path: str | None) -> None:
 class OutputStore:
     """Strategy for getting a finished artefact back to the caller.
 
-    ``store`` receives a path to a plaintext file on the worker and returns the dict that
-    goes into ``output.images[]``. Implementations own their own cleanup of that file.
+    ``store`` receives a path to a file on the worker and returns the dict that goes into
+    ``output.images[]``. Implementations own their own cleanup of that file.
+
+    ``protected`` describes what that file now *is* - plaintext in standard mode, an
+    encrypted container in confidential mode. It is optional so that every existing caller
+    keeps working untouched; a store that ignores it behaves exactly as it did before.
     """
 
-    def store(self, path: str, entry: dict) -> dict:
+    def store(self, path: str, entry: dict, protected: ProtectedArtifact | None = None) -> dict:
         raise NotImplementedError
 
 
@@ -1551,7 +1577,7 @@ class Base64Store(OutputStore):
     def __init__(self) -> None:
         self.max_bytes = int(os.environ.get("H3_MAX_BASE64_BYTES", str(180 * 1024 * 1024)))
 
-    def store(self, path: str, entry: dict) -> dict:
+    def store(self, path: str, entry: dict, protected: ProtectedArtifact | None = None) -> dict:
         size = os.path.getsize(path)
         if size > self.max_bytes:
             raise WorkflowError(
@@ -1585,10 +1611,14 @@ class WorkerUploadStore(OutputStore):
         self.uploaded_bytes = 0
         self.upload_seconds = 0.0
 
-    def store(self, path: str, entry: dict) -> dict:
+    def store(self, path: str, entry: dict, protected: ProtectedArtifact | None = None) -> dict:
         size = os.path.getsize(path)
+        # The content type describes what is actually in the body. For a confidential
+        # artefact that is an opaque container, not an MP4, and saying so is what stops the
+        # Worker from ever labelling ciphertext as playable video.
+        content_type = protected.content_type if protected else "video/mp4"
         headers = {
-            "Content-Type": "video/mp4",
+            "Content-Type": content_type,
             "Content-Length": str(size),
             **cloudflare_access_headers(),
         }
@@ -1652,6 +1682,15 @@ class WorkerUploadStore(OutputStore):
         for field in ("key", "url", "contentType"):
             if body.get(field):
                 result[field] = body[field]
+
+        if protected is not None:
+            # Non-secret protection facts, so /status can describe the artefact without the
+            # client having to download it first. There is no key material in here - see
+            # ProtectedArtifact.metadata, which is built from public fields only.
+            result["privacyMode"] = protected.metadata.get("privacyMode", "standard")
+            result["encrypted"] = protected.encrypted
+            if protected.encrypted:
+                result["artifact"] = dict(protected.metadata)
 
         return result
 
@@ -1782,7 +1821,7 @@ class EncryptedR2Store(OutputStore):
         except OSError as error:
             log(f"WARNING: could not delete temporary file: {error}")
 
-    def store(self, path: str, entry: dict) -> dict:
+    def store(self, path: str, entry: dict, protected: ProtectedArtifact | None = None) -> dict:
         filename = entry["filename"]
         object_key = "/".join(
             part for part in (self.prefix, f"{uuid.uuid4().hex}", filename) if part
@@ -1855,30 +1894,87 @@ def get_output_store() -> OutputStore:
     return _output_store
 
 
-def collect_outputs(history: dict, store: OutputStore | None = None) -> list[dict]:
+def collect_outputs(
+    history: dict,
+    store: OutputStore | None = None,
+    protector: artifacts.ArtifactProtector | None = None,
+    generation_id: str = "",
+) -> list[dict]:
+    """Turn a finished execution into the artefacts the caller gets back.
+
+    Two separable steps per artefact, in this order and never the other way round:
+
+      1. **protect** - encrypt it, if the job asked for that. The plaintext is destroyed
+         here, while the bytes are still inside this process.
+      2. **store**   - hand the protected bytes to whatever delivers them.
+
+    Protection failing is fatal by construction: ``protect()`` raises, the exception
+    propagates, and no ``store()`` call is ever reached. There is no path through this
+    function that uploads a plaintext artefact for a job that asked for encryption.
+    """
     # `store` is injected per job so an R2-backed request can upload through the Worker
     # while everything else keeps using the process-wide configured store.
     store = store if store is not None else get_output_store()
+    protector = protector if protector is not None else artifacts.PassthroughProtector()
     results: list[dict] = []
     scratch = tempfile.mkdtemp(prefix="h3-out-")
     keep_outputs = os.environ.get("H3_KEEP_OUTPUTS", "0") == "1"
+    protected_artifacts: list[ProtectedArtifact] = []
 
     try:
         for entry in iter_output_entries(history):
             path = resolve_output_path(entry)
             if path is None:
                 path = download_output(entry, os.path.join(scratch, entry["filename"]))
-            results.append(store.store(path, entry))
+
+            protected = protector.protect(
+                GeneratedArtifact(
+                    path=path,
+                    mime_type=_artifact_mime_type(entry["filename"]),
+                    generation_id=generation_id or entry["filename"],
+                    filename=entry["filename"],
+                )
+            )
+            protected_artifacts.append(protected)
+
+            results.append(store.store(protected.path, entry, protected))
 
             # A warm worker serves many jobs; without this, generated videos pile up in the
-            # output directory until the container disk fills. The r2 store already deletes
-            # its plaintext, so this is a no-op there.
-            if not keep_outputs:
+            # output directory until the container disk fills. In confidential mode the
+            # plaintext is already gone (protect() shredded it), so this finds nothing -
+            # and H3_KEEP_OUTPUTS is deliberately not consulted there, because "keep the
+            # outputs for debugging" must never mean "keep the plaintext of an artefact the
+            # caller asked us to encrypt".
+            if not keep_outputs or protected.encrypted:
                 _discard_output_file(path)
     finally:
+        # Runs on every path, including a failed encryption or a failed upload: no
+        # ciphertext scratch directory and no downloaded plaintext outlives this call.
+        for protected in protected_artifacts:
+            protected.discard()
         shutil.rmtree(scratch, ignore_errors=True)
 
     return results
+
+
+#: Filename extension -> media type of the *plaintext* artefact. Recorded in the encrypted
+#: container so a decrypting client knows what it is holding without guessing.
+_ARTIFACT_MIME_TYPES = {
+    ".mp4": "video/mp4",
+    ".webm": "video/webm",
+    ".webp": "image/webp",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".flac": "audio/flac",
+    ".wav": "audio/wav",
+    ".mp3": "audio/mpeg",
+}
+
+
+def _artifact_mime_type(filename: str) -> str:
+    return _ARTIFACT_MIME_TYPES.get(os.path.splitext(filename)[1].lower(), "application/octet-stream")
 
 
 def _discard_output_file(path: str) -> None:
@@ -1905,6 +2001,25 @@ def _spec(job_input: dict, key: str) -> dict:
     return value if isinstance(value, dict) else {}
 
 
+def build_protector_for_job(job_input: dict) -> artifacts.ArtifactProtector:
+    """Resolve this job's privacy mode into an artefact protector.
+
+    Validated here as well as in the Worker, on purpose. The Worker is the public contract
+    and rejects bad input early with a clean 4xx; this is the last line before plaintext
+    would be handed to an uploader, and it is the only one that matters if a job ever
+    reaches RunPod by another route.
+    """
+    privacy = _spec(job_input, "privacy")
+    mode = privacy.get("mode") or job_input.get("privacyMode") or job_input.get("privacy_mode")
+    encryption = _spec(job_input, "encryption")
+    try:
+        return artifacts.build_protector(mode, encryption, on_warning=lambda m: log(f"WARNING: {m}"))
+    except ArtifactError as error:
+        # Surfaces as a caller-facing 4xx-ish error rather than a crash, and - because
+        # WorkflowError is raised before any output is touched - nothing is uploaded.
+        raise WorkflowError(str(error)) from error
+
+
 def build_output_store_for_job(job_input: dict) -> tuple[OutputStore, WorkerUploadStore | None]:
     """Pick where this job's artefacts go.
 
@@ -1927,6 +2042,7 @@ def build_output_store_for_job(job_input: dict) -> tuple[OutputStore, WorkerUplo
 def handler(job: dict) -> dict:
     job_id = job.get("id", "<unknown>")
     staged_assets: list[str] = []
+    protector: artifacts.ArtifactProtector | None = None
 
     global _jobs_served
     with _jobs_lock:
@@ -1951,6 +2067,28 @@ def handler(job: dict) -> dict:
         if not isinstance(workflow, dict) or not workflow:
             status = "bad_request"
             return {"error": "input.workflow is required and must be a ComfyUI API-format object."}
+
+        # Resolved before anything expensive starts: a job that cannot be protected the way
+        # it asked should cost zero GPU seconds, not fail after two minutes of sampling.
+        protector = build_protector_for_job(job_input)
+        generation_id = str(_spec(job_input, "progress").get("jobId") or job_id)
+        log(
+            f"generation_id={generation_id} privacy_mode={protector.mode} "
+            f"encryption={'AES-256-GCM' if protector.encrypts else 'none'} "
+            f"nodes={len(workflow)}"
+        )
+
+        if protector.encrypts and not _spec(job_input, "output").get("url"):
+            # Fail closed. Without an upload endpoint the only way back is base64 inside
+            # this job's RunPod result, which is a copy of the artefact in a store we do not
+            # control. Refusing is the honest answer; silently returning the plaintext MP4
+            # would be the dangerous one.
+            status = "bad_request"
+            raise WorkflowError(
+                "privacyMode 'confidential' requires an output upload endpoint. This job "
+                "arrived without one, and returning the artefact inline is not an option "
+                "for a confidential generation."
+            )
 
         reporter.phase(PHASE_STARTING)
 
@@ -1989,13 +2127,19 @@ def handler(job: dict) -> dict:
             reporter.phase(PHASE_UPLOADING, percent=95)
 
         began = time.monotonic()
-        images = collect_outputs(history, store=store)
+        images = collect_outputs(
+            history, store=store, protector=protector, generation_id=generation_id
+        )
         timer.add_span("output", time.monotonic() - began)
 
         if upload_store is not None:
             # Reported separately so a slow R2 write is never read as slow inference.
             timer.add_span("output_upload", upload_store.upload_seconds)
             timer.output_bytes = upload_store.uploaded_bytes
+        if protector.total_seconds:
+            # The whole point of measuring this is to be able to say what Confidential
+            # Generation costs. Expect it to disappear next to sampling.
+            timer.add_span("encryption", protector.total_seconds)
 
         if not images:
             status = "no_output"
@@ -2013,7 +2157,7 @@ def handler(job: dict) -> dict:
         log(f"Job {job_id}: returning {len(images)} artefact(s)")
         status = "ok"
 
-        result = {"images": images, "prompt_id": prompt_id}
+        result = {"images": images, "prompt_id": prompt_id, "privacyMode": protector.mode}
 
         # Only now is the job genuinely done: the upload has already succeeded, because
         # WorkerUploadStore raises rather than returning on a failed PUT.
@@ -2045,6 +2189,11 @@ def handler(job: dict) -> dict:
         # Always runs, so a failed or rejected job cannot orphan staged input images.
         for path in staged_assets:
             cleanup_input_image(path)
+        # The key was request-scoped; it stops being reachable here. See the "Secrets in
+        # memory" section of docs/confidential-generation.md for what this is and is not
+        # worth - CPython cannot promise every copy is gone.
+        if protector is not None:
+            protector.destroy()
         timer.progress_callbacks = (reporter.sent, reporter.failed)
         if reporter.seconds:
             timer.add_span("progress_callback_time", reporter.seconds)

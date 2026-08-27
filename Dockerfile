@@ -85,7 +85,12 @@ RUN cd "$COMFY_DIR" \
  && python3 -c "from alembic import command; from alembic.config import Config; c = Config('alembic.ini'); c.set_main_option('script_location', 'alembic_db'); command.upgrade(c, 'head')" \
  && python3 -c "import sqlite3; r = sqlite3.connect('user/comfyui.db').execute('select version_num from alembic_version').fetchone(); assert r and r[0], 'alembic_version is empty - migrations did not run'; print('ComfyUI DB baked at revision', r[0])"
 
+# artifacts.py is the model-independent privacy layer (privacy modes, the encrypted
+# container format, plaintext hygiene, redaction). It is a sibling module rather than more
+# of handler.py because nothing in it is H3-specific: a second model reuses it as-is.
+# handler.py runs from /opt/serverless, so a plain `import artifacts` resolves.
 COPY handler.py /opt/serverless/handler.py
+COPY artifacts.py /opt/serverless/artifacts.py
 
 WORKDIR /opt/serverless
 

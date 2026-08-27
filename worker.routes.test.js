@@ -41,7 +41,17 @@ function makeEnv(overrides = {}) {
         bucket.set(key, body);
         return { size: 123 };
       },
-      get: async (key) => (bucket.has(key) ? { body: "x", httpEtag: '"e"', size: 123, writeHttpMetadata() {} } : null)
+      get: async (key) =>
+        bucket.has(key)
+          ? { body: "x", httpEtag: '"e"', size: 123, customMetadata: {}, writeHttpMetadata() {} }
+          : null,
+      delete: async (key) => {
+        for (const one of Array.isArray(key) ? key : [key]) bucket.delete(one);
+      },
+      list: async ({ prefix = "" } = {}) => ({
+        objects: [...bucket.keys()].filter((key) => key.startsWith(prefix)).map((key) => ({ key })),
+        truncated: false
+      })
     },
 
     __doCalls: doCalls,
@@ -221,6 +231,11 @@ test("every route reachable by a verb responds without a ReferenceError", async 
     new Request("https://worker.example/cancel/h3-blackwell/j1", { method: "POST" }),
     new Request("https://worker.example/cancel/h3-blackwell/j1?jobId=w1", { method: "POST" }),
     new Request("https://worker.example/jobs/w1/video"),
+    new Request("https://worker.example/jobs/w1/artifact"),
+    new Request("https://worker.example/jobs/w1/video", { method: "DELETE" }),
+    new Request("https://worker.example/jobs/w1/artifact", { method: "DELETE" }),
+    new Request("https://worker.example/jobs/w1", { method: "DELETE" }),
+    post("/generate", { ...LEGACY_BODY, privacyMode: "standard" }),
     post("/internal/jobs/w1/progress", { phase: "sampling" }),
     new Request("https://worker.example/internal/jobs/w1/assets/first-frame")
   ];

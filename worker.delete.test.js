@@ -11,7 +11,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import worker, { outputKey, publicEvent } from "./worker.js";
+import worker, { outputKey, outputKeyCandidates, publicEvent } from "./worker.js";
 
 const JOB = "08ad4ace-d847-46b4-a1d6-a919d7e3a0c9";
 
@@ -52,8 +52,24 @@ function makeEnv({ withVideo = true } = {}) {
 
     H3_OUTPUTS: {
       delete: async (key) => {
-        deletes.push(key);
-        bucket.delete(key); // R2 does not error on a missing key
+        // R2's delete takes a key or an array of them, and does not error on keys that are
+        // already gone. The stub models both, because deletion now names several
+        // candidates at once and idempotence depends on that being tolerated.
+        for (const one of Array.isArray(key) ? key : [key]) {
+          deletes.push(one);
+          bucket.delete(one);
+        }
+      },
+      list: async ({ prefix = "", cursor, limit = 1000 } = {}) => {
+        const all = [...bucket.keys()].filter((key) => key.startsWith(prefix)).sort();
+        const start = cursor ? Number(cursor) : 0;
+        const page = all.slice(start, start + limit);
+        const next = start + page.length;
+        return {
+          objects: page.map((key) => ({ key })),
+          truncated: next < all.length,
+          cursor: next < all.length ? String(next) : undefined
+        };
       },
       get: async (key) => {
         if (!bucket.has(key)) return null;
@@ -93,8 +109,14 @@ test("deleting a job's video removes exactly that object", async () => {
   const body = await response.json();
 
   assert.equal(response.status, 200);
-  assert.deepEqual(body, { id: JOB, deleted: true });
-  assert.deepEqual(env.__deletes, [outputKey(JOB)], "exactly one key, derived from the job id");
+  // Subset rather than deepEqual: the response is additive (scope, removed) and a strict
+  // shape assertion here would fail every time a non-breaking field is added.
+  assert.equal(body.id, JOB);
+  assert.equal(body.deleted, true);
+  assert.equal(body.removed, 1, "one object actually existed");
+  // Both possible artefact names are deleted - standard and confidential - and every one
+  // of them is derived from the job id. That scoping is the property under test.
+  assert.deepEqual(env.__deletes.sort(), outputKeyCandidates(JOB).sort());
   assert.equal(env.__bucket.has(outputKey(JOB)), false);
 });
 
@@ -116,7 +138,10 @@ test("repeated deletion succeeds identically", async () => {
   for (const response of [first, second, third]) {
     assert.equal(response.status, 200);
   }
-  assert.deepEqual(await third.json(), { id: JOB, deleted: true });
+  const body = await third.json();
+  assert.equal(body.id, JOB);
+  assert.equal(body.deleted, true);
+  assert.equal(body.removed, 0, "nothing was left to remove by the third call");
 });
 
 test("deleting a job that never had a video still succeeds", async () => {
@@ -124,7 +149,10 @@ test("deleting a job that never had a video still succeeds", async () => {
   const response = await worker.fetch(del(JOB), env);
 
   assert.equal(response.status, 200, "a missing object is not an error condition");
-  assert.deepEqual(await response.json(), { id: JOB, deleted: true });
+  const body = await response.json();
+  assert.equal(body.id, JOB);
+  assert.equal(body.deleted, true);
+  assert.equal(body.removed, 0);
 });
 
 test("deleting an entirely unknown job id succeeds without touching anything else", async () => {
@@ -133,7 +161,7 @@ test("deleting an entirely unknown job id succeeds without touching anything els
 
   const response = await worker.fetch(del(other), env);
   assert.equal(response.status, 200);
-  assert.deepEqual(env.__deletes, [outputKey(other)]);
+  assert.deepEqual(env.__deletes.sort(), outputKeyCandidates(other).sort());
   assert.equal(env.__bucket.has(outputKey(JOB)), true, "the real job's video is untouched");
 });
 
@@ -161,7 +189,8 @@ test("deleting one job cannot reach another job's object", async () => {
   await worker.fetch(del(JOB), env);
 
   assert.equal(env.__bucket.has(outputKey(other)), true);
-  assert.equal(env.__deletes.length, 1);
+  // Every key named is inside this job's own namespace; nothing can address another's.
+  assert.ok(env.__deletes.every((key) => key.startsWith(`outputs/${JOB}/`)), env.__deletes.join());
 });
 
 test("there is no route that deletes an arbitrary R2 key", async () => {
