@@ -100,8 +100,45 @@ class CapturingStore(handler.OutputStore):
 
 
 def confidential_protector(key: bytes | None = None, **kwargs):
+    """A v1 symmetric protector. Still constructible directly, so that the v1 read path
+    stays exercised; it is simply no longer reachable from a request."""
     return artifacts.ConfidentialProtector(
         artifacts.EphemeralKey(key or secrets.token_bytes(32)), **kwargs
+    )
+
+
+#: One RSA key pair for the whole module. Generating 3072 bits costs ~200 ms, and a test
+#: file that did it per test would spend most of its runtime on key generation. Reuse is a
+#: test-speed decision and nothing else - production draws a fresh file key per artefact
+#: and the key pair belongs to the user, not to the platform.
+_TEST_KEYPAIR = None
+
+
+def rsa_keypair():
+    global _TEST_KEYPAIR
+    if _TEST_KEYPAIR is None:
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+
+        private = rsa.generate_private_key(public_exponent=65537, key_size=3072)
+        spki = private.public_key().public_bytes(
+            serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
+        )
+        _TEST_KEYPAIR = (private, spki, base64.urlsafe_b64encode(spki).decode().rstrip("="))
+    return _TEST_KEYPAIR
+
+
+def public_key_b64():
+    return rsa_keypair()[2]
+
+
+def private_key():
+    return rsa_keypair()[0]
+
+
+def v2_protector(**kwargs):
+    return artifacts.ConfidentialV2Protector(
+        artifacts.decode_public_key(public_key_b64()), **kwargs
     )
 
 
@@ -187,7 +224,7 @@ class TestContainerFormat(unittest.TestCase):
     def test_layout_matches_the_documented_offsets(self):
         container = bytes.fromhex(self.vector["container_hex"])
         self.assertEqual(container[:4], b"CGEN")
-        self.assertEqual(container[4], artifacts.FORMAT_VERSION)
+        self.assertEqual(container[4], artifacts.CONTAINER_V1_SYMMETRIC)
         self.assertEqual(container[5], artifacts.SUITE_AES_256_GCM)
         self.assertEqual(int.from_bytes(container[6:8], "big"), self.vector["header_length"])
 
@@ -231,7 +268,8 @@ class TestContainerFormat(unittest.TestCase):
         good = bytes.fromhex(self.vector["container_hex"])
 
         future_version = bytearray(good)
-        future_version[4] = 2
+        # 2 is now a real version, so the unknown-version case needs a genuinely unknown one.
+        future_version[4] = 9
         with self.assertRaisesRegex(artifacts.ContainerError, "version"):
             artifacts.parse_container_prefix(bytes(future_version))
 
@@ -424,71 +462,162 @@ class TestPrivacyModes(unittest.TestCase):
 
 
 class TestRequestValidation(unittest.TestCase):
-    def key_b64url(self, size=32):
-        return base64.urlsafe_b64encode(secrets.token_bytes(size)).decode().rstrip("=")
+    """What a confidential request may and may not contain, under the v2 contract."""
 
-    def test_a_valid_256_bit_key_is_accepted(self):
-        protector = artifacts.build_protector("confidential", {"key": self.key_b64url()})
+    def test_a_valid_public_key_is_accepted(self):
+        protector = artifacts.build_protector(
+            "confidential", {"version": 2, "publicKey": public_key_b64()}
+        )
         self.assertTrue(protector.encrypts)
+        self.assertEqual(protector.crypto_version, artifacts.CONTAINER_V2_HYBRID)
+
+    def test_version_defaults_to_the_hybrid_design(self):
+        protector = artifacts.build_protector("confidential", {"publicKey": public_key_b64()})
+        self.assertEqual(protector.crypto_version, artifacts.CONTAINER_V2_HYBRID)
 
     def test_standard_base64_is_accepted_too(self):
-        raw = secrets.token_bytes(32)
+        spki = rsa_keypair()[1]
         protector = artifacts.build_protector(
-            "confidential", {"key": base64.b64encode(raw).decode()}
+            "confidential", {"publicKey": base64.b64encode(spki).decode()}
         )
         self.assertTrue(protector.encrypts)
 
-    def test_a_wrong_size_key_is_rejected(self):
-        for size in (16, 24, 31, 33, 64):
-            with self.subTest(size=size):
-                with self.assertRaisesRegex(artifacts.ArtifactError, "32 bytes"):
-                    artifacts.build_protector("confidential", {"key": self.key_b64url(size)})
+    def test_a_symmetric_key_in_the_request_is_refused(self):
+        """The whole point of v2. A key that can decrypt must not reach the worker."""
+        for block in (
+            {"key": base64.urlsafe_b64encode(secrets.token_bytes(32)).decode().rstrip("=")},
+            {"version": 1, "publicKey": public_key_b64()},
+            {"version": 1},
+        ):
+            with self.subTest(block=sorted(block)):
+                with self.assertRaisesRegex(artifacts.ArtifactError, "no longer accepted"):
+                    artifacts.build_protector("confidential", block)
 
-    def test_malformed_base64_is_rejected(self):
-        for bad in ("not base64!", "***", "a b c"):
+    def test_the_refusal_names_the_replacement(self):
+        with self.assertRaises(artifacts.ArtifactError) as caught:
+            artifacts.build_protector("confidential", {"key": "x" * 43})
+        message = str(caught.exception)
+        self.assertIn("publicKey", message)
+        self.assertIn("version 2", message)
+        self.assertIn("remain decryptable", message, "migration, not an outage")
+
+    def test_an_rsa_key_below_the_floor_is_rejected(self):
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+
+        weak = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        spki = weak.public_key().public_bytes(
+            serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
+        )
+        with self.assertRaisesRegex(artifacts.ArtifactError, "minimum is 3072"):
+            artifacts.build_protector(
+                "confidential",
+                {"publicKey": base64.urlsafe_b64encode(spki).decode().rstrip("=")},
+            )
+
+    def test_a_larger_rsa_key_is_accepted(self):
+        """A floor, not a fixed size: a client wanting 4096 just generates 4096."""
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+
+        big = rsa.generate_private_key(public_exponent=65537, key_size=4096)
+        spki = big.public_key().public_bytes(
+            serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
+        )
+        protector = artifacts.build_protector(
+            "confidential", {"publicKey": base64.urlsafe_b64encode(spki).decode().rstrip("=")}
+        )
+        self.assertEqual(protector.public_key.modulus_bits, 4096)
+
+    def test_a_non_rsa_public_key_is_rejected(self):
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
+
+        curve = ec.generate_private_key(ec.SECP256R1())
+        spki = curve.public_key().public_bytes(
+            serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
+        )
+        with self.assertRaisesRegex(artifacts.ArtifactError, "Unsupported public key type"):
+            artifacts.build_protector(
+                "confidential",
+                {"publicKey": base64.urlsafe_b64encode(spki).decode().rstrip("=")},
+            )
+
+    def test_malformed_public_keys_are_rejected(self):
+        for bad, pattern in (
+            ("not base64!", "base64url"),
+            ("***", "base64url"),
+            ("QUJDRA", "SPKI"),  # valid base64, not a key
+        ):
             with self.subTest(bad):
-                with self.assertRaisesRegex(artifacts.ArtifactError, "base64url"):
-                    artifacts.build_protector("confidential", {"key": bad})
+                with self.assertRaisesRegex(artifacts.ArtifactError, pattern):
+                    artifacts.build_protector("confidential", {"publicKey": bad})
 
     def test_a_missing_encryption_block_is_rejected(self):
         with self.assertRaisesRegex(artifacts.ArtifactError, "requires an encryption block"):
             artifacts.build_protector("confidential", None)
 
-    def test_a_missing_key_is_rejected(self):
+    def test_a_missing_public_key_is_rejected(self):
         with self.assertRaisesRegex(artifacts.ArtifactError, "missing"):
             artifacts.build_protector("confidential", {"algorithm": "AES-256-GCM"})
 
     def test_an_unsupported_algorithm_is_rejected(self):
         with self.assertRaisesRegex(artifacts.ArtifactError, "Unsupported encryption algorithm"):
             artifacts.build_protector(
-                "confidential", {"algorithm": "AES-128-CBC", "key": self.key_b64url()}
+                "confidential", {"algorithm": "AES-128-CBC", "publicKey": public_key_b64()}
             )
+
+    def test_an_unsupported_key_wrap_algorithm_is_rejected(self):
+        with self.assertRaisesRegex(artifacts.ArtifactError, "Unsupported keyWrapAlgorithm"):
+            artifacts.build_protector(
+                "confidential",
+                {"publicKey": public_key_b64(), "keyWrapAlgorithm": "RSA-PKCS1v15"},
+            )
+
+    def test_an_unknown_version_is_rejected(self):
+        with self.assertRaisesRegex(artifacts.ArtifactError, "Unsupported encryption.version"):
+            artifacts.build_protector("confidential", {"version": 7, "publicKey": public_key_b64()})
 
     def test_standard_mode_with_an_encryption_block_is_rejected(self):
         """Silently ignoring it would leave the caller believing they were encrypted."""
         with self.assertRaisesRegex(artifacts.ArtifactError, "does not encrypt"):
-            artifacts.build_protector("standard", {"key": self.key_b64url()})
+            artifacts.build_protector("standard", {"publicKey": public_key_b64()})
 
-    def test_a_non_object_kdf_is_rejected(self):
-        with self.assertRaisesRegex(artifacts.ArtifactError, "kdf must be an object"):
+    def test_a_key_id_that_disagrees_with_the_key_is_rejected(self):
+        with self.assertRaisesRegex(artifacts.ArtifactError, "does not match"):
             artifacts.build_protector(
-                "confidential", {"key": self.key_b64url(), "kdf": "argon2id"}
+                "confidential", {"publicKey": public_key_b64(), "keyId": "someone-elses-key"}
             )
 
-    def test_kdf_metadata_reaches_the_container(self):
-        kdf = {"name": "argon2id", "salt": "c2FsdA", "parameters": {"memorySize": 65536}}
+    def test_a_matching_key_id_is_accepted(self):
+        expected = artifacts.public_key_id(rsa_keypair()[1])
         protector = artifacts.build_protector(
-            "confidential", {"key": self.key_b64url(), "kdf": kdf, "keyId": "kid-1"}
+            "confidential", {"publicKey": public_key_b64(), "keyId": expected}
         )
-        path = write_output("kdf.mp4")
+        self.assertEqual(protector.key_id, expected)
+
+    def test_the_key_id_is_derived_from_the_key_not_chosen(self):
+        """Two parties computing it from the same bytes must always agree."""
+        spki = rsa_keypair()[1]
+        self.assertEqual(artifacts.public_key_id(spki), artifacts.public_key_id(bytes(spki)))
+        self.assertNotEqual(artifacts.public_key_id(spki), artifacts.public_key_id(spki + b"x"))
+
+    def test_the_wrapped_key_and_key_id_reach_the_container(self):
+        protector = artifacts.build_protector("confidential", {"publicKey": public_key_b64()})
+        path = write_output("wrapped.mp4")
         protected = protector.protect(
             artifacts.GeneratedArtifact(path=path, mime_type="video/mp4", generation_id="g")
         )
         try:
             with open(protected.path, "rb") as handle:
-                header = artifacts.parse_container_prefix(handle.read(4096))["header"]
-            self.assertEqual(header["kdf"], kdf)
-            self.assertEqual(header["keyId"], "kid-1")
+                parsed = artifacts.parse_container_prefix(handle.read(8192))
+            self.assertEqual(parsed["version"], 2)
+            self.assertEqual(parsed["key_wrap"]["alg"], "RSA-OAEP-256")
+            self.assertEqual(parsed["key_wrap"]["keyId"], protector.key_id)
+            self.assertTrue(parsed["key_wrap"]["wrappedFileKey"])
+            # No KDF in a v2 container: the KDF protects the private key, which is account
+            # metadata, not something to repeat inside every video.
+            self.assertNotIn("kdf", parsed["header"])
         finally:
             protected.discard()
 
@@ -714,14 +843,27 @@ class TestHandlerWiring(unittest.TestCase):
         self.assertFalse(protector.encrypts)
         self.assertEqual(protector.mode, "standard")
 
-    def test_a_confidential_job_produces_an_encrypting_protector(self):
+    def test_a_confidential_job_produces_a_hybrid_protector(self):
         protector = handler.build_protector_for_job(
             {
                 "privacy": {"mode": "confidential"},
-                "encryption": {"algorithm": "AES-256-GCM", "key": self.key_b64url()},
+                "encryption": {
+                    "version": 2,
+                    "algorithm": "AES-256-GCM",
+                    "publicKey": public_key_b64(),
+                },
             }
         )
         self.assertTrue(protector.encrypts)
+        self.assertEqual(protector.crypto_version, artifacts.CONTAINER_V2_HYBRID)
+
+    def test_a_job_carrying_a_symmetric_key_is_refused_by_the_handler_too(self):
+        """Defence in depth: the Worker rejects it, and so does the worker."""
+        with self.assertRaises(handler.WorkflowError) as caught:
+            handler.build_protector_for_job(
+                {"privacy": {"mode": "confidential"}, "encryption": {"key": self.key_b64url()}}
+            )
+        self.assertIn("no longer accepted", str(caught.exception))
 
     def test_a_bad_confidential_job_is_a_workflow_error_not_a_crash(self):
         with self.assertRaises(handler.WorkflowError):
@@ -737,7 +879,7 @@ class TestHandlerWiring(unittest.TestCase):
                 "input": {
                     "workflow": {"1": {"class_type": "X", "inputs": {}}},
                     "privacy": {"mode": "confidential"},
-                    "encryption": {"key": self.key_b64url()},
+                    "encryption": {"version": 2, "publicKey": public_key_b64()},
                 },
             }
         )

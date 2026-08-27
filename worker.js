@@ -207,7 +207,17 @@ const DEFAULT_PRIVACY_MODE = "standard";
  * the two implementations cannot drift apart unnoticed.
  */
 const CONTAINER_MAGIC = "CGEN";
-const CONTAINER_VERSION = 1;
+
+/*
+ * v1 is the original symmetric design, where the caller sent a key that could decrypt the
+ * result. v2 is hybrid: the worker draws a random file key and wraps it to a public key.
+ * Both are readable, so existing artefacts keep working; only v2 is creatable.
+ */
+const CONTAINER_V1_SYMMETRIC = 1;
+const CONTAINER_V2_HYBRID = 2;
+const SUPPORTED_CONTAINER_VERSIONS = new Set([CONTAINER_V1_SYMMETRIC, CONTAINER_V2_HYBRID]);
+const CONTAINER_VERSION = CONTAINER_V2_HYBRID;
+
 const CONTAINER_SUITES = Object.freeze({ 1: "AES-256-GCM" });
 const CONTAINER_PREAMBLE_BYTES = 8;
 const CONTAINER_MAX_HEADER_BYTES = 8192;
@@ -216,24 +226,48 @@ const CONTAINER_TAG_BYTES = 16;
 
 const ENCRYPTED_CONTENT_TYPE = "application/octet-stream";
 
-/*
- * Supported client-side key derivation functions.
- *
- * The Worker never runs a KDF - derivation happens in the browser and only the derived key
- * is ever transmitted. This list exists so that unrecognised metadata is rejected at the
- * door rather than stored and echoed back to a client that would not know what to do with
- * it. Adding a KDF here costs nothing on the backend, which is the point: the choice
- * belongs to the client.
- */
-const SUPPORTED_KDFS = Object.freeze({
-  argon2id: { saltMin: 8, saltMax: 64 },
-  scrypt: { saltMin: 8, saltMax: 64 },
-  "pbkdf2-sha256": { saltMin: 8, saltMax: 64 },
-  "pbkdf2-sha512": { saltMin: 8, saltMax: 64 }
-});
-
 const SUPPORTED_ENCRYPTION_ALGORITHMS = Object.freeze(["AES-256-GCM"]);
-const ENCRYPTION_KEY_BYTES = 32;
+
+/*
+ * Key wrapping. RSA-OAEP with SHA-256 (MGF1-SHA256, empty label) is the default in both
+ * `cryptography` and WebCrypto, which is why the two interoperate with no parameters to
+ * negotiate. See docs/confidential-generation.md for why this rather than ECIES or HPKE.
+ */
+const SUPPORTED_KEY_WRAP_ALGORITHMS = Object.freeze(["RSA-OAEP-256"]);
+
+const MIN_RSA_MODULUS_BITS = 3072;
+
+/*
+ * SPKI size bounds for RSA keys between 3072 and 8192 bits. Used as a cheap shape check;
+ * the authoritative parse happens in the worker, via a real ASN.1 implementation. Writing
+ * a DER parser here would be new attack surface for no benefit.
+ */
+const MIN_SPKI_BYTES = 380;
+const MAX_SPKI_BYTES = 1200;
+
+/*
+ * Fields that must never be sent to this API, at any depth, normalised for case and
+ * separators so `private_key`, `privateKey` and `PRIVATE-KEY` are all caught.
+ *
+ * Note what is deliberately absent: publicKey, publicKeyAlgorithm, keyId, wrappedFileKey,
+ * salt and cryptoVersion are all non-secret and all have legitimate reasons to appear.
+ */
+const FORBIDDEN_REQUEST_FIELDS = new Set([
+  "passphrase",
+  "password",
+  "privatekey",
+  "privateencryptionkey",
+  "encryptedprivatekey",
+  "keyencryptionkey",
+  "kek",
+  "fileencryptionkey",
+  "fek",
+  "decryptionkey",
+  "derivedkey",
+  "aeskey",
+  "symmetrickey",
+  "secretkey"
+]);
 
 // Retention bounds for the advisory expiresAt recorded on an artefact. One minute is the
 // shortest that is not simply a mistake; 90 days is past any lifecycle rule we ship.
@@ -743,7 +777,7 @@ export function normalizeRequest(body) {
  * and, in confidential mode, holds the raw key alongside its non-secret metadata. The
  * caller must treat `encryption.key` as request-scoped: forward it once, never store it.
  */
-export function normalizePrivacy(body) {
+export async function normalizePrivacy(body) {
   const requested = firstPresent(body.privacyMode, body.privacy_mode);
   const mode = requested ? String(requested).trim().toLowerCase() : DEFAULT_PRIVACY_MODE;
   const spec = PRIVACY_MODES[mode];
@@ -801,163 +835,186 @@ export function normalizePrivacy(body) {
     );
   }
 
-  const key = validateEncryptionKey(block.key);
-  const keyId = validateKeyId(firstPresent(block.keyId, block.key_id), key);
-  const kdf = validateKdf(block.kdf);
+  /*
+   * Version 1 is refused, not honoured.
+   *
+   * v1 put a symmetric key in this request, which meant a value capable of decrypting the
+   * finished video travelled through the job queue and lived in whatever that queue
+   * retains. Removing that is the entire reason v2 exists, so accepting a v1 request
+   * "for compatibility" would preserve exactly the property being removed. Existing v1
+   * artefacts stay readable; new ones cannot be created.
+   */
+  const version = hasNonEmptyValue(block.version) ? toInteger(block.version, 0) : CONTAINER_V2_HYBRID;
+
+  if (version === CONTAINER_V1_SYMMETRIC || hasNonEmptyValue(block.key)) {
+    throw new HttpError(
+      400,
+      "Confidential generation v1 (a symmetric key in the request) is no longer accepted: " +
+        "that key would travel through the job queue and could later decrypt the stored " +
+        "video. Send encryption.version 2 with a publicKey instead. Existing v1 artefacts " +
+        "remain decryptable.",
+      { cryptoVersion: CONTAINER_V2_HYBRID, migration: "docs/confidential-generation.md" }
+    );
+  }
+
+  if (version !== CONTAINER_V2_HYBRID) {
+    throw new HttpError(
+      400,
+      `Unsupported encryption.version ${version}. This deployment creates version ` +
+        `${CONTAINER_V2_HYBRID}.`
+    );
+  }
+
+  const keyWrapAlgorithm = hasNonEmptyValue(firstPresent(block.keyWrapAlgorithm, block.key_wrap_algorithm))
+    ? String(firstPresent(block.keyWrapAlgorithm, block.key_wrap_algorithm)).trim()
+    : SUPPORTED_KEY_WRAP_ALGORITHMS[0];
+
+  if (!SUPPORTED_KEY_WRAP_ALGORITHMS.includes(keyWrapAlgorithm)) {
+    throw new HttpError(
+      400,
+      `Unsupported keyWrapAlgorithm '${keyWrapAlgorithm}'. Supported: ` +
+        SUPPORTED_KEY_WRAP_ALGORITHMS.join(", ")
+    );
+  }
+
+  const publicKeyAlgorithm = hasNonEmptyValue(firstPresent(block.publicKeyAlgorithm, block.public_key_algorithm))
+    ? String(firstPresent(block.publicKeyAlgorithm, block.public_key_algorithm)).trim()
+    : keyWrapAlgorithm;
+
+  if (publicKeyAlgorithm !== keyWrapAlgorithm) {
+    throw new HttpError(
+      400,
+      `encryption.publicKeyAlgorithm '${publicKeyAlgorithm}' does not match ` +
+        `keyWrapAlgorithm '${keyWrapAlgorithm}'.`
+    );
+  }
+
+  const publicKey = validatePublicKey(firstPresent(block.publicKey, block.public_key));
+  const keyId = await deriveKeyId(publicKey.spki);
+  const claimedKeyId = firstPresent(block.keyId, block.key_id);
+
+  // A key id is derived from the key's own bytes, so a disagreement means the caller is
+  // confused about which key they hold - and an artefact filed under the wrong id is one
+  // the client will not think to try its private key against.
+  if (hasNonEmptyValue(claimedKeyId) && String(claimedKeyId).trim() !== keyId) {
+    throw new HttpError(
+      400,
+      `encryption.keyId does not match the supplied public key (expected '${keyId}').`
+    );
+  }
 
   return {
     mode,
     spec,
-    encryption: { algorithm, key, keyId, kdf },
+    encryption: {
+      version: CONTAINER_V2_HYBRID,
+      algorithm,
+      keyWrapAlgorithm,
+      publicKeyAlgorithm,
+      publicKey: publicKey.encoded,
+      publicKeyBits: publicKey.modulusBits,
+      keyId
+    },
     expiresAt: resolveExpiry(body)
   };
 }
 
 /**
- * Check a base64url-encoded 256-bit key without ever putting it in an error message.
+ * Reject a request that carries anything capable of decrypting the result.
  *
- * Every rejection describes the shape of what arrived - "decoded to 16 bytes" - and never
- * its content, because a 400 body is exactly the kind of thing that ends up in a log.
+ * Nothing downstream reads these fields, so ignoring them would be harmless *today*. The
+ * point is tomorrow: a frontend change that starts sending `passphrase` alongside the
+ * public key would silently reintroduce the exact property v2 removes, and nobody would
+ * notice until an audit. A 400 turns that into an immediate, obvious failure.
+ *
+ * Scanned at every depth, because the mistake is as likely to be `encryption.privateKey`
+ * as a top-level field.
  */
-function validateEncryptionKey(value) {
+export function rejectSecretFields(value, path = "", depth = 0) {
+  if (depth > 12 || value === null || typeof value !== "object") return;
+
+  if (Array.isArray(value)) {
+    for (const [index, item] of value.entries()) {
+      rejectSecretFields(item, `${path}[${index}]`, depth + 1);
+    }
+    return;
+  }
+
+  for (const [name, child] of Object.entries(value)) {
+    const normalized = String(name).toLowerCase().replace(/[_-]/g, "");
+    if (FORBIDDEN_REQUEST_FIELDS.has(normalized)) {
+      const where = path ? `${path}.${name}` : name;
+      throw new HttpError(
+        400,
+        `Request field '${where}' must never be sent to this API. Confidential generation ` +
+          "is public-key based: the inference worker receives an encryption-only public " +
+          "key, and any value that could decrypt the result stays in your browser.",
+        { field: where }
+      );
+    }
+    rejectSecretFields(child, path ? `${path}.${name}` : name, depth + 1);
+  }
+}
+
+/**
+ * Validate a base64url SPKI public key without decoding ASN.1 by hand.
+ *
+ * The Worker checks shape and size; the worker (Python) does the authoritative parse via
+ * `cryptography`. That split is deliberate - a JavaScript ASN.1 parser written here would
+ * be new attack surface for no benefit, and a malformed key fails closed at the point it
+ * is actually used.
+ */
+function validatePublicKey(value) {
   if (!hasNonEmptyValue(value)) {
-    throw new HttpError(400, "encryption.key is required in confidential mode");
+    throw new HttpError(
+      400,
+      "encryption.publicKey is required in confidential mode (base64url SPKI)"
+    );
   }
   if (typeof value !== "string") {
-    throw new HttpError(400, "encryption.key must be a base64url-encoded string");
+    throw new HttpError(400, "encryption.publicKey must be a base64url-encoded string");
   }
 
   const text = value.trim();
   if (!/^[A-Za-z0-9_\-+/]+={0,2}$/.test(text)) {
-    throw new HttpError(400, "encryption.key is not valid base64url");
+    throw new HttpError(400, "encryption.publicKey is not valid base64url");
   }
 
-  let bytes;
+  let spki;
   try {
-    bytes = b64urlDecodeToBytes(text);
+    spki = b64urlDecodeToBytes(text);
   } catch {
-    throw new HttpError(400, "encryption.key is not valid base64url");
+    throw new HttpError(400, "encryption.publicKey is not valid base64url");
   }
 
-  if (bytes.length !== ENCRYPTION_KEY_BYTES) {
+  /*
+   * An SPKI RSA public key is a SEQUENCE containing an AlgorithmIdentifier and a BIT
+   * STRING. Rather than parse it, read the two facts that matter and let the worker do the
+   * real decode: it must look like a DER SEQUENCE, and its length must be in the range a
+   * 3072-to-8192-bit RSA key occupies (a 3072-bit SPKI is 398-422 bytes, 8192-bit ~1100).
+   */
+  if (spki[0] !== 0x30) {
+    throw new HttpError(400, "encryption.publicKey is not a DER SubjectPublicKeyInfo");
+  }
+  if (spki.length < MIN_SPKI_BYTES || spki.length > MAX_SPKI_BYTES) {
     throw new HttpError(
       400,
-      `encryption.key must decode to ${ENCRYPTION_KEY_BYTES} bytes (256 bits), got ${bytes.length}`
+      `encryption.publicKey is ${spki.length} bytes, outside the ${MIN_SPKI_BYTES}-` +
+        `${MAX_SPKI_BYTES} range for an RSA key of ${MIN_RSA_MODULUS_BITS} bits or more`
     );
   }
 
-  return text;
+  // The modulus length is what actually determines strength; import the key and read it
+  // rather than inferring from the encoding.
+  return { encoded: text, spki, modulusBits: null };
 }
 
-/**
- * `keyId` is an opaque client label, and its whole job is to be safe to show.
- *
- * The one check worth making is that the client has not simply pasted the key into it:
- * that mistake would take a value we go to lengths never to persist and put it into
- * metadata, status responses and logs.
- */
-function validateKeyId(value, key) {
-  if (!hasNonEmptyValue(value)) return null;
-
-  const keyId = String(value).trim();
-  if (keyId.length > 128) {
-    throw new HttpError(400, "encryption.keyId must be 128 characters or fewer");
-  }
-  if (!/^[A-Za-z0-9._:\-]+$/.test(keyId)) {
-    throw new HttpError(400, "encryption.keyId may contain only [A-Za-z0-9._:-]");
-  }
-  if (key && keyId === key) {
-    throw new HttpError(
-      400,
-      "encryption.keyId must not be the key itself. keyId is stored and returned; the key " +
-        "never is."
-    );
-  }
-  return keyId;
+/** The key's stable name: truncated SHA-256 of its SPKI. Mirrors artifacts.public_key_id. */
+async function deriveKeyId(spki) {
+  const digest = await crypto.subtle.digest("SHA-256", spki);
+  return b64urlEncode(new Uint8Array(digest).slice(0, 16));
 }
 
-/**
- * Validate the KDF description the client will need to reconstruct its own key later.
- *
- * None of this is secret and none of it is executed here - it is recorded so that a user
- * who returns tomorrow with the same passphrase derives the same key. Which is exactly why
- * it has to be well-formed: a corrupted salt makes an artefact permanently undecryptable.
- */
-function validateKdf(value) {
-  if (value === undefined || value === null) return null;
-
-  if (typeof value !== "object" || Array.isArray(value)) {
-    throw new HttpError(400, "encryption.kdf must be an object");
-  }
-
-  const name = String(value.name ?? "").trim().toLowerCase();
-  const spec = SUPPORTED_KDFS[name];
-  if (!spec) {
-    throw new HttpError(
-      400,
-      `Unsupported encryption.kdf.name '${name || "(missing)"}'. Supported: ` +
-        Object.keys(SUPPORTED_KDFS).join(", ")
-    );
-  }
-
-  if (!hasNonEmptyValue(value.salt)) {
-    throw new HttpError(400, "encryption.kdf.salt is required");
-  }
-  if (typeof value.salt !== "string" || !/^[A-Za-z0-9_\-+/]+={0,2}$/.test(value.salt.trim())) {
-    throw new HttpError(400, "encryption.kdf.salt must be base64url");
-  }
-
-  let salt;
-  try {
-    salt = b64urlDecodeToBytes(value.salt.trim());
-  } catch {
-    throw new HttpError(400, "encryption.kdf.salt must be base64url");
-  }
-  if (salt.length < spec.saltMin || salt.length > spec.saltMax) {
-    throw new HttpError(
-      400,
-      `encryption.kdf.salt must decode to ${spec.saltMin}-${spec.saltMax} bytes, got ${salt.length}`
-    );
-  }
-
-  const parameters = value.parameters ?? {};
-  if (typeof parameters !== "object" || Array.isArray(parameters)) {
-    throw new HttpError(400, "encryption.kdf.parameters must be an object");
-  }
-
-  // Flat, small and scalar. These end up inside the artefact's authenticated header, whose
-  // size is capped; an unbounded object here would fail much later, at encryption time.
-  const entries = Object.entries(parameters);
-  if (entries.length > 12) {
-    throw new HttpError(400, "encryption.kdf.parameters may hold at most 12 values");
-  }
-  const cleaned = {};
-  for (const [name_, raw] of entries) {
-    if (!/^[A-Za-z0-9_]{1,32}$/.test(name_)) {
-      throw new HttpError(400, `encryption.kdf.parameters key '${name_}' is not a simple name`);
-    }
-    if (typeof raw === "number") {
-      if (!Number.isFinite(raw)) {
-        throw new HttpError(400, `encryption.kdf.parameters.${name_} must be finite`);
-      }
-      cleaned[name_] = raw;
-    } else if (typeof raw === "string") {
-      if (raw.length > 64) {
-        throw new HttpError(400, `encryption.kdf.parameters.${name_} is too long`);
-      }
-      cleaned[name_] = raw;
-    } else if (typeof raw === "boolean") {
-      cleaned[name_] = raw;
-    } else {
-      throw new HttpError(
-        400,
-        `encryption.kdf.parameters.${name_} must be a number, string or boolean`
-      );
-    }
-  }
-
-  return { name, salt: value.salt.trim(), parameters: cleaned };
-}
 
 /**
  * Resolve an advisory expiry from `retentionSeconds` or `expiresAt`.
@@ -1302,12 +1359,22 @@ function describeCapabilities() {
       ])
     ),
     encryption: {
+      /*
+       * Hybrid: the caller supplies an encryption-only public key, and the inference
+       * worker generates a fresh symmetric file key per artefact and wraps it to that key.
+       * Nothing capable of decrypting the result is ever sent.
+       */
+      cryptoVersion: CONTAINER_V2_HYBRID,
+      readableCryptoVersions: [CONTAINER_V1_SYMMETRIC, CONTAINER_V2_HYBRID],
       algorithms: [...SUPPORTED_ENCRYPTION_ALGORITHMS],
-      keyBytes: ENCRYPTION_KEY_BYTES,
-      containerVersion: CONTAINER_VERSION,
-      // The Worker never runs a KDF - derivation is the client's job. This is the list of
-      // descriptions it will accept and store, so a client knows what it may record.
-      kdfs: Object.keys(SUPPORTED_KDFS),
+      keyWrapAlgorithms: [...SUPPORTED_KEY_WRAP_ALGORITHMS],
+      publicKeyFormat: "spki-der-base64url",
+      minPublicKeyBits: MIN_RSA_MODULUS_BITS,
+      /*
+       * The passphrase KDF is deliberately absent. It protects the caller's private key,
+       * which never reaches this API in any form, so the platform neither runs it nor
+       * records its parameters. That is a client-side concern by design.
+       */
       retentionSeconds: { min: MIN_RETENTION_SECONDS, max: MAX_RETENTION_SECONDS }
     }
   };
@@ -1320,11 +1387,17 @@ function describeCapabilities() {
 // `url` is needed for the callback origin, so it is passed in rather than re-parsed.
 async function generateVideo(request, env, headers, url) {
   const body = await readJsonObject(request);
+
+  // Before anything else, including backend resolution: if the caller sent something that
+  // could decrypt the result, that is a mistake to surface immediately and loudly, not
+  // something to quietly drop on the floor.
+  rejectSecretFields(body);
+
   const backend = resolveRequestedBackend(body);
   const config = getRunPodConfig(backend, env);
 
   const settings = normalizeRequest(body);
-  const privacy = normalizePrivacy(body);
+  const privacy = await normalizePrivacy(body);
   const workflow = buildWorkflowForSettings(settings);
 
   /*
@@ -1441,9 +1514,12 @@ async function generateVideo(request, env, headers, url) {
       ...(privacy.encryption
         ? {
             encryption: {
+              version: privacy.encryption.version,
               algorithm: privacy.encryption.algorithm,
-              ...(privacy.encryption.keyId ? { keyId: privacy.encryption.keyId } : {}),
-              ...(privacy.encryption.kdf ? { kdf: privacy.encryption.kdf } : {})
+              keyWrapAlgorithm: privacy.encryption.keyWrapAlgorithm,
+              // The derived id, not the key: it is what a client matches an artefact
+              // against to know which private key to unlock.
+              keyId: privacy.encryption.keyId
             }
           }
         : {}),
@@ -1521,6 +1597,9 @@ async function buildCallbackBlocks(env, jobId, origin, settings, privacy) {
       jobId,
       token: await signJobToken(secret, jobId, TOKEN_PURPOSES.output, ttl, {
         pm: privacy?.mode ?? DEFAULT_PRIVACY_MODE,
+        // Signed too, so a v2 job cannot have a v1 container filed against it. The
+        // uploader can read this claim; it cannot change it.
+        ...(privacy?.encryption ? { cv: privacy.encryption.version } : {}),
         ...(privacy?.expiresAt ? { exa: privacy.expiresAt } : {})
       })
     }
@@ -1651,12 +1730,21 @@ export function describeArtifactForStatus(jobId, state, runpodVideo) {
   };
 
   if (encrypted) {
-    out.artifact.encryptionVersion = stored?.encryptionVersion ?? CONTAINER_VERSION;
-    out.artifact.algorithm = stored?.algorithm || CONTAINER_SUITES[1];
-    // Everything the browser needs to derive the same key from the same passphrase - and
-    // nothing that would let anyone else do it.
-    if (stored?.kdf) out.artifact.kdf = stored.kdf;
+    const cryptoVersion = stored?.cryptoVersion ?? stored?.encryptionVersion ?? CONTAINER_VERSION;
+    out.artifact.cryptoVersion = cryptoVersion;
+    out.artifact.encryptionVersion = cryptoVersion;
+    out.artifact.videoAlgorithm = stored?.algorithm || CONTAINER_SUITES[1];
+    out.artifact.algorithm = out.artifact.videoAlgorithm;
+
+    /*
+     * Everything a client needs to know which private key to unlock, and nothing that
+     * would let anyone else open the artefact. The wrapped file key is not repeated here:
+     * it lives inside the container's authenticated header, where it cannot be swapped.
+     */
+    if (stored?.keyWrapAlgorithm) out.artifact.keyWrapAlgorithm = stored.keyWrapAlgorithm;
     if (stored?.keyId) out.artifact.keyId = stored.keyId;
+    // v1 only: its file key came from a passphrase, so its KDF had to be recorded.
+    if (stored?.kdf) out.artifact.kdf = stored.kdf;
   }
 
   return out;
@@ -1717,23 +1805,31 @@ function buildRunPodInput(backend, workflow, settings, callbacks, privacy) {
       const input = { workflow };
 
       /*
-       * The one place the encryption key is ever written to an outbound payload.
+       * Everything crossing into the job queue, and nothing else.
        *
-       * It has to be here: encryption must happen where the plaintext is, and that is
-       * inside the inference container. The key is request-scoped and travels no further -
-       * it is not stored in R2, KV, D1, a Durable Object or a log, and no response the API
-       * produces contains it. What it does mean is that the key is present in the job
-       * payload RunPod holds for that job's retention window, which is a real exposure and
-       * is documented as one in docs/confidential-generation.md.
+       * This block is the security boundary the whole v2 design exists to establish. The
+       * only key material here is a *public* key: it can encrypt and it cannot decrypt.
+       * Treat this payload as permanently retained - RunPod holds job records, and a copy
+       * of one must not be enough to open the artefact it produced.
+       *
+       * What is absent, and must stay absent: the passphrase, the key-encryption key it
+       * derives, the private key, and any symmetric key capable of decrypting the video.
+       * The file key does not appear either, in any form: it does not exist yet when this
+       * is written. The worker generates it, uses it once and wraps it to the public key
+       * below, so the only persistent form it ever takes is one this payload cannot open.
+       *
+       * worker.confidential.v2.test.js asserts this over the actual serialized bytes.
        */
       if (privacy) {
         input.privacy = { mode: privacy.mode };
         if (privacy.encryption) {
           input.encryption = {
+            version: privacy.encryption.version,
             algorithm: privacy.encryption.algorithm,
-            key: privacy.encryption.key,
-            ...(privacy.encryption.keyId ? { keyId: privacy.encryption.keyId } : {}),
-            ...(privacy.encryption.kdf ? { kdf: privacy.encryption.kdf } : {})
+            keyWrapAlgorithm: privacy.encryption.keyWrapAlgorithm,
+            publicKeyAlgorithm: privacy.encryption.publicKeyAlgorithm,
+            publicKey: privacy.encryption.publicKey,
+            keyId: privacy.encryption.keyId
           };
         }
       }
@@ -2564,6 +2660,22 @@ async function receiveOutput(request, env, headers, jobId) {
     }
 
     /*
+     * The crypto version the job was created with, read from the signed token. A v2 job
+     * must produce a v2 container: accepting a v1 one would mean a symmetric key existed
+     * for this artefact somewhere, which is precisely what v2 removed. This cannot be
+     * relaxed by the uploader, because the claim is inside the HMAC.
+     */
+    const requiredVersion = Number.isInteger(claims.cv) ? claims.cv : container.version;
+    if (container.version !== requiredVersion) {
+      throw new HttpError(
+        422,
+        `Refusing to store this artefact: job ${jobId} was created with confidential ` +
+          `crypto version ${requiredVersion}, but the uploaded container is version ` +
+          `${container.version}. Nothing was written.`
+      );
+    }
+
+    /*
      * The header is the AEAD's associated data, so an attacker cannot rewrite artifactId
      * without breaking authentication. Checking it here means a ciphertext produced for
      * another generation cannot be filed under this one.
@@ -2579,12 +2691,19 @@ async function receiveOutput(request, env, headers, jobId) {
     artifact = {
       privacyMode: mode,
       encrypted: true,
+      cryptoVersion: container.version,
+      // Kept under its original name as well, so existing clients reading
+      // `encryptionVersion` are unaffected.
       encryptionVersion: container.version,
       algorithm: container.algorithm,
       contentType: ENCRYPTED_CONTENT_TYPE,
       originalContentType: container.header.contentType || "application/octet-stream",
+      ...(container.keyWrap
+        ? { keyWrapAlgorithm: container.keyWrap.alg, keyId: container.keyWrap.keyId }
+        : {}),
+      // v1 artefacts carry their KDF and key id at the top of the header.
       ...(container.header.kdf ? { kdf: container.header.kdf } : {}),
-      ...(container.header.keyId ? { keyId: container.header.keyId } : {})
+      ...(!container.keyWrap && container.header.keyId ? { keyId: container.header.keyId } : {})
     };
   }
 
@@ -2603,9 +2722,14 @@ async function receiveOutput(request, env, headers, jobId) {
       encrypted: String(artifact.encrypted),
       ...(artifact.encrypted
         ? {
+            cryptoVersion: String(artifact.cryptoVersion),
             encryptionVersion: String(artifact.encryptionVersion),
             algorithm: artifact.algorithm,
-            originalContentType: artifact.originalContentType
+            originalContentType: artifact.originalContentType,
+            // Non-secret by construction: an algorithm name and a key's public
+            // fingerprint. Neither helps anyone decrypt anything.
+            ...(artifact.keyWrapAlgorithm ? { keyWrapAlgorithm: artifact.keyWrapAlgorithm } : {}),
+            ...(artifact.keyId ? { keyId: artifact.keyId } : {})
           }
         : {}),
       ...(expiresAt ? { expiresAt } : {})
@@ -2703,7 +2827,7 @@ export function parseContainerPrefix(data) {
 
   const version = data[4];
   const suite = data[5];
-  if (version !== CONTAINER_VERSION) {
+  if (!SUPPORTED_CONTAINER_VERSIONS.has(version)) {
     throw new Error(`unsupported container version ${version}`);
   }
   if (!CONTAINER_SUITES[suite]) {
@@ -2735,11 +2859,35 @@ export function parseContainerPrefix(data) {
     throw new Error("header must be a JSON object");
   }
 
+  /*
+   * A v2 container must actually carry the thing that makes it v2. Checking here means
+   * "this parsed as v2" is a real statement about its contents, and an artefact that
+   * claimed v2 while omitting its wrapped file key would be undecryptable forever - worth
+   * catching before it is written, not after.
+   */
+  let keyWrap = null;
+  if (version === CONTAINER_V2_HYBRID) {
+    keyWrap = header.kw;
+    if (!keyWrap || typeof keyWrap !== "object" || Array.isArray(keyWrap)) {
+      throw new Error("a v2 container must carry a 'kw' key-wrapping block");
+    }
+    if (!SUPPORTED_KEY_WRAP_ALGORITHMS.includes(keyWrap.alg)) {
+      throw new Error(`unsupported key-wrap algorithm ${JSON.stringify(keyWrap.alg)}`);
+    }
+    if (typeof keyWrap.wrappedFileKey !== "string" || !keyWrap.wrappedFileKey) {
+      throw new Error("a v2 container must carry a wrapped file key");
+    }
+    if (typeof keyWrap.keyId !== "string" || !keyWrap.keyId) {
+      throw new Error("a v2 container must name the key it was wrapped to");
+    }
+  }
+
   return {
     version,
     suite,
     algorithm: CONTAINER_SUITES[suite],
     header,
+    keyWrap,
     headerLength,
     nonceOffset: headerEnd,
     ciphertextOffset: headerEnd + CONTAINER_NONCE_BYTES

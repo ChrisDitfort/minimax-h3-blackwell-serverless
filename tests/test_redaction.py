@@ -45,6 +45,20 @@ import artifacts  # noqa: E402
 import handler  # noqa: E402
 
 KEY = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode().rstrip("=")
+
+# A real public key, so the confidential path can be exercised as far as the log line.
+def _public_key_b64():
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    private = rsa.generate_private_key(public_exponent=65537, key_size=3072)
+    spki = private.public_key().public_bytes(
+        serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
+    )
+    return base64.urlsafe_b64encode(spki).decode().rstrip("=")
+
+
+PUBLIC_KEY = _public_key_b64()
 PASSPHRASE = "correct horse battery staple"
 ACCESS_SECRET = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
@@ -208,7 +222,7 @@ class TestHandlerLogging(unittest.TestCase):
                 "input": {
                     "workflow": {"1": {"class_type": "X", "inputs": {}}},
                     "privacy": {"mode": "confidential"},
-                    "encryption": {"key": KEY, "keyId": "kid-1"},
+                    "encryption": {"version": 2, "publicKey": PUBLIC_KEY},
                 },
             }
         )

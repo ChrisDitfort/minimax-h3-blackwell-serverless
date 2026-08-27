@@ -85,11 +85,34 @@ from typing import Any, BinaryIO, Callable
 # --------------------------------------------------------------------------------------
 
 MAGIC = b"CGEN"
-FORMAT_VERSION = 1
+
+#: Container versions this build can *read*. v1 is the original symmetric design, where the
+#: caller derived the file key from a passphrase and sent it to the worker. v2 is hybrid:
+#: the worker draws a random file key and wraps it to a public key it was given, so nothing
+#: capable of decrypting the artefact ever travels to the worker.
+CONTAINER_V1_SYMMETRIC = 1
+CONTAINER_V2_HYBRID = 2
+SUPPORTED_CONTAINER_VERSIONS = frozenset({CONTAINER_V1_SYMMETRIC, CONTAINER_V2_HYBRID})
+
+#: The only version this build will *write*. Reading v1 keeps existing artefacts openable;
+#: writing it would keep reintroducing the very property v2 exists to remove.
+FORMAT_VERSION = CONTAINER_V2_HYBRID
 
 SUITE_AES_256_GCM = 1
 SUITE_NAMES = {SUITE_AES_256_GCM: "AES-256-GCM"}
 SUITE_IDS = {name: suite for suite, name in SUITE_NAMES.items()}
+
+#: Key-wrapping algorithms. RSA-OAEP with SHA-256 and MGF1-SHA256, empty label - the
+#: default for both `cryptography` and WebCrypto, which is why they interoperate with no
+#: parameters to agree on. See docs/confidential-generation.md for why this and not ECIES.
+KEY_WRAP_RSA_OAEP_256 = "RSA-OAEP-256"
+SUPPORTED_KEY_WRAP_ALGORITHMS = frozenset({KEY_WRAP_RSA_OAEP_256})
+
+#: 3072-bit RSA is the NIST 128-bit-security level and is what "modern RSA" means. Larger
+#: is accepted; smaller is not. A floor rather than a fixed size means a client that wants
+#: 4096 simply generates 4096 and nothing here has to change.
+MIN_RSA_MODULUS_BITS = 3072
+MAX_RSA_MODULUS_BITS = 8192
 
 KEY_BYTES = 32
 NONCE_BYTES = 12
@@ -301,6 +324,116 @@ def decode_key(value: str) -> EphemeralKey:
 
 
 # --------------------------------------------------------------------------------------
+# Public keys and key wrapping (crypto v2)
+#
+# The whole point of v2 lives in this section: the only key material the inference worker
+# ever receives is a public key, which can encrypt and cannot decrypt. Everything that
+# could open an artefact - the passphrase, the key-encryption key it derives, the private
+# key - stays in the browser and never enters a job payload.
+# --------------------------------------------------------------------------------------
+
+
+class PublicEncryptionKey:
+    """An encryption-only public key, loaded from its SPKI DER encoding.
+
+    SPKI is what WebCrypto's ``exportKey("spki")`` produces and what `cryptography`'s
+    ``load_der_public_key`` consumes, so no format has to be agreed on beyond "the standard
+    one". The key id is *derived* from those exact bytes rather than supplied: a caller
+    cannot label a key as something it is not, and two parties independently computing the
+    id always agree.
+    """
+
+    __slots__ = ("_key", "spki", "key_id", "algorithm", "modulus_bits")
+
+    def __init__(self, spki: bytes) -> None:
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.hazmat.primitives.serialization import load_der_public_key
+
+        try:
+            key = load_der_public_key(spki)
+        except Exception as error:
+            raise ArtifactError(f"Public key is not a valid SPKI DER encoding: {error}") from error
+
+        if not isinstance(key, rsa.RSAPublicKey):
+            raise ArtifactError(
+                f"Unsupported public key type {type(key).__name__}. This build wraps with "
+                f"{KEY_WRAP_RSA_OAEP_256}, which needs an RSA key."
+            )
+        if key.key_size < MIN_RSA_MODULUS_BITS:
+            raise ArtifactError(
+                f"RSA public key is {key.key_size} bits; the minimum is "
+                f"{MIN_RSA_MODULUS_BITS}."
+            )
+        if key.key_size > MAX_RSA_MODULUS_BITS:
+            raise ArtifactError(
+                f"RSA public key is {key.key_size} bits; the maximum is "
+                f"{MAX_RSA_MODULUS_BITS}."
+            )
+
+        self._key = key
+        self.spki = bytes(spki)
+        self.modulus_bits = key.key_size
+        self.algorithm = KEY_WRAP_RSA_OAEP_256
+        self.key_id = public_key_id(self.spki)
+
+    def wrap(self, file_key: "EphemeralKey") -> bytes:
+        """Wrap a file-encryption key to this public key.
+
+        One library call, deliberately. The alternative designs - ECIES, HPKE - would have
+        this method compose an ephemeral keypair, a key agreement, a KDF and a second AEAD,
+        all inside the most security-critical code in the system. RSA-OAEP does it in one
+        primitive that both `cryptography` and WebCrypto implement natively.
+        """
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import padding
+
+        return self._key.encrypt(
+            file_key.bytes,
+            padding.OAEP(
+                mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                algorithm=hashes.SHA256(),
+                label=None,
+            ),
+        )
+
+    def __repr__(self) -> str:
+        return f"<PublicEncryptionKey {self.algorithm} {self.modulus_bits}-bit {self.key_id}>"
+
+
+def public_key_id(spki: bytes) -> str:
+    """A stable, verifiable name for a public key: the truncated SHA-256 of its SPKI.
+
+    Derived rather than chosen, so a key id can never name a key it does not belong to.
+    Both the browser and the worker compute it the same way from the same bytes.
+    """
+    digest = hashlib.sha256(spki).digest()
+    return base64.urlsafe_b64encode(digest[:16]).decode("ascii").rstrip("=")
+
+
+def decode_public_key(value: str) -> PublicEncryptionKey:
+    """Decode a base64url (or base64) SPKI public key.
+
+    Failure messages describe the shape of what arrived. A public key is not secret, but
+    quoting caller-supplied bytes back into an error message is a habit worth not having.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ArtifactError("Public encryption key is missing.")
+
+    text = value.strip()
+    if not re.fullmatch(r"[A-Za-z0-9_\-+/\s]+={0,2}", text):
+        raise ArtifactError("Public encryption key is not valid base64url.")
+
+    normalized = re.sub(r"\s+", "", text).replace("-", "+").replace("_", "/")
+    normalized += "=" * (-len(normalized) % 4)
+    try:
+        spki = base64.b64decode(normalized, validate=True)
+    except (binascii.Error, ValueError) as error:
+        raise ArtifactError(f"Public encryption key is not valid base64url: {error}") from error
+
+    return PublicEncryptionKey(spki)
+
+
+# --------------------------------------------------------------------------------------
 # Artefact types
 # --------------------------------------------------------------------------------------
 
@@ -444,6 +577,51 @@ def canonical_header(header: dict[str, Any]) -> bytes:
     return encoded
 
 
+def build_v2_header(
+    *,
+    generation_id: str,
+    content_type: str,
+    plaintext_bytes: int,
+    wrapped_file_key: bytes,
+    key_id: str,
+    key_wrap_algorithm: str = KEY_WRAP_RSA_OAEP_256,
+    privacy_mode: str = "confidential",
+    created_at: str | None = None,
+    suite: int = SUITE_AES_256_GCM,
+) -> dict[str, Any]:
+    """The non-secret metadata carried inside a hybrid (v2) container.
+
+    Everything here is authenticated: the header is the AEAD's associated data, so none of
+    it can be altered without the file key, which nobody has. That is what makes putting
+    the *wrapped file key in the header* the right place for it - an attacker cannot
+    substitute a file key wrapped to their own public key, because doing so invalidates the
+    tag over the video. The container is therefore bound to one key pair and one
+    generation, not merely accompanied by a claim about them.
+
+    What is authenticated, exactly: container version, cipher suite name, generation id,
+    plaintext media type and length, creation time, privacy mode, and the entire
+    key-wrapping block (algorithm, wrapped file key, key id).
+    """
+    return {
+        "v": CONTAINER_V2_HYBRID,
+        "alg": SUITE_NAMES[suite],
+        "artifactId": str(generation_id),
+        "contentType": str(content_type),
+        "plaintextBytes": int(plaintext_bytes),
+        "privacyMode": privacy_mode,
+        "createdAt": created_at
+        or datetime.now(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z"),
+        "kw": {
+            "alg": key_wrap_algorithm,
+            "wrappedFileKey": base64.urlsafe_b64encode(wrapped_file_key).decode("ascii").rstrip("="),
+            "keyId": key_id,
+        },
+    }
+
+
 def build_header(
     *,
     generation_id: str,
@@ -454,14 +632,18 @@ def build_header(
     created_at: str | None = None,
     suite: int = SUITE_AES_256_GCM,
 ) -> dict[str, Any]:
-    """Assemble the non-secret metadata carried inside a container.
+    """Assemble the non-secret metadata carried inside a **v1** container.
+
+    Kept so that artefacts written before the hybrid design remain readable and their
+    conformance vector still reproduces. Nothing calls this to write new artefacts - see
+    build_v2_header.
 
     Everything here is public by construction. ``plaintextBytes`` leaks nothing the file
     size does not already: AES-GCM is length preserving, so the ciphertext is exactly as
     long as the plaintext.
     """
     header: dict[str, Any] = {
-        "v": FORMAT_VERSION,
+        "v": CONTAINER_V1_SYMMETRIC,
         "alg": SUITE_NAMES[suite],
         "artifactId": str(generation_id),
         "contentType": str(content_type),
@@ -496,10 +678,10 @@ def parse_container_prefix(data: bytes) -> dict[str, Any]:
 
     version = data[4]
     suite = data[5]
-    if version != FORMAT_VERSION:
+    if version not in SUPPORTED_CONTAINER_VERSIONS:
         raise ContainerError(
             f"Unsupported container version {version}; this build understands "
-            f"{FORMAT_VERSION}."
+            f"{sorted(SUPPORTED_CONTAINER_VERSIONS)}."
         )
     if suite not in SUITE_NAMES:
         raise ContainerError(f"Unsupported cipher suite {suite}.")
@@ -520,6 +702,20 @@ def parse_container_prefix(data: bytes) -> dict[str, Any]:
     if not isinstance(header, dict):
         raise ContainerError("Container header must be a JSON object.")
 
+    # Version-specific header requirements. Checked here rather than at each call site so
+    # that "this parsed" always means "this is structurally a container of that version",
+    # and nothing downstream has to re-derive what a v2 header must contain.
+    if version == CONTAINER_V2_HYBRID:
+        wrap = header.get("kw")
+        if not isinstance(wrap, dict):
+            raise ContainerError("A v2 container must carry a 'kw' key-wrapping block.")
+        if wrap.get("alg") not in SUPPORTED_KEY_WRAP_ALGORITHMS:
+            raise ContainerError(f"Unsupported key-wrap algorithm {wrap.get('alg')!r}.")
+        if not isinstance(wrap.get("wrappedFileKey"), str) or not wrap["wrappedFileKey"]:
+            raise ContainerError("A v2 container must carry a wrapped file key.")
+        if not isinstance(wrap.get("keyId"), str) or not wrap["keyId"]:
+            raise ContainerError("A v2 container must name the key it was wrapped to.")
+
     return {
         "version": version,
         "suite": suite,
@@ -529,6 +725,7 @@ def parse_container_prefix(data: bytes) -> dict[str, Any]:
         "header_length": header_len,
         "nonce_offset": header_end,
         "ciphertext_offset": header_end + NONCE_BYTES,
+        "key_wrap": header.get("kw") if version == CONTAINER_V2_HYBRID else None,
     }
 
 
@@ -561,10 +758,17 @@ def encrypt_stream(
     elif len(nonce) != NONCE_BYTES:
         raise ContainerError(f"Nonce must be {NONCE_BYTES} bytes, got {len(nonce)}.")
 
+    # The framing version comes from the header, not a module constant: one function
+    # writes both container versions, and the two must never disagree about which one this
+    # is - the version byte is what a reader dispatches on.
+    version = int(header.get("v", CONTAINER_V1_SYMMETRIC))
+    if version not in SUPPORTED_CONTAINER_VERSIONS:
+        raise ContainerError(f"Refusing to write unknown container version {version}.")
+
     header_bytes = canonical_header(header)
 
     destination.write(MAGIC)
-    destination.write(bytes([FORMAT_VERSION, suite]))
+    destination.write(bytes([version, suite]))
     destination.write(len(header_bytes).to_bytes(2, "big"))
     destination.write(header_bytes)
     destination.write(nonce)
@@ -594,7 +798,7 @@ def encrypt_stream(
 
     return {
         "algorithm": SUITE_NAMES[suite],
-        "version": FORMAT_VERSION,
+        "version": version,
         "suite": suite,
         "plaintext_bytes": plaintext_bytes,
         "ciphertext_bytes": ciphertext_bytes,
@@ -796,6 +1000,194 @@ class ConfidentialProtector(ArtifactProtector):
         )
 
 
+class ConfidentialV2Protector(ArtifactProtector):
+    """Hybrid mode: a random file key per artefact, wrapped to the caller's public key.
+
+    The difference from v1 is the whole reason this class exists. v1 was handed a symmetric
+    key that could decrypt the result, which meant that key travelled through the job queue
+    and lived in whatever the queue retains. Here the worker is handed a key that can only
+    encrypt. It generates the file-encryption key itself, uses it once, wraps it to the
+    public key and drops it. Nothing that leaves this process can open the artefact.
+
+    Lifecycle of the file-encryption key, in full:
+
+        secrets.token_bytes(32) -> AES-256-GCM encrypt -> RSA-OAEP wrap -> destroy()
+
+    It is never logged, never written to disk, never returned, and never persisted in any
+    form other than the wrapped one inside the container's authenticated header.
+    """
+
+    encrypts = True
+    mode = "confidential"
+    crypto_version = CONTAINER_V2_HYBRID
+
+    def __init__(
+        self,
+        public_key: PublicEncryptionKey,
+        *,
+        on_warning: Callable[[str], None] | None = None,
+        chunk_bytes: int = DEFAULT_CHUNK_BYTES,
+    ) -> None:
+        super().__init__()
+        if not isinstance(public_key, PublicEncryptionKey):
+            raise ArtifactError("ConfidentialV2Protector needs a PublicEncryptionKey.")
+        self.public_key = public_key
+        self.key_id = public_key.key_id
+        self.chunk_bytes = chunk_bytes
+        self._on_warning = on_warning
+
+    def _warn(self, message: str) -> None:
+        if self._on_warning:
+            self._on_warning(message)
+
+    def destroy(self) -> None:
+        """Nothing to release: this protector never holds a decryption-capable secret."""
+
+    def protect(self, artifact: GeneratedArtifact) -> ProtectedArtifact:
+        began = time.monotonic()
+        plaintext_size = artifact.size
+
+        # Fresh for every artefact, and every retry of every artefact. Never derived from
+        # the generation id, the seed, the job id or a timestamp - a deterministic file key
+        # or nonce under a reused key is the one catastrophic misuse of GCM, and a
+        # deterministic object path makes that an easy mistake to reach for.
+        file_key = EphemeralKey(secrets.token_bytes(KEY_BYTES))
+
+        try:
+            # Wrap before encrypting: the wrapped key belongs in the header, and the header
+            # is the associated data, so it has to exist before the first byte is sealed.
+            # It also means a wrapping failure costs nothing - no ciphertext was written
+            # and the plaintext is still where the caller left it.
+            try:
+                wrapped = self.public_key.wrap(file_key)
+            except ArtifactError:
+                raise
+            except Exception as error:
+                raise ArtifactError(
+                    f"Wrapping the file key to public key {self.key_id} failed: "
+                    f"{type(error).__name__}"
+                ) from error
+
+            header = build_v2_header(
+                generation_id=artifact.generation_id,
+                content_type=artifact.mime_type,
+                plaintext_bytes=plaintext_size,
+                wrapped_file_key=wrapped,
+                key_id=self.key_id,
+                key_wrap_algorithm=self.public_key.algorithm,
+                privacy_mode=self.mode,
+            )
+
+            scratch = make_scratch_dir("cg-enc-")
+            target = os.path.join(scratch, f"{uuid.uuid4().hex}{ENCRYPTED_EXTENSION}")
+
+            try:
+                with open(artifact.path, "rb") as source, open(target, "wb") as destination:
+                    facts = encrypt_stream(
+                        source,
+                        destination,
+                        key=file_key,
+                        header=header,
+                        chunk_bytes=self.chunk_bytes,
+                    )
+            except Exception:
+                # Fail closed: nothing half-encrypted survives, and the caller gets an
+                # exception rather than a plaintext artefact it might upload.
+                shutil.rmtree(scratch, ignore_errors=True)
+                raise
+        finally:
+            # The file key has done its only two jobs. Releasing it here means it is gone
+            # before the upload even starts, on the failure paths as well as the happy one.
+            file_key.destroy()
+
+        removed = shred(artifact.path, on_warning=self._warn)
+        if not removed:
+            self._warn(
+                f"plaintext for {artifact.name} could not be deleted; it will go when the "
+                "container is destroyed"
+            )
+
+        elapsed = time.monotonic() - began
+        self.total_seconds += elapsed
+        return ProtectedArtifact(
+            path=target,
+            content_type=ENCRYPTED_CONTENT_TYPE,
+            encrypted=True,
+            generation_id=artifact.generation_id,
+            filename=artifact.name + ENCRYPTED_EXTENSION,
+            size=facts["container_bytes"],
+            plaintext_removed=removed,
+            encryption_seconds=elapsed,
+            scratch_dir=scratch,
+            metadata={
+                "privacyMode": self.mode,
+                "encrypted": True,
+                "cryptoVersion": CONTAINER_V2_HYBRID,
+                "algorithm": facts["algorithm"],
+                "encryptionVersion": CONTAINER_V2_HYBRID,
+                "keyWrapAlgorithm": self.public_key.algorithm,
+                "keyId": self.key_id,
+                "contentType": ENCRYPTED_CONTENT_TYPE,
+                "originalContentType": artifact.mime_type,
+                "plaintextBytes": plaintext_size,
+            },
+        )
+
+
+def unwrap_file_key(wrapped: bytes, private_key) -> "EphemeralKey":
+    """Recover a file key from its wrapped form. Reference implementation, for tests.
+
+    Production never calls this: the worker only ever wraps, and unwrapping happens in the
+    browser with a private key this codebase never sees.
+    """
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import padding
+
+    try:
+        raw = private_key.decrypt(
+            wrapped,
+            padding.OAEP(
+                mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                algorithm=hashes.SHA256(),
+                label=None,
+            ),
+        )
+    except Exception as error:
+        raise ContainerError(
+            "Unable to unwrap the file key. The private key is wrong or the wrapped key "
+            "was modified."
+        ) from error
+    return EphemeralKey(raw)
+
+
+def decrypt_v2_container(data: bytes, private_key) -> tuple[bytes, dict[str, Any]]:
+    """Unwrap the file key with a private key, then decrypt. Returns ``(plaintext, header)``.
+
+    The reference implementation of the v2 read path and what the browser module is checked
+    against. Every failure - wrong private key, modified wrapped key, modified header,
+    modified ciphertext, modified tag - raises the same ``ContainerError``.
+    """
+    parsed = parse_container_prefix(data)
+    if parsed["version"] != CONTAINER_V2_HYBRID:
+        raise ContainerError(
+            f"Not a hybrid container: version {parsed['version']}. Use decrypt_container "
+            "for v1 artefacts."
+        )
+
+    wrap = parsed["key_wrap"]
+    padded = wrap["wrappedFileKey"] + "=" * (-len(wrap["wrappedFileKey"]) % 4)
+    try:
+        wrapped = base64.urlsafe_b64decode(padded)
+    except (binascii.Error, ValueError) as error:
+        raise ContainerError(f"Wrapped file key is not valid base64url: {error}") from error
+
+    file_key = unwrap_file_key(wrapped, private_key)
+    try:
+        return decrypt_container(data, file_key)
+    finally:
+        file_key.destroy()
+
+
 def build_protector(
     mode_name: str | None,
     encryption: dict[str, Any] | None = None,
@@ -830,18 +1222,53 @@ def build_protector(
             f"{', '.join(sorted(SUITE_IDS))}."
         )
 
-    key = decode_key(encryption.get("key") or "")
-    key_id = encryption.get("keyId") or encryption.get("key_id")
-    kdf = encryption.get("kdf")
-    if kdf is not None and not isinstance(kdf, dict):
-        raise ArtifactError("encryption.kdf must be an object when supplied.")
+    version = int(encryption.get("version") or CONTAINER_V2_HYBRID)
 
-    return ConfidentialProtector(
-        key,
-        kdf=kdf,
-        key_id=str(key_id) if key_id else None,
-        on_warning=on_warning,
+    # A symmetric key in the request is the exact property v2 exists to remove, so it is
+    # refused outright rather than honoured. Old artefacts stay readable; new ones cannot
+    # be created this way. Naming the replacement in the message is the difference between
+    # a migration and an outage.
+    if version == CONTAINER_V1_SYMMETRIC or encryption.get("key"):
+        raise ArtifactError(
+            "Confidential generation v1 (a symmetric key in the request) is no longer "
+            "accepted: that key would travel through the job queue and could later decrypt "
+            "the stored video. Send encryption.version 2 with a publicKey instead. "
+            "Existing v1 artefacts remain decryptable."
+        )
+
+    if version != CONTAINER_V2_HYBRID:
+        raise ArtifactError(
+            f"Unsupported encryption.version {version}. This build creates version "
+            f"{CONTAINER_V2_HYBRID}."
+        )
+
+    wrap_algorithm = str(
+        encryption.get("keyWrapAlgorithm")
+        or encryption.get("key_wrap_algorithm")
+        or KEY_WRAP_RSA_OAEP_256
+    ).strip()
+    if wrap_algorithm not in SUPPORTED_KEY_WRAP_ALGORITHMS:
+        raise ArtifactError(
+            f"Unsupported keyWrapAlgorithm {wrap_algorithm!r}. Supported: "
+            f"{', '.join(sorted(SUPPORTED_KEY_WRAP_ALGORITHMS))}."
+        )
+
+    public_key = decode_public_key(
+        encryption.get("publicKey") or encryption.get("public_key") or ""
     )
+
+    # A supplied key id has to agree with the key it claims to name. The id is derived from
+    # the key's own bytes, so disagreement means the caller is confused about which key
+    # they hold - and an artefact filed under the wrong id is one the client will not think
+    # to try its private key against.
+    claimed = encryption.get("keyId") or encryption.get("key_id")
+    if claimed and str(claimed) != public_key.key_id:
+        raise ArtifactError(
+            f"encryption.keyId does not match the supplied public key (expected "
+            f"{public_key.key_id})."
+        )
+
+    return ConfidentialV2Protector(public_key, on_warning=on_warning)
 
 
 # --------------------------------------------------------------------------------------
