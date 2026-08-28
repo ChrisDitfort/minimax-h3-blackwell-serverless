@@ -3,8 +3,8 @@ name: Build Experimental Dual-GPU Image
 # Publishes the experimental 2-GPU MiniMax H3 worker under a NEW immutable tag.
 #
 # It never touches :latest, :code or the staging-N tags, so the known-good image and the
-# rollback path this repository already relies on stay exactly where they are. Manual
-# dispatch only: an experimental image must never be published by pushing a branch.
+# rollback path this repository already relies on stay exactly where they are. It only
+# ever writes to a tag that does not exist yet, and refuses to run if it does.
 #
 # Two ways to get the models into the image:
 #
@@ -17,13 +17,23 @@ name: Build Experimental Dual-GPU Image
 #                     code image, exactly as build.yml does. ~30 minutes and 42 GB. Use it
 #                     if the base image ever stops being rebasable.
 
+# `push` on the experiment branch as well as manual dispatch, and deliberately so:
+# GitHub only offers workflow_dispatch for workflows that exist on the *default* branch,
+# and putting this file on main would fire build.yml's `on: push` and overwrite :latest
+# with an image built from main. Publishing here is still safe to do on every push - the
+# target tag is immutable, so a second push to the same tag fails the build instead of
+# replacing a benchmarked image.
 on:
+  push:
+    branches:
+      - dual-gpu-experiment
   workflow_dispatch:
     inputs:
       tag:
         description: "New immutable tag to publish (e.g. dual-gpu-1). Must not be latest/code/staging-*."
         type: string
-        required: true
+        required: false
+        default: "dual-gpu-1"
       base_tag:
         description: "Known-good image to take the model layers from."
         type: string
@@ -48,6 +58,10 @@ concurrency:
 env:
   REGISTRY: ghcr.io
   IMAGE: ghcr.io/chrisditfort/minimax-h3-blackwell-serverless
+  # A push event carries no inputs, so every input needs a fallback here.
+  DEFAULT_TAG: dual-gpu-1
+  DEFAULT_BASE_TAG: latest
+  DEFAULT_OLD_CODE_TAG: code
 
 jobs:
   # ------------------------------------------------------------------------------------
@@ -61,6 +75,7 @@ jobs:
     outputs:
       code_ref: ${{ steps.record.outputs.code_ref }}
       code_tag: ${{ steps.guard.outputs.code_tag }}
+      tag: ${{ steps.guard.outputs.tag }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -68,9 +83,10 @@ jobs:
       - name: Refuse to publish over a protected or existing tag
         id: guard
         env:
-          TAG: ${{ inputs.tag }}
+          TAG_INPUT: ${{ inputs.tag }}
         run: |
           set -euo pipefail
+          TAG="${TAG_INPUT:-$DEFAULT_TAG}"
           case "$TAG" in
             latest|code|staging-*|"")
               echo "::error::Refusing to publish to '${TAG}'. That tag is the known-good image or part of its build chain."
@@ -81,6 +97,7 @@ jobs:
             echo "::error::'${TAG}' is not a valid lowercase OCI tag."
             exit 1
           fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "code_tag=code-${TAG}" >> "$GITHUB_OUTPUT"
           echo "Publishing experimental image to ${IMAGE}:${TAG}"
 
@@ -96,7 +113,7 @@ jobs:
 
       - name: Fail if the target tag already exists
         env:
-          TAG: ${{ inputs.tag }}
+          TAG: ${{ steps.guard.outputs.tag }}
         run: |
           set -euo pipefail
           # Immutability is the point: a benchmark run has to be attributable to exactly
@@ -152,10 +169,12 @@ jobs:
       - name: Pin the known-good image and its code base
         id: pin
         env:
-          BASE_TAG: ${{ inputs.base_tag }}
-          OLD_CODE_TAG: ${{ inputs.old_code_tag }}
+          BASE_TAG_INPUT: ${{ inputs.base_tag }}
+          OLD_CODE_TAG_INPUT: ${{ inputs.old_code_tag }}
         run: |
           set -euo pipefail
+          BASE_TAG="${BASE_TAG_INPUT:-$DEFAULT_BASE_TAG}"
+          OLD_CODE_TAG="${OLD_CODE_TAG_INPUT:-$DEFAULT_OLD_CODE_TAG}"
           base_digest=$(crane digest "${IMAGE}:${BASE_TAG}")
           old_code_digest=$(crane digest "${IMAGE}:${OLD_CODE_TAG}")
           echo "base=${IMAGE}@${base_digest}"          >> "$GITHUB_OUTPUT"
@@ -174,7 +193,7 @@ jobs:
       - name: Rebase the model layers onto the new code
         id: rebase
         env:
-          TAG: ${{ inputs.tag }}
+          TAG: ${{ needs.build-code.outputs.tag }}
           BASE: ${{ steps.pin.outputs.base }}
           OLD_BASE: ${{ steps.pin.outputs.old_base }}
           NEW_BASE: ${{ needs.build-code.outputs.code_ref }}
@@ -193,7 +212,7 @@ jobs:
 
       - name: Verify the model layers survived the rebase
         env:
-          TAG: ${{ inputs.tag }}
+          TAG: ${{ needs.build-code.outputs.tag }}
           NEW_BASE: ${{ needs.build-code.outputs.code_ref }}
         run: |
           set -euo pipefail
@@ -206,7 +225,7 @@ jobs:
 
       - name: Verify the entrypoint and the default GPU mode
         env:
-          TAG: ${{ inputs.tag }}
+          TAG: ${{ needs.build-code.outputs.tag }}
         run: |
           set -euo pipefail
           # A rebase that lost the handler entrypoint, or that shipped defaulting to dual,
@@ -229,7 +248,7 @@ jobs:
 
       - name: Publish the result
         env:
-          TAG: ${{ inputs.tag }}
+          TAG: ${{ needs.build-code.outputs.tag }}
           DIGEST: ${{ steps.rebase.outputs.digest }}
         run: |
           set -euo pipefail
@@ -298,7 +317,7 @@ jobs:
         env:
           CODE_REF: ${{ needs.build-code.outputs.code_ref }}
           WORK: ${{ steps.work.outputs.dir }}
-          TAG: ${{ inputs.tag }}
+          TAG: ${{ needs.build-code.outputs.tag }}
         run: |
           set -euo pipefail
           export TMPDIR="${WORK}/tmp"
@@ -343,7 +362,7 @@ jobs:
 
       - name: Publish the result
         env:
-          TAG: ${{ inputs.tag }}
+          TAG: ${{ needs.build-code.outputs.tag }}
         run: |
           set -euo pipefail
           crane tag "${final_ref}" "${TAG}"
