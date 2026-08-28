@@ -217,6 +217,11 @@ class ComfyRank:
 _ranks: list[ComfyRank] = []
 _shadow_ranks: list[ComfyRank] = []
 
+#: A rank uses this exit status when its transport probe stalled. Kept in step with
+#: h3_parallel.runtime.EXIT_TRANSPORT_STALLED; a plain crash uses some other code, and the
+#: two mean different things to the ladder.
+TRANSPORT_STALLED_EXIT = 97
+
 
 # --------------------------------------------------------------------------------------
 # Performance instrumentation
@@ -866,8 +871,8 @@ def comfy_command(rank: ComfyRank) -> list[str]:
     return command
 
 
-def rank_env(rank: ComfyRank) -> dict:
-    """Environment for one rank: its GPU, its place in the group, its attention backend."""
+def rank_env(rank: ComfyRank, transport: tuple | None = None) -> dict:
+    """Environment for one rank: its GPU, its place in the group, its NCCL transport."""
     env = build_comfy_env()
     if GPU_CONFIG is None or not GPU_CONFIG.dual:
         # Single mode must not leave a stale rank marker behind, or h3_parallel would try
@@ -882,10 +887,58 @@ def rank_env(rank: ComfyRank) -> dict:
     env["H3_SP_WORLD_SIZE"] = str(GPU_CONFIG.world_size)
     env["H3_SP_MASTER_ADDR"] = GPU_CONFIG.master_addr
     env["H3_SP_MASTER_PORT"] = str(GPU_CONFIG.master_port)
+
+    if transport is not None:
+        name, overlay, _description = transport
+        env.update(overlay)
+        # Echoed back by the rank so a log line says which rung carried the traffic.
+        env["H3_SP_TRANSPORT_LABEL"] = name
+        if name != "auto" and not _env_flag("NCCL_DEBUG"):
+            # Something already went wrong to reach a second rung, so stop being quiet.
+            env["NCCL_DEBUG"] = "INFO"
     return env
 
 
-def _launch_rank(rank: ComfyRank) -> None:
+def _env_flag(name: str) -> bool:
+    return bool(os.environ.get(name, "").strip())
+
+
+def log_host_transport_facts() -> None:
+    """What the handler can see about GPU-to-GPU communication that a rank cannot.
+
+    Each rank runs with CUDA_VISIBLE_DEVICES narrowed to one GPU, so no rank can answer
+    "can these two cards reach each other?". The handler can, and it is the single most
+    useful fact when a collective stalls.
+    """
+    facts: list[str] = []
+    try:
+        stats = os.statvfs("/dev/shm")
+        megabytes = (stats.f_blocks * stats.f_frsize) // (1024 * 1024)
+        facts.append(
+            f"shm={megabytes}MB"
+            + (" (small - NCCL's shared-memory transport may fail)" if megabytes <= 128 else "")
+        )
+    except Exception as error:
+        facts.append(f"shm=unknown ({type(error).__name__})")
+
+    try:
+        import torch
+
+        if torch.cuda.is_available() and torch.cuda.device_count() >= 2:
+            peer = torch.cuda.can_device_access_peer(0, 1)
+            facts.append(f"p2p_0_to_1={'yes' if peer else 'NO'}")
+            for index in (0, 1):
+                properties = torch.cuda.get_device_properties(index)
+                facts.append(f"gpu{index}={properties.name!r}")
+    except Exception as error:
+        facts.append(f"p2p probe failed: {type(error).__name__}: {error}")
+
+    nccl_env = {k: v for k, v in sorted(os.environ.items()) if k.startswith("NCCL_")}
+    facts.append(f"nccl_env={nccl_env or '<none set>'}")
+    log("[H3-GPU] host " + " ".join(facts))
+
+
+def _launch_rank(rank: ComfyRank, transport: tuple | None = None) -> None:
     for directory in (rank.output_dir, rank.temp_dir, COMFY_INPUT_DIR, rank.user_dir):
         if not directory:
             continue
@@ -895,7 +948,7 @@ def _launch_rank(rank: ComfyRank) -> None:
             log(f"WARNING: could not create {directory}: {error}")
 
     command = comfy_command(rank)
-    env = rank_env(rank)
+    env = rank_env(rank, transport)
     extra_args = parse_extra_args(os.environ.get("COMFY_EXTRA_ARGS", ""))
     # Logged in full and on its own line so an A/B run can be attributed to the exact
     # flags it used - `--highvram` in particular is invisible otherwise. The wording of
@@ -944,7 +997,7 @@ def _verify_dual_ranks() -> None:
         log(
             f"[H3-GPU] rank {rank.rank} verified: strategy={status.get('strategy')} "
             f"world_size={status.get('world_size')} patched={patched} "
-            f"selftest={status.get('selftest')}"
+            f"transport={status.get('transport')} selftest={status.get('selftest')}"
         )
 
 
@@ -980,35 +1033,87 @@ def start_comfyui() -> None:
         # reflects time-to-ready rather than time-since-fork.
         boot_began = time.monotonic()
 
-        if not _ranks or all(rank.process is None for rank in _ranks):
-            world = GPU_CONFIG.world_size if (GPU_CONFIG and GPU_CONFIG.dual) else 1
-            _ranks = [ComfyRank(index) for index in range(world)]
-            _shadow_ranks = [rank for rank in _ranks if rank.shadow]
-            for rank in _ranks:
-                _launch_rank(rank)
-            _comfy_process = _ranks[0].process
+        if GPU_CONFIG is None or not GPU_CONFIG.dual:
+            _bring_up(transport=None, timeout=COMFY_STARTUP_TIMEOUT)
+            _comfy_boot_seconds = time.monotonic() - boot_began
+            log(f"ComfyUI is ready after ~{_comfy_boot_seconds:.1f}s (1 rank)")
+            return
 
-        deadline = time.monotonic() + COMFY_STARTUP_TIMEOUT
-        while time.monotonic() < deadline:
-            for rank in _ranks:
-                if rank.process is not None and rank.process.poll() is not None:
-                    code = rank.process.returncode
-                    _stop_ranks()
-                    raise RuntimeError(
-                        f"ComfyUI rank {rank.rank} exited during startup with code {code}. "
-                        "Check the ComfyUI log above for the underlying error."
-                    )
-            if all(rank.is_ready() for rank in _ranks):
-                elapsed = time.monotonic() - boot_began
-                _comfy_boot_seconds = elapsed
-                log(f"ComfyUI is ready after ~{elapsed:.1f}s ({len(_ranks)} rank(s))")
-                if GPU_CONFIG is not None and GPU_CONFIG.dual:
-                    _verify_dual_ranks()
-                return
-            time.sleep(1)
+        # Dual mode walks the NCCL transport ladder. Creating a communicator is not the
+        # same as being able to move bytes through it, and which transports a container
+        # permits is not knowable from inside one - so the worker finds out by trying,
+        # and says which rung worked.
+        log_host_transport_facts()
+        ladder = gpu_config.transport_ladder()
+        log(
+            "[H3-GPU] transport ladder: "
+            + " -> ".join(f"{name} ({description})" for name, _, description in ladder)
+        )
+
+        failures: list[str] = []
+        for attempt, transport in enumerate(ladder, start=1):
+            name, _overlay, description = transport
+            log(f"[H3-GPU] transport attempt {attempt}/{len(ladder)}: {name} - {description}")
+            try:
+                _bring_up(transport=transport, timeout=GPU_CONFIG.attempt_timeout)
+            except Exception as error:
+                failures.append(f"{name}: {error}")
+                log(f"[H3-GPU] transport {name} FAILED: {error}")
+                _stop_ranks()
+                continue
+
+            _comfy_boot_seconds = time.monotonic() - boot_began
+            log(
+                f"ComfyUI is ready after ~{_comfy_boot_seconds:.1f}s "
+                f"({len(_ranks)} ranks, transport={name})"
+            )
+            if name != "auto":
+                log(
+                    f"[H3-GPU] NOTE: the default transport did not work on this host; "
+                    f"'{name}' did. Set the matching NCCL variable on the endpoint to skip "
+                    "the ladder on future cold starts."
+                )
+            return
 
         _stop_ranks()
-        raise RuntimeError(f"ComfyUI did not become ready within {COMFY_STARTUP_TIMEOUT}s")
+        raise RuntimeError(
+            "no NCCL transport on this host could carry a collective between the two "
+            "ranks. Attempts: " + " | ".join(failures)
+        )
+
+
+def _bring_up(*, transport: tuple | None, timeout: int) -> None:
+    """Launch every rank once and wait for them all to be ready and verified."""
+    global _comfy_process, _ranks, _shadow_ranks
+
+    world = GPU_CONFIG.world_size if (GPU_CONFIG and GPU_CONFIG.dual) else 1
+    _ranks = [ComfyRank(index) for index in range(world)]
+    _shadow_ranks = [rank for rank in _ranks if rank.shadow]
+    for rank in _ranks:
+        _launch_rank(rank, transport)
+    _comfy_process = _ranks[0].process
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        for rank in _ranks:
+            if rank.process is not None and rank.process.poll() is not None:
+                code = rank.process.returncode
+                stalled = code == TRANSPORT_STALLED_EXIT
+                raise RuntimeError(
+                    f"rank {rank.rank} exited with code {code}"
+                    + (
+                        " - a collective stalled; see the [H3-GPU] transport lines above"
+                        if stalled
+                        else " during startup; see the ComfyUI log above"
+                    )
+                )
+        if all(rank.is_ready() for rank in _ranks):
+            if GPU_CONFIG is not None and GPU_CONFIG.dual:
+                _verify_dual_ranks()
+            return
+        time.sleep(1)
+
+    raise RuntimeError(f"ranks did not all become ready within {timeout}s")
 
 
 def _stop_ranks() -> None:

@@ -20,9 +20,15 @@ produces wrong video is worse than one that never starts.
 from __future__ import annotations
 
 import os
+import sys
+import threading
 import time
 
 from . import config, patches
+
+#: Exit status a rank uses when a collective stalled. The handler reads it as
+#: "this transport cannot carry traffic" and moves to the next rung of the ladder.
+EXIT_TRANSPORT_STALLED = 97
 
 #: What this rank actually managed to do, served over /h3/gpu. The handler treats
 #: ready=False as a fatal startup condition, which is the only way a swallowed
@@ -35,6 +41,7 @@ STATUS: dict = {
     "strategy": None,
     "patched": {},
     "selftest": None,
+    "transport": None,
     "error": None,
 }
 
@@ -134,6 +141,152 @@ def _int_env(name: str, default: int) -> int:
         return int(os.environ.get(name, "").strip() or default)
     except ValueError:
         return default
+
+
+# --------------------------------------------------------------------------------------
+# Transport probe
+# --------------------------------------------------------------------------------------
+
+
+def shm_bytes() -> int | None:
+    """Size of /dev/shm, the transport NCCL falls back to when peer-to-peer is unavailable."""
+    try:
+        stats = os.statvfs("/dev/shm")
+        return stats.f_blocks * stats.f_frsize
+    except Exception:  # pragma: no cover - not present off Linux
+        return None
+
+
+def transport_diagnostics() -> list[str]:
+    """Everything that explains a stalled collective, gathered without needing one."""
+    lines: list[str] = []
+
+    size = shm_bytes()
+    if size is None:
+        lines.append("shm=unknown")
+    else:
+        megabytes = size // (1024 * 1024)
+        verdict = "likely too small for NCCL" if megabytes <= 128 else "adequate"
+        lines.append(f"shm=/dev/shm {megabytes}MB ({verdict})")
+
+    nccl_env = {
+        key: value for key, value in sorted(os.environ.items()) if key.startswith("NCCL_")
+    }
+    lines.append(f"nccl_env={nccl_env or '<none set>'}")
+    lines.append(
+        f"cuda_visible_devices={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')!r}"
+    )
+
+    try:
+        import torch
+
+        lines.append(
+            f"visible_devices={torch.cuda.device_count()} "
+            f"ipc_handle_support={_ipc_supported()}"
+        )
+    except Exception as error:  # pragma: no cover
+        lines.append(f"device probe failed: {error}")
+
+    return lines
+
+
+def _ipc_supported() -> str:
+    """Whether this process can export a CUDA IPC handle - what NCCL's P2P path needs."""
+    try:
+        import torch
+        from torch.multiprocessing.reductions import reduce_tensor
+
+        reduce_tensor(torch.zeros(1, device="cuda"))
+        return "yes"
+    except Exception as error:
+        return f"no ({type(error).__name__})"
+
+
+def probe_transport(collective, timeout: int) -> str:
+    """Run the three collectives the DiT depends on, on tiny tensors, under a watchdog.
+
+    This exists because of a real production failure: `init_process_group` returned in
+    743 ms, the patches installed, and then the first genuine collective hung. Nothing was
+    logged, the rank never became ready, and RunPod killed the worker eight minutes later
+    with no clue as to why. NCCL's own watchdog did not fire in time either.
+
+    A stuck NCCL call cannot be interrupted from Python - the thread is inside CUDA. So the
+    probe runs on a daemon thread, and when the watchdog wins the process prints what it
+    knows and exits immediately. Dying loudly in twenty-five seconds is worth far more than
+    hanging silently for eight minutes.
+    """
+    import torch
+
+    # CUDA in the container, CPU in the test suite: the watchdog and the shape of the
+    # three collectives are what this guards, and neither depends on the device.
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    completed: dict[str, float] = {}
+    failure: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            began = time.monotonic()
+            collective.barrier()
+            completed["barrier_ms"] = (time.monotonic() - began) * 1000
+
+            began = time.monotonic()
+            marker = torch.full((4,), float(collective.rank), device=device)
+            collective.broadcast(marker, 0)
+            if marker.tolist() != [0.0, 0.0, 0.0, 0.0]:
+                raise RuntimeError(f"broadcast from rank 0 delivered {marker.tolist()}")
+            completed["broadcast_ms"] = (time.monotonic() - began) * 1000
+
+            began = time.monotonic()
+            world = collective.world_size
+            send = torch.full((world,), float(collective.rank), device=device)
+            received = collective.all_to_all(send, [1] * world, [1] * world)
+            expected = list(range(world))
+            if [int(value) for value in received.tolist()] != expected:
+                raise RuntimeError(
+                    f"all_to_all delivered {received.tolist()}, expected {expected}"
+                )
+            completed["all_to_all_ms"] = (time.monotonic() - began) * 1000
+        except BaseException as error:  # noqa: BLE001 - re-raised on the calling thread
+            failure.append(error)
+
+    worker = threading.Thread(target=run, name="h3-transport-probe", daemon=True)
+    worker.start()
+    worker.join(timeout)
+
+    if worker.is_alive():
+        stalled = next(
+            name for name in ("barrier", "broadcast", "all_to_all")
+            if f"{name}_ms" not in completed
+        )
+        log(f"[H3-GPU] transport=FAILED stalled_on={stalled} after {timeout}s")
+        log(f"[H3-GPU]   completed_before_stall={completed or '<nothing>'}")
+        for line in transport_diagnostics():
+            log(f"[H3-GPU]   {line}")
+        log(
+            "[H3-GPU]   A collective that hangs after a successful init means the "
+            "communicator was created but cannot move bytes between the two ranks. On one "
+            "host that is nearly always the shared-memory or CUDA-IPC transport being "
+            "unavailable inside the container."
+        )
+        log(
+            "[H3-GPU]   Exiting now so the handler can try the next transport instead of "
+            "waiting for RunPod to kill an unresponsive worker."
+        )
+        # The probe thread is stuck inside NCCL and cannot be joined or cancelled; a clean
+        # interpreter shutdown would block on it forever. Hard-exit is the only way out.
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(EXIT_TRANSPORT_STALLED)
+
+    if failure:
+        log(f"[H3-GPU] transport=FAILED error={type(failure[0]).__name__}: {failure[0]}")
+        for line in transport_diagnostics():
+            log(f"[H3-GPU]   {line}")
+        raise failure[0]
+
+    return "transport=ok " + " ".join(
+        f"{name.removesuffix('_ms')}={value:.1f}ms" for name, value in completed.items()
+    )
 
 
 # --------------------------------------------------------------------------------------
@@ -245,6 +398,15 @@ def boot() -> None:
     )
     collective = init_process_group(settings)
     log(f"[H3-PERF] distributed_init_ms={round((time.monotonic() - began) * 1000)}")
+
+    # Before anything expensive, prove the group can actually move bytes. A communicator
+    # that was created successfully is not the same thing as a working transport, and the
+    # difference between those two is eight minutes of silence in production.
+    transport = probe_transport(collective, settings.probe_timeout)
+    STATUS["transport"] = transport
+    log(f"[H3-GPU] {transport} via={os.environ.get('H3_SP_TRANSPORT_LABEL', 'auto')}")
+    for line in transport_diagnostics():
+        log(f"[H3-GPU] {line}")
 
     report = patches.install(collective, parallel_vae=settings.parallel_vae, log=log)
     log(report.describe())

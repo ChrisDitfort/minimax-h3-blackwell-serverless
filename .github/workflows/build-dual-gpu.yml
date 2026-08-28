@@ -59,7 +59,7 @@ env:
   REGISTRY: ghcr.io
   IMAGE: ghcr.io/chrisditfort/minimax-h3-blackwell-serverless
   # A push event carries no inputs, so every input needs a fallback here.
-  DEFAULT_TAG: dual-gpu-2
+  DEFAULT_TAG: dual-gpu-3
   DEFAULT_BASE_TAG: latest
   DEFAULT_OLD_CODE_TAG: code
 

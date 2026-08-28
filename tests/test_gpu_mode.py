@@ -506,6 +506,154 @@ class RankVerificationTests(unittest.TestCase):
         self.assertIn("not patched", str(caught.exception))
 
 
+class TransportLadderTests(unittest.TestCase):
+    """Picking an NCCL transport by trying, rather than by making the operator guess."""
+
+    def test_default_ladder_ends_somewhere_that_always_works(self):
+        with EnvOverride(H3_SP_TRANSPORT=None, NCCL_P2P_DISABLE=None, NCCL_SHM_DISABLE=None,
+                         NCCL_NET=None):
+            ladder = gpu_config.transport_ladder()
+        self.assertEqual([name for name, _, _ in ladder], ["auto", "no-shm", "no-p2p", "sockets"])
+        # The last rung disables both GPU transports, leaving loopback sockets - slow, but
+        # available in any container. A slow measurement beats no measurement.
+        self.assertEqual(ladder[-1][1], {"NCCL_P2P_DISABLE": "1", "NCCL_SHM_DISABLE": "1"})
+
+    def test_the_first_rung_changes_nothing(self):
+        with EnvOverride(H3_SP_TRANSPORT=None, NCCL_P2P_DISABLE=None, NCCL_SHM_DISABLE=None,
+                         NCCL_NET=None):
+            self.assertEqual(gpu_config.transport_ladder()[0][1], {})
+
+    def test_an_operator_nccl_setting_is_never_second_guessed(self):
+        with EnvOverride(H3_SP_TRANSPORT=None, NCCL_SHM_DISABLE="1", NCCL_P2P_DISABLE=None,
+                         NCCL_NET=None):
+            ladder = gpu_config.transport_ladder()
+        self.assertEqual(len(ladder), 1)
+        self.assertEqual(ladder[0][0], "operator-pinned")
+        self.assertIn("NCCL_SHM_DISABLE", ladder[0][2])
+
+    def test_a_named_transport_is_the_only_one_tried(self):
+        with EnvOverride(H3_SP_TRANSPORT="sockets", NCCL_P2P_DISABLE=None,
+                         NCCL_SHM_DISABLE=None, NCCL_NET=None):
+            ladder = gpu_config.transport_ladder()
+        self.assertEqual(len(ladder), 1)
+        self.assertEqual(ladder[0][0], "sockets")
+
+    def test_an_unknown_transport_is_rejected(self):
+        with EnvOverride(H3_SP_TRANSPORT="infiniband", NCCL_P2P_DISABLE=None,
+                         NCCL_SHM_DISABLE=None, NCCL_NET=None):
+            with self.assertRaises(gpu_config.ConfigurationError):
+                gpu_config.transport_ladder()
+
+    def test_the_overlay_reaches_the_rank_environment(self):
+        saved = handler.GPU_CONFIG
+        try:
+            with EnvOverride(H3_GPU_MODE="dual", NCCL_DEBUG=None):
+                handler.GPU_CONFIG = gpu_config.resolve(device_count=2)
+                first = handler.rank_env(handler.ComfyRank(0), ("auto", {}, ""))
+                later = handler.rank_env(
+                    handler.ComfyRank(1), ("sockets", {"NCCL_P2P_DISABLE": "1"}, "")
+                )
+        finally:
+            handler.GPU_CONFIG = saved
+
+        self.assertEqual(first["H3_SP_TRANSPORT_LABEL"], "auto")
+        self.assertNotIn("NCCL_P2P_DISABLE", first)
+        self.assertEqual(later["NCCL_P2P_DISABLE"], "1")
+        self.assertEqual(later["H3_SP_TRANSPORT_LABEL"], "sockets")
+        # Reaching a second rung means something already went wrong; stop being quiet.
+        self.assertEqual(later["NCCL_DEBUG"], "INFO")
+
+    def test_an_operators_nccl_debug_choice_is_kept(self):
+        saved = handler.GPU_CONFIG
+        try:
+            with EnvOverride(H3_GPU_MODE="dual", NCCL_DEBUG="WARN"):
+                handler.GPU_CONFIG = gpu_config.resolve(device_count=2)
+                env = handler.rank_env(
+                    handler.ComfyRank(1), ("sockets", {"NCCL_P2P_DISABLE": "1"}, "")
+                )
+        finally:
+            handler.GPU_CONFIG = saved
+        self.assertEqual(env["NCCL_DEBUG"], "WARN")
+
+    @unittest.skipUnless(HAS_TORCH, "the probe lives in h3_parallel.runtime")
+    def test_the_stall_exit_code_is_shared_with_the_rank(self):
+        from h3_parallel import runtime
+
+        self.assertEqual(handler.TRANSPORT_STALLED_EXIT, runtime.EXIT_TRANSPORT_STALLED)
+
+
+@unittest.skipUnless(HAS_TORCH, "the probe needs torch")
+class TransportProbeTests(unittest.TestCase):
+    """The probe exists so a stalled collective is loud in seconds, not silent for eight minutes."""
+
+    def test_a_working_transport_reports_its_timings(self):
+        from h3_parallel import runtime
+        from h3_parallel.collectives import ThreadCollective, ThreadGroup
+
+        group = ThreadGroup(1)
+        result = runtime.probe_transport(ThreadCollective(group, 0), timeout=30)
+        self.assertIn("transport=ok", result)
+        for collective in ("barrier", "broadcast", "all_to_all"):
+            self.assertIn(f"{collective}=", result)
+
+    def test_a_wrong_answer_is_raised_not_ignored(self):
+        from h3_parallel import runtime
+
+        class Liar:
+            rank, world_size = 0, 1
+
+            def barrier(self):
+                pass
+
+            def broadcast(self, tensor, src):
+                tensor.fill_(99.0)  # not what rank 0 sent
+                return tensor
+
+            def all_to_all(self, send, input_splits, output_splits):
+                return send
+
+        with self.assertRaises(RuntimeError) as caught:
+            runtime.probe_transport(Liar(), timeout=30)
+        self.assertIn("broadcast", str(caught.exception))
+
+    def test_a_stalled_collective_exits_fast_with_a_diagnostic(self):
+        # The real production failure: a collective that never returns. Run in a
+        # subprocess because the fix is a hard exit - the thread is stuck inside NCCL and
+        # cannot be joined, so nothing else can free the process.
+        import subprocess
+
+        script = (
+            "import sys, time\n"
+            f"sys.path.insert(0, {self.ROOT!r})\n"
+            "from h3_parallel import runtime\n"
+            "class Stuck:\n"
+            "    rank, world_size = 0, 1\n"
+            "    def barrier(self):\n"
+            "        time.sleep(600)\n"
+            "runtime.probe_transport(Stuck(), timeout=2)\n"
+            "print('UNREACHABLE')\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script], capture_output=True, text=True, timeout=120
+        )
+        self.assertEqual(
+            result.returncode, 97,
+            f"expected the stall exit code\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+        self.assertNotIn("UNREACHABLE", result.stdout)
+        self.assertIn("stalled_on=barrier", result.stdout)
+        self.assertIn("nccl_env=", result.stdout)
+
+    ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def test_diagnostics_never_raise(self):
+        from h3_parallel import runtime
+
+        lines = runtime.transport_diagnostics()
+        self.assertTrue(any("nccl_env" in line for line in lines))
+        self.assertTrue(any(line.startswith("shm=") for line in lines))
+
+
 class CustomNodeEntryPointTests(unittest.TestCase):
     """The ComfyUI side of the wiring, exercised the way ComfyUI actually loads it."""
 

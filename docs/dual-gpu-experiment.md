@@ -119,6 +119,9 @@ the decoded video is the same video.
 | `H3_SP_ALLOW_FALLBACK` | `0` | When `1`, a worker asked for dual that cannot deliver it degrades to single instead of refusing to start. |
 | `H3_SP_MASTER_PORT` | `29513` | Loopback rendezvous port for the NCCL group. |
 | `H3_SP_INIT_TIMEOUT` | `300` | Seconds to wait for every rank to join. |
+| `H3_SP_PROBE_TIMEOUT` | `25` | Seconds a tiny transport probe may take before the rank reports a stall and exits. |
+| `H3_SP_ATTEMPT_TIMEOUT` | `150` | Seconds the handler waits for one transport attempt to produce two ready ranks. |
+| `H3_SP_TRANSPORT` | `auto` | Pin one NCCL transport (`auto`, `no-shm`, `no-p2p`, `sockets`) instead of walking the ladder. |
 | `NCCL_DEBUG` | `WARN` | `INFO` prints a screenful per collective and buries the benchmark output. |
 
 **Dual mode is never inferred.** A worker that happens to be scheduled two GPUs still runs
@@ -128,6 +131,35 @@ silently invalidate an A/B comparison.
 **Asking for dual and not getting it is fatal by default.** The worker refuses to start
 rather than quietly serve single-GPU results from an endpoint that believes it is
 measuring two. `H3_SP_ALLOW_FALLBACK=1` opts out.
+
+### Finding a transport that works
+
+Creating an NCCL communicator is not the same as being able to move bytes through it.
+In production `init_process_group` returned in 743 ms, the patches installed, and the
+first genuine collective then hung forever - the container permitted communicator setup
+but not the shared-memory or CUDA-IPC transport underneath it. Nothing was logged, and
+RunPod killed the unresponsive worker eight minutes later.
+
+So the worker now finds out by trying, before anything expensive happens:
+
+1. each rank runs a **transport probe** - a barrier, a broadcast and an all-to-all on
+   four-element tensors - under a watchdog. A stuck NCCL call cannot be interrupted from
+   Python, so when the watchdog wins the rank prints `/dev/shm` size, the NCCL
+   environment, CUDA IPC support and which collective stalled, then hard-exits with
+   status 97;
+2. the handler reads that status and moves to the next rung of the ladder:
+   `auto` -> `no-shm` -> `no-p2p` -> `sockets`, turning on `NCCL_DEBUG=INFO` from the
+   second rung onward;
+3. whichever rung carries traffic is named in the log, so the matching NCCL variable can
+   be set on the endpoint to skip the ladder on later cold starts.
+
+The last rung disables both GPU transports and leaves loopback sockets, which work in any
+container. That is slow - it is not a configuration to benchmark against - but it proves
+the parallel path end to end and produces a measurement instead of a stalled worker.
+
+An operator who has already set `NCCL_P2P_DISABLE`, `NCCL_SHM_DISABLE` or `NCCL_NET`, or
+who names one in `H3_SP_TRANSPORT`, gets exactly that and no ladder: a deliberate choice
+is never second-guessed, or the logs would misreport what was tested.
 
 ## 5. Why the shadow rank does not save a video
 

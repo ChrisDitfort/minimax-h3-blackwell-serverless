@@ -38,6 +38,30 @@ H3_NUM_HEADS = 56
 DEFAULT_MASTER_PORT = 29513
 DEFAULT_COMFY_PORT = 8188
 
+#: NCCL transports to try, in order, when nothing has been pinned by the operator.
+#:
+#: Two ranks on one host can talk over CUDA peer-to-peer, over /dev/shm, or over loopback
+#: sockets. A container can break the first two without breaking communicator *creation* -
+#: which is exactly the failure seen in production: `init_process_group` returned in 743 ms
+#: and the first real collective then hung forever. Rather than make an operator guess one
+#: environment variable per rollout, the worker walks this ladder itself and reports which
+#: rung carried traffic.
+#:
+#: The last rung always works. It is slow - loopback sockets instead of a GPU
+#: interconnect - but a slow measurement beats no measurement, and it proves the
+#: parallel path end to end.
+NCCL_TRANSPORTS = (
+    ("auto", {}, "whatever NCCL selects on its own"),
+    ("no-shm", {"NCCL_SHM_DISABLE": "1"}, "peer-to-peer or sockets; /dev/shm unused"),
+    ("no-p2p", {"NCCL_P2P_DISABLE": "1"}, "shared memory or sockets; no GPU peer access"),
+    ("sockets", {"NCCL_P2P_DISABLE": "1", "NCCL_SHM_DISABLE": "1"},
+     "loopback sockets only - slow, but available in any container"),
+)
+
+#: Set either of these on the endpoint and the ladder is skipped: an explicit operator
+#: choice is never second-guessed.
+NCCL_PINNING_VARS = ("NCCL_P2P_DISABLE", "NCCL_SHM_DISABLE", "NCCL_NET")
+
 
 class ConfigurationError(RuntimeError):
     """The requested GPU configuration cannot be honoured."""
@@ -81,6 +105,12 @@ class GpuConfig:
     #: declares the group dead. One knob rather than two: the rendezvous is the only
     #: collective that legitimately takes more than milliseconds, so it sets the bound.
     init_timeout: int
+    #: Seconds a tiny transport probe may take before the rank gives up and says so.
+    #: Deliberately short: a hung collective otherwise burns the eight minutes RunPod
+    #: waits before killing a worker that never became ready, and logs nothing at all.
+    probe_timeout: int
+    #: Seconds the handler waits for one transport attempt to produce two ready ranks.
+    attempt_timeout: int
     #: Run the boot-time correctness self-test before serving traffic.
     selftest: bool
     #: When dual was requested but cannot be honoured, degrade to single instead of failing.
@@ -148,6 +178,8 @@ def resolve(
         "master_port": _env_int("H3_SP_MASTER_PORT", DEFAULT_MASTER_PORT),
         "parallel_vae": _env_flag("H3_SP_VAE", True),
         "init_timeout": _env_int("H3_SP_INIT_TIMEOUT", 300),
+        "probe_timeout": _env_int("H3_SP_PROBE_TIMEOUT", 25),
+        "attempt_timeout": _env_int("H3_SP_ATTEMPT_TIMEOUT", 150),
         "selftest": _env_flag("H3_SP_SELFTEST", True),
         "allow_fallback": allow_fallback,
     }
@@ -201,6 +233,31 @@ def _dual_blocker(*, device_count: int, world_size: int, num_heads: int) -> str 
     return None
 
 
+def transport_ladder() -> list[tuple[str, dict, str]]:
+    """The NCCL transports this worker should try, in order.
+
+    Returns a single entry when the operator has pinned one - either by naming it in
+    H3_SP_TRANSPORT or by setting an NCCL variable directly on the endpoint. Walking a
+    ladder over the top of somebody's deliberate choice would make the logs lie about what
+    was actually tested.
+    """
+    pinned = [name for name in NCCL_PINNING_VARS if _env(name)]
+    if pinned:
+        return [("operator-pinned", {}, f"pinned by {', '.join(pinned)} on the endpoint")]
+
+    requested = _env("H3_SP_TRANSPORT").lower()
+    if requested and requested != "auto":
+        for name, overlay, description in NCCL_TRANSPORTS:
+            if name == requested:
+                return [(name, overlay, description)]
+        raise ConfigurationError(
+            f"H3_SP_TRANSPORT={requested!r} is not a known transport; expected one of "
+            + ", ".join(name for name, _, _ in NCCL_TRANSPORTS)
+        )
+
+    return list(NCCL_TRANSPORTS)
+
+
 def resolve_for_rank() -> GpuConfig:
     """The plan for a ComfyUI process that was launched as a member of the group.
 
@@ -233,6 +290,8 @@ def resolve_for_rank() -> GpuConfig:
         master_port=_env_int("H3_SP_MASTER_PORT", DEFAULT_MASTER_PORT),
         parallel_vae=_env_flag("H3_SP_VAE", True),
         init_timeout=_env_int("H3_SP_INIT_TIMEOUT", 300),
+        probe_timeout=_env_int("H3_SP_PROBE_TIMEOUT", 25),
+        attempt_timeout=_env_int("H3_SP_ATTEMPT_TIMEOUT", 150),
         selftest=_env_flag("H3_SP_SELFTEST", True),
         allow_fallback=_env_flag("H3_SP_ALLOW_FALLBACK", False),
     )
