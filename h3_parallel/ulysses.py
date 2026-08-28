@@ -201,7 +201,9 @@ def sequence_parallel_attention(
         vf.transpose(0, 1).unsqueeze(0),
         heads_local,
     )
-    out = out.view(total, heads_local, -1)
+    # reshape, not view: an attention backend is free to return a non-contiguous
+    # result, and SageAttention3's output layout is not ours to assume.
+    out = out.reshape(total, heads_local, -1)
 
     if world == 1:
         return out

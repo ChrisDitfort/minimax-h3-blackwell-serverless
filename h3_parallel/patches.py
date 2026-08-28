@@ -235,9 +235,9 @@ def make_parallel_adaptive_decode(original_adaptive_decode, collective):
     not an approximation of it.
     """
 
-    def adaptive_decode(self, z):
+    def adaptive_decode(self, z, *args, **kwargs):
         if not getattr(_STATE, "vae_decode", False) or collective.world_size == 1:
-            return original_adaptive_decode(self, z)
+            return original_adaptive_decode(self, z, *args, **kwargs)
 
         index = getattr(_STATE, "vae_chunk", 0)
         _STATE.vae_chunk = index + 1
@@ -246,7 +246,7 @@ def make_parallel_adaptive_decode(original_adaptive_decode, collective):
         meta = torch.zeros(2 + _MAX_DIMS, dtype=torch.int64, device=z.device)
         decoded = None
         if collective.rank == owner:
-            decoded = original_adaptive_decode(self, z)
+            decoded = original_adaptive_decode(self, z, *args, **kwargs)
             if decoded.dim() > _MAX_DIMS:
                 raise RuntimeError(
                     f"VAE chunk has {decoded.dim()} dimensions; the parallel decode path "
@@ -274,11 +274,13 @@ def make_parallel_adaptive_decode(original_adaptive_decode, collective):
 def make_parallel_vae_decode(original_decode):
     """Bracket a decode so chunk numbering restarts and can never drift between ranks."""
 
-    def decode(self, z):
+    def decode(self, z, *args, **kwargs):
+        # ComfyUI calls this as first_stage_model.decode(samples, **vae_options), so
+        # the wrapper has to be transparent to arguments it knows nothing about.
         _STATE.vae_decode = True
         _STATE.vae_chunk = 0
         try:
-            return original_decode(self, z)
+            return original_decode(self, z, *args, **kwargs)
         finally:
             _STATE.vae_decode = False
             _STATE.vae_chunk = 0
