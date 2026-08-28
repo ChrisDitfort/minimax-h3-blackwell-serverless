@@ -30,10 +30,10 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "New immutable tag to publish (e.g. dual-gpu-1). Must not be latest/code/staging-*."
+        description: "New immutable tag to publish. Blank uses DEFAULT_TAG below. Must not be latest/code/staging-*."
         type: string
         required: false
-        default: "dual-gpu-1"
+        default: ""
       base_tag:
         description: "Known-good image to take the model layers from."
         type: string
@@ -59,7 +59,7 @@ env:
   REGISTRY: ghcr.io
   IMAGE: ghcr.io/chrisditfort/minimax-h3-blackwell-serverless
   # A push event carries no inputs, so every input needs a fallback here.
-  DEFAULT_TAG: dual-gpu-1
+  DEFAULT_TAG: dual-gpu-2
   DEFAULT_BASE_TAG: latest
   DEFAULT_OLD_CODE_TAG: code
 
@@ -193,7 +193,6 @@ jobs:
       - name: Rebase the model layers onto the new code
         id: rebase
         env:
-          TAG: ${{ needs.build-code.outputs.tag }}
           BASE: ${{ steps.pin.outputs.base }}
           OLD_BASE: ${{ steps.pin.outputs.old_base }}
           NEW_BASE: ${{ needs.build-code.outputs.code_ref }}
@@ -203,10 +202,42 @@ jobs:
           # layers beneath them, so the experimental image differs from the known-good one
           # by this repository's source and nothing else.
           # The image to rebase is positional in current crane; --original was removed.
-          crane rebase "${BASE}" \
+          # Untagged on purpose: the result is not publishable until its config has been
+          # brought across too (next step), and tagging it here would burn the tag.
+          rebased=$(crane rebase "${BASE}" \
             --old_base "${OLD_BASE}" \
-            --new_base "${NEW_BASE}" \
-            -t "${IMAGE}:${TAG}"
+            --new_base "${NEW_BASE}")
+          echo "rebased=${rebased}" >> "$GITHUB_OUTPUT"
+          echo "Rebased image: ${rebased}"
+
+      - name: Carry the new image's environment defaults across
+        id: publish_tag
+        env:
+          TAG: ${{ needs.build-code.outputs.tag }}
+          REBASED: ${{ steps.rebase.outputs.rebased }}
+          NEW_BASE: ${{ needs.build-code.outputs.code_ref }}
+        run: |
+          set -euo pipefail
+          # crane rebase swaps layers but keeps the *original* image's config, so the
+          # Dockerfile's new ENV block does not survive it. Copy every H3_/NCCL_ variable
+          # off the freshly built code image rather than restating them here, so this step
+          # cannot drift away from the Dockerfile.
+          crane config "${NEW_BASE}" > /tmp/new-code-config.json
+          python3 - <<'PY' > /tmp/mutate-args
+          import json
+
+          config = json.load(open("/tmp/new-code-config.json"))["config"]
+          for entry in config.get("Env") or []:
+              if "=" not in entry:
+                  continue
+              key = entry.split("=", 1)[0]
+              if key.startswith("H3_") or key.startswith("NCCL_"):
+                  print("--env")
+                  print(entry)
+          PY
+          mapfile -t MUTATE_ARGS < /tmp/mutate-args
+          echo "Applying: ${MUTATE_ARGS[*]:-<none>}"
+          crane mutate "${REBASED}" "${MUTATE_ARGS[@]}" -t "${IMAGE}:${TAG}"
           digest=$(crane digest "${IMAGE}:${TAG}")
           echo "digest=${digest}" >> "$GITHUB_OUTPUT"
 
@@ -249,7 +280,7 @@ jobs:
       - name: Publish the result
         env:
           TAG: ${{ needs.build-code.outputs.tag }}
-          DIGEST: ${{ steps.rebase.outputs.digest }}
+          DIGEST: ${{ steps.publish_tag.outputs.digest }}
         run: |
           set -euo pipefail
           {
