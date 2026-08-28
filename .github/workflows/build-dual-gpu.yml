@@ -202,8 +202,8 @@ jobs:
           # Keeps the four 5-21 GB model layers byte-for-byte and swaps only the code
           # layers beneath them, so the experimental image differs from the known-good one
           # by this repository's source and nothing else.
-          crane rebase \
-            --original "${BASE}" \
+          # The image to rebase is positional in current crane; --original was removed.
+          crane rebase "${BASE}" \
             --old_base "${OLD_BASE}" \
             --new_base "${NEW_BASE}" \
             -t "${IMAGE}:${TAG}"
