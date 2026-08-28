@@ -92,6 +92,32 @@ RUN cd "$COMFY_DIR" \
 COPY handler.py /opt/serverless/handler.py
 COPY artifacts.py /opt/serverless/artifacts.py
 
+# Experimental multi-GPU execution. The package lives next to the handler so both the
+# handler process and every ComfyUI rank import the same copy; the one-file shim in
+# custom_nodes is how ComfyUI is told to load it, since that is the only directory it
+# scans. Nothing in it runs unless H3_GPU_MODE=dual - see the ENV block below.
+COPY h3_parallel /opt/serverless/h3_parallel
+COPY comfy_custom_nodes/h3_parallel_boot.py ${COMFY_DIR}/custom_nodes/h3_parallel_boot.py
+
+# GPU execution mode.
+#
+#   single  the known-good path this image has always run: one ComfyUI, one GPU, no
+#           patches applied to ComfyUI at all. This is the default, so releasing this
+#           image without setting anything behaves exactly like its predecessor.
+#   dual    one ComfyUI per GPU, one generation split across both by Ulysses sequence
+#           parallelism. Set H3_GPU_MODE=dual on the RunPod endpoint AND give the
+#           endpoint 2 GPUs per worker; the worker refuses to start if it is asked for
+#           dual and cannot deliver it.
+#
+# NCCL_DEBUG stays at WARN on purpose: INFO prints a screenful per collective, which
+# would bury the benchmark output the image exists to produce. Raise it on the endpoint
+# if a rollout needs diagnosing.
+ENV H3_GPU_MODE=single \
+    H3_SP_MASTER_PORT=29513 \
+    H3_SP_VAE=1 \
+    H3_SP_SELFTEST=1 \
+    NCCL_DEBUG=WARN
+
 WORKDIR /opt/serverless
 
 # Override the base image's Pod ENTRYPOINT. This is the whole point of the image: the

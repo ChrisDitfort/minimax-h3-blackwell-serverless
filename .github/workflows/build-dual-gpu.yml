@@ -1,0 +1,360 @@
+name: Build Experimental Dual-GPU Image
+
+# Publishes the experimental 2-GPU MiniMax H3 worker under a NEW immutable tag.
+#
+# It never touches :latest, :code or the staging-N tags, so the known-good image and the
+# rollback path this repository already relies on stay exactly where they are. Manual
+# dispatch only: an experimental image must never be published by pushing a branch.
+#
+# Two ways to get the models into the image:
+#
+#   rebase (default)  Take the known-good image, which already carries the four model
+#                     layers, and swap the code layers underneath them for freshly built
+#                     ones. Two minutes, no downloads, and the result provably differs
+#                     from the known-good image by nothing but this repository's code.
+#
+#   full_rebuild      Stream the four models from Hugging Face and append them to the new
+#                     code image, exactly as build.yml does. ~30 minutes and 42 GB. Use it
+#                     if the base image ever stops being rebasable.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "New immutable tag to publish (e.g. dual-gpu-1). Must not be latest/code/staging-*."
+        type: string
+        required: true
+      base_tag:
+        description: "Known-good image to take the model layers from."
+        type: string
+        default: "latest"
+      old_code_tag:
+        description: "The code image base_tag was built on. Only used by the rebase path."
+        type: string
+        default: "code"
+      full_rebuild:
+        description: "Re-download and append the four model layers instead of rebasing."
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build-dual-gpu
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: ghcr.io/chrisditfort/minimax-h3-blackwell-serverless
+
+jobs:
+  # ------------------------------------------------------------------------------------
+  # Stage 1: the slim code image, built from this branch, pushed to its own tag.
+  #
+  # Deliberately NOT :code. Overwriting :code would destroy the reference the rebase path
+  # needs to reconstruct the known-good image, which is the rollback story.
+  # ------------------------------------------------------------------------------------
+  build-code:
+    runs-on: ubuntu-latest
+    outputs:
+      code_ref: ${{ steps.record.outputs.code_ref }}
+      code_tag: ${{ steps.guard.outputs.code_tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Refuse to publish over a protected or existing tag
+        id: guard
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          case "$TAG" in
+            latest|code|staging-*|"")
+              echo "::error::Refusing to publish to '${TAG}'. That tag is the known-good image or part of its build chain."
+              exit 1
+              ;;
+          esac
+          if ! printf '%s' "$TAG" | grep -Eq '^[a-z0-9][a-z0-9._-]{0,62}$'; then
+            echo "::error::'${TAG}' is not a valid lowercase OCI tag."
+            exit 1
+          fi
+          echo "code_tag=code-${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Publishing experimental image to ${IMAGE}:${TAG}"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install crane
+        uses: imjasonh/setup-crane@v0.4
+
+      - name: Fail if the target tag already exists
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          # Immutability is the point: a benchmark run has to be attributable to exactly
+          # one image, so a tag is never reused.
+          if crane digest "${IMAGE}:${TAG}" >/dev/null 2>&1; then
+            echo "::error::${IMAGE}:${TAG} already exists. Pick a new tag; experimental tags are immutable."
+            exit 1
+          fi
+          echo "${IMAGE}:${TAG} is free."
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push the code image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ env.IMAGE }}:${{ steps.guard.outputs.code_tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+
+      - name: Record the immutable code digest
+        id: record
+        run: |
+          set -euo pipefail
+          ref="${IMAGE}@${{ steps.build.outputs.digest }}"
+          echo "code_ref=${ref}" >> "$GITHUB_OUTPUT"
+          echo "Code image: ${ref}"
+
+  # ------------------------------------------------------------------------------------
+  # Stage 2a: rebase the known-good image onto the new code layers (the fast path).
+  # ------------------------------------------------------------------------------------
+  rebase:
+    needs: build-code
+    if: ${{ inputs.full_rebuild != true }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install crane
+        uses: imjasonh/setup-crane@v0.4
+
+      - name: Log in to GHCR
+        run: |
+          set -euo pipefail
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+            | crane auth login "${REGISTRY}" -u "${{ github.actor }}" --password-stdin
+
+      - name: Pin the known-good image and its code base
+        id: pin
+        env:
+          BASE_TAG: ${{ inputs.base_tag }}
+          OLD_CODE_TAG: ${{ inputs.old_code_tag }}
+        run: |
+          set -euo pipefail
+          base_digest=$(crane digest "${IMAGE}:${BASE_TAG}")
+          old_code_digest=$(crane digest "${IMAGE}:${OLD_CODE_TAG}")
+          echo "base=${IMAGE}@${base_digest}"          >> "$GITHUB_OUTPUT"
+          echo "old_base=${IMAGE}@${old_code_digest}"  >> "$GITHUB_OUTPUT"
+          {
+            echo "### Rollback reference"
+            echo
+            echo '```'
+            echo "known-good : ${IMAGE}:${BASE_TAG}"
+            echo "digest     : ${base_digest}"
+            echo "code base  : ${IMAGE}:${OLD_CODE_TAG}"
+            echo "digest     : ${old_code_digest}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Rebase the model layers onto the new code
+        id: rebase
+        env:
+          TAG: ${{ inputs.tag }}
+          BASE: ${{ steps.pin.outputs.base }}
+          OLD_BASE: ${{ steps.pin.outputs.old_base }}
+          NEW_BASE: ${{ needs.build-code.outputs.code_ref }}
+        run: |
+          set -euo pipefail
+          # Keeps the four 5-21 GB model layers byte-for-byte and swaps only the code
+          # layers beneath them, so the experimental image differs from the known-good one
+          # by this repository's source and nothing else.
+          crane rebase \
+            --original "${BASE}" \
+            --old_base "${OLD_BASE}" \
+            --new_base "${NEW_BASE}" \
+            -t "${IMAGE}:${TAG}"
+          digest=$(crane digest "${IMAGE}:${TAG}")
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify the model layers survived the rebase
+        env:
+          TAG: ${{ inputs.tag }}
+          NEW_BASE: ${{ needs.build-code.outputs.code_ref }}
+        run: |
+          set -euo pipefail
+          crane manifest "${NEW_BASE}"      > /tmp/code-manifest.json
+          crane manifest "${IMAGE}:${TAG}"  > /tmp/final-manifest.json
+          python3 scripts/verify_model_layers.py \
+            --manifest /tmp/final-manifest.json \
+            --code-manifest /tmp/code-manifest.json \
+            --models models.tsv
+
+      - name: Verify the entrypoint and the default GPU mode
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          # A rebase that lost the handler entrypoint, or that shipped defaulting to dual,
+          # would be worse than no image at all.
+          crane config "${IMAGE}:${TAG}" > /tmp/config.json
+          python3 - <<'PY'
+          import json, sys
+          config = json.load(open("/tmp/config.json"))["config"]
+          entrypoint = config.get("Entrypoint") or []
+          env = dict(item.split("=", 1) for item in (config.get("Env") or []) if "=" in item)
+          problems = []
+          if entrypoint != ["python3", "/opt/serverless/handler.py"]:
+              problems.append(f"unexpected entrypoint {entrypoint}")
+          if env.get("H3_GPU_MODE") != "single":
+              problems.append(f"H3_GPU_MODE defaults to {env.get('H3_GPU_MODE')!r}, expected 'single'")
+          if problems:
+              sys.exit("image check failed: " + "; ".join(problems))
+          print("entrypoint and H3_GPU_MODE default are correct")
+          PY
+
+      - name: Publish the result
+        env:
+          TAG: ${{ inputs.tag }}
+          DIGEST: ${{ steps.rebase.outputs.digest }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### Experimental dual-GPU image"
+            echo
+            echo '```'
+            echo "${IMAGE}:${TAG}"
+            echo "${IMAGE}@${DIGEST}"
+            echo "source commit ${GITHUB_SHA}"
+            echo '```'
+            echo
+            echo "Release it on RunPod with 2 GPUs per worker and \`H3_GPU_MODE=dual\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Published ${IMAGE}:${TAG} (${DIGEST})"
+
+  # ------------------------------------------------------------------------------------
+  # Stage 2b: the from-scratch path. Same streaming append chain as build.yml, but every
+  # tag it touches is scoped to this experiment.
+  # ------------------------------------------------------------------------------------
+  append-models:
+    needs: build-code
+    if: ${{ inputs.full_rebuild == true }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free up runner disk
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost /usr/local/share/powershell \
+                      /usr/local/lib/node_modules /opt/hostedtoolcache || true
+          sudo docker image prune -af || true
+          df -h / /mnt || true
+
+      - name: Select work directory on the largest filesystem
+        id: work
+        run: |
+          set -euo pipefail
+          best_dir=""; best_free=0
+          for candidate in /mnt /home/runner /tmp; do
+            [ -d "$candidate" ] || continue
+            free=$(df -B1 --output=avail "$candidate" | tail -1 | tr -d ' ')
+            if [ "$free" -gt "$best_free" ]; then best_free=$free; best_dir=$candidate; fi
+          done
+          if [ "$best_free" -lt 50000000000 ]; then
+            echo "::error::Only $((best_free/1000000000)) GB free on $best_dir; need at least 50 GB."
+            exit 1
+          fi
+          work="${best_dir}/h3-build"
+          sudo mkdir -p "$work" && sudo chown "$(id -u):$(id -g)" "$work"
+          echo "dir=${work}" >> "$GITHUB_OUTPUT"
+
+      - name: Install crane
+        uses: imjasonh/setup-crane@v0.4
+
+      - name: Log in to GHCR
+        run: |
+          set -euo pipefail
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+            | crane auth login "${REGISTRY}" -u "${{ github.actor }}" --password-stdin
+
+      - name: Append model layers
+        env:
+          CODE_REF: ${{ needs.build-code.outputs.code_ref }}
+          WORK: ${{ steps.work.outputs.dir }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          export TMPDIR="${WORK}/tmp"
+          mkdir -p "$TMPDIR"
+
+          current="${CODE_REF}"
+          step=0
+          while IFS=$'\t' read -r name url dest size sha; do
+            case "$name" in ''|\#*) continue ;; esac
+            step=$((step + 1))
+            layer="${WORK}/${name}.tar"
+            # Experiment-scoped staging tags: build.yml's staging-N tags belong to the
+            # known-good chain and must not be disturbed.
+            staging="${IMAGE}:staging-${TAG}-${step}"
+
+            echo "::group::[${step}/4] ${name} -> /${dest}"
+            python3 scripts/build_model_layer.py \
+              --url "$url" --dest "$dest" --size "$size" --sha256 "$sha" --out "$layer"
+            crane append --base "$current" --new_layer "$layer" --new_tag "$staging"
+            rm -f "$layer"
+            current="$staging"
+            echo "::endgroup::"
+          done < models.tsv
+
+          if [ "$step" -ne 4 ]; then
+            echo "::error::Expected 4 model layers, appended ${step}."
+            exit 1
+          fi
+          echo "final_ref=${current}" >> "$GITHUB_ENV"
+
+      - name: Verify the final image structure
+        env:
+          CODE_REF: ${{ needs.build-code.outputs.code_ref }}
+        run: |
+          set -euo pipefail
+          crane manifest "${CODE_REF}"  > /tmp/code-manifest.json
+          crane manifest "${final_ref}" > /tmp/final-manifest.json
+          python3 scripts/verify_model_layers.py \
+            --manifest /tmp/final-manifest.json \
+            --code-manifest /tmp/code-manifest.json \
+            --models models.tsv
+
+      - name: Publish the result
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          crane tag "${final_ref}" "${TAG}"
+          digest=$(crane digest "${IMAGE}:${TAG}")
+          {
+            echo "### Experimental dual-GPU image (full rebuild)"
+            echo
+            echo '```'
+            echo "${IMAGE}:${TAG}"
+            echo "${IMAGE}@${digest}"
+            echo "source commit ${GITHUB_SHA}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Published ${IMAGE}:${TAG} (${digest})"

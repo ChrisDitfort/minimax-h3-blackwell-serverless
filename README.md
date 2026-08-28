@@ -292,6 +292,28 @@ Then compare **`pre_sampling`** and **`first_step`** between the two, on jobs wh
 `cold_process=true` in both. `sampling` and `per_step` should be unchanged; if they move,
 something other than residency changed and the comparison is not clean.
 
+## Experimental two-GPU execution
+
+This branch adds an opt-in path that splits **one** generation across **two** GPUs by
+sequence-parallelising the H3 transformer (Ulysses: shard the packed token sequence, switch
+to head-sharding inside attention with an all-to-all, switch back) and distributing the
+video VAE's temporal chunks. It is off by default — `H3_GPU_MODE=single` applies no patches
+to ComfyUI at all, so the image behaves exactly like its predecessor until it is asked not
+to.
+
+```
+H3_GPU_MODE=dual        # plus 2 GPUs per worker on the endpoint
+```
+
+A worker asked for `dual` that cannot deliver it **refuses to start** rather than quietly
+serving single-GPU results from an endpoint that believes it is measuring two. Every rank
+verifies sharded attention against unsharded attention on the real GPUs before it serves.
+
+Full design, log formats, failure modes and what is deliberately still serial:
+[`docs/dual-gpu-experiment.md`](docs/dual-gpu-experiment.md). Build it with the
+**"Build Experimental Dual-GPU Image"** workflow, which publishes to a new immutable tag
+and never touches `:latest`, `:code` or `staging-*`.
+
 ## Cloudflare Worker API (worker.js)
 
 `worker.js` is the public API in front of both RunPod endpoints. It owns the contract and

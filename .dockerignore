@@ -1,0 +1,22 @@
+# The build context only needs the worker: handler.py, artifacts.py, the h3_parallel
+# package and the ComfyUI shim. Everything else is either build-host clutter or belongs to
+# a different part of the system entirely.
+__pycache__/
+*.py[cod]
+.git/
+.github/
+.claude/
+.pytest_cache/
+.wrangler/
+tests/
+docs/
+client/
+examples/
+*.test.js
+worker.js
+wrangler.toml
+mint-tokens.mjs
+.env
+.env.*
+.dev.vars
+logs-*.txt

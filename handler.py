@@ -61,6 +61,12 @@ from artifacts import (
     redact,
 )
 
+# Experimental multi-GPU execution (H3_GPU_MODE=dual). Importing this here is inert: the
+# package only touches ComfyUI when it is imported *inside* a rank, which is the only place
+# H3_SP_RANK is set. In the handler it is just configuration and workflow rewriting.
+from h3_parallel import config as gpu_config
+from h3_parallel import shadow as shadow_graph
+
 # --------------------------------------------------------------------------------------
 # Configuration
 # --------------------------------------------------------------------------------------
@@ -137,6 +143,79 @@ _start_lock = threading.Lock()
 
 def log(message: str) -> None:
     print(f"[handler] {message}", flush=True)
+
+
+# --------------------------------------------------------------------------------------
+# Multi-GPU execution (experimental)
+# --------------------------------------------------------------------------------------
+#
+# In dual mode this container runs one ComfyUI per GPU:
+#
+#     handler.py (PID 1)
+#     +-- rank 0   CUDA_VISIBLE_DEVICES=0   127.0.0.1:8188   <- the only rank the
+#     |                                                          handler reads results from
+#     +-- rank 1   CUDA_VISIBLE_DEVICES=1   127.0.0.1:8189   <- shadow: holds up its half
+#                                                                of every collective
+#
+# Both ranks execute the same graph, in step, and split the packed token sequence between
+# them inside the DiT (see h3_parallel/ulysses.py). The shadow's copy of the workflow is
+# rewritten to stop at the VAE decodes, so only rank 0 ever produces a file.
+
+
+def _visible_cuda_devices() -> int:
+    """How many GPUs this container was actually scheduled. 0 if torch cannot say."""
+    try:
+        import torch
+
+        return torch.cuda.device_count() if torch.cuda.is_available() else 0
+    except Exception as error:  # pragma: no cover - torch is always present in the image
+        log(f"WARNING: could not count CUDA devices: {error}")
+        return 0
+
+
+# Resolved at import so every part of the handler can read it, but a failure is *carried*
+# rather than raised: main() logs it properly and exits, instead of the worker dying inside
+# an import traceback that says nothing about which environment variable was wrong.
+GPU_MODE_ERROR: Exception | None = None
+GPU_CONFIG: "gpu_config.GpuConfig | None" = None
+try:
+    GPU_CONFIG = gpu_config.resolve(device_count=_visible_cuda_devices())
+except Exception as _gpu_error:  # noqa: BLE001 - reported by main(), which then exits
+    GPU_MODE_ERROR = _gpu_error
+
+
+class ComfyRank:
+    """One ComfyUI process, pinned to one GPU."""
+
+    def __init__(self, rank: int) -> None:
+        self.rank = rank
+        self.port = gpu_config.comfy_port_for_rank(rank, COMFY_PORT)
+        self.url = f"http://{COMFY_HOST}:{self.port}"
+        self.process: subprocess.Popen | None = None
+        self.shadow = rank > 0
+        # Rank 0 keeps the paths the known-good image uses, so the single-GPU path and the
+        # dual-GPU path write to exactly the same places. Shadows get their own, which are
+        # emptied after every job.
+        self.output_dir = COMFY_OUTPUT_DIR if rank == 0 else f"{COMFY_OUTPUT_DIR}-rank{rank}"
+        self.temp_dir = COMFY_TEMP_DIR if rank == 0 else f"{COMFY_TEMP_DIR}-rank{rank}"
+        # A private user directory keeps two processes off one SQLite asset database.
+        self.user_dir = None if rank == 0 else f"/tmp/comfy-user-rank{rank}"
+
+    def is_ready(self) -> bool:
+        return _comfy_is_ready(self.url)
+
+    def gpu_status(self, timeout: float = 10.0) -> dict:
+        """Ask the rank's /h3/gpu route what it actually managed to set up."""
+        response = requests.get(f"{self.url}/h3/gpu", timeout=timeout)
+        response.raise_for_status()
+        return response.json()
+
+    def __repr__(self) -> str:  # pragma: no cover - diagnostics
+        return f"<ComfyRank {self.rank} port={self.port}>"
+
+
+_ranks: list[ComfyRank] = []
+_shadow_ranks: list[ComfyRank] = []
 
 
 # --------------------------------------------------------------------------------------
@@ -516,6 +595,12 @@ class JobTimer:
 
         fields = [
             f"proc={PROCESS_ID}",
+            # Which execution path produced this number. Without it a log line from the
+            # experimental image is indistinguishable from a single-GPU one, and the whole
+            # A/B comparison rests on being able to tell them apart.
+            f"gpu_mode={GPU_CONFIG.mode if GPU_CONFIG else 'unresolved'}",
+            f"gpu_count={GPU_CONFIG.world_size if GPU_CONFIG else '?'}",
+            f"strategy={GPU_CONFIG.strategy if GPU_CONFIG else 'unresolved'}",
             # First job in this process, so this job paid for the cold start.
             f"cold_process={'true' if job_index == 1 else 'false'}",
             f"job_in_proc={job_index}",
@@ -585,6 +670,11 @@ def emit_perf(timer: JobTimer, *, job_index: int, status: str) -> None:
             nodes = timer.node_summary()
             if nodes:
                 log(nodes)
+        # Separate line: it costs two loopback HTTP calls, which have no business inside
+        # JobTimer, and it only exists in dual mode.
+        gpu_fields = gpu_perf_fields()
+        if gpu_fields:
+            log("[perf] gpu " + " ".join(gpu_fields))
     except Exception as error:  # pragma: no cover - defensive only
         log(f"WARNING: could not emit perf summary: {error}")
 
@@ -725,9 +815,9 @@ def build_comfy_env() -> dict:
 # --------------------------------------------------------------------------------------
 
 
-def _comfy_is_ready() -> bool:
+def _comfy_is_ready(url: str = COMFY_URL) -> bool:
     try:
-        response = requests.get(f"{COMFY_URL}/system_stats", timeout=5)
+        response = requests.get(f"{url}/system_stats", timeout=5)
     except requests.RequestException:
         return False
     return response.ok
@@ -750,83 +840,193 @@ def parse_extra_args(raw: str) -> list[str]:
         return raw.split()
 
 
+def comfy_command(rank: ComfyRank) -> list[str]:
+    """The argv for one rank's ComfyUI. Rank 0's is byte-identical to single-GPU mode."""
+    command = [
+        sys.executable,
+        "main.py",
+        "--listen",
+        COMFY_HOST,  # localhost only: RunPod Serverless exposes no ports
+        "--port",
+        str(rank.port),
+        "--preview-method",
+        "none",  # previews waste VRAM and bandwidth in a headless worker
+        "--disable-auto-launch",
+        "--disable-metadata",
+        "--output-directory",
+        rank.output_dir,
+        "--temp-directory",
+        rank.temp_dir,
+        "--input-directory",
+        COMFY_INPUT_DIR,  # shared: a staged keyframe must be visible to every rank
+    ]
+    if rank.user_dir:
+        command += ["--user-directory", rank.user_dir]
+    command.extend(parse_extra_args(os.environ.get("COMFY_EXTRA_ARGS", "")))
+    return command
+
+
+def rank_env(rank: ComfyRank) -> dict:
+    """Environment for one rank: its GPU, its place in the group, its attention backend."""
+    env = build_comfy_env()
+    if GPU_CONFIG is None or not GPU_CONFIG.dual:
+        # Single mode must not leave a stale rank marker behind, or h3_parallel would try
+        # to join a group that nobody else is in.
+        env.pop("H3_SP_RANK", None)
+        return env
+
+    # One GPU each. Every rank then sees its own device as cuda:0, which is what lets
+    # ComfyUI's device handling and NCCL's rank-to-device mapping both stay conventional.
+    env["CUDA_VISIBLE_DEVICES"] = str(rank.rank)
+    env["H3_SP_RANK"] = str(rank.rank)
+    env["H3_SP_WORLD_SIZE"] = str(GPU_CONFIG.world_size)
+    env["H3_SP_MASTER_ADDR"] = GPU_CONFIG.master_addr
+    env["H3_SP_MASTER_PORT"] = str(GPU_CONFIG.master_port)
+    return env
+
+
+def _launch_rank(rank: ComfyRank) -> None:
+    for directory in (rank.output_dir, rank.temp_dir, COMFY_INPUT_DIR, rank.user_dir):
+        if not directory:
+            continue
+        try:
+            os.makedirs(directory, exist_ok=True)
+        except OSError as error:
+            log(f"WARNING: could not create {directory}: {error}")
+
+    command = comfy_command(rank)
+    env = rank_env(rank)
+    extra_args = parse_extra_args(os.environ.get("COMFY_EXTRA_ARGS", ""))
+    # Logged in full and on its own line so an A/B run can be attributed to the exact
+    # flags it used - `--highvram` in particular is invisible otherwise. The wording of
+    # the second line is what README's --highvram A/B recipe tells you to grep for.
+    log(f"Starting ComfyUI rank {rank.rank}: {' '.join(command)} (cwd={COMFY_DIR})")
+    log(
+        "ComfyUI effective args: "
+        f"COMFY_EXTRA_ARGS={os.environ.get('COMFY_EXTRA_ARGS', '<unset>')!r} "
+        f"-> extra={extra_args or '[]'}"
+    )
+    log(
+        f"ComfyUI rank {rank.rank} device: "
+        f"CUDA_VISIBLE_DEVICES={env.get('CUDA_VISIBLE_DEVICES', '<all>')}"
+    )
+    rank.process = subprocess.Popen(command, cwd=COMFY_DIR, env=env)
+
+
+def _verify_dual_ranks() -> None:
+    """Refuse to serve unless every rank says it really is running the parallel path.
+
+    ComfyUI swallows a custom node that raises during import, so a NCCL failure or a
+    self-test mismatch would otherwise leave two healthy-looking ComfyUIs that each
+    quietly compute the whole sequence - correct video, single-GPU speed, and a benchmark
+    number that means nothing. /h3/gpu is the rank's own account of what it managed to do.
+    """
+    for rank in _ranks:
+        try:
+            status = rank.gpu_status()
+        except Exception as error:
+            raise RuntimeError(
+                f"rank {rank.rank} did not answer /h3/gpu ({error}). The h3_parallel "
+                "custom node is not loaded in that ComfyUI, so dual mode is not active."
+            ) from error
+
+        if not status.get("ready"):
+            raise RuntimeError(
+                f"rank {rank.rank} reports the sequence-parallel path is NOT ready: "
+                f"{status.get('error') or status}"
+            )
+        patched = status.get("patched") or {}
+        if not (patched.get("dit") and patched.get("attention")):
+            raise RuntimeError(
+                f"rank {rank.rank} came up but the H3 model was not patched ({patched}). "
+                "It would run the full sequence on one GPU."
+            )
+        log(
+            f"[H3-GPU] rank {rank.rank} verified: strategy={status.get('strategy')} "
+            f"world_size={status.get('world_size')} patched={patched} "
+            f"selftest={status.get('selftest')}"
+        )
+
+
 def start_comfyui() -> None:
-    """Start ComfyUI once and block until it genuinely answers HTTP.
+    """Start every rank's ComfyUI and block until they all genuinely answer HTTP.
 
     Serialised behind a lock because RunPod may hand us concurrent jobs, and re-entrant
     starts would race two ComfyUI processes onto the same port.
+
+    In dual mode this is also where the NCCL group forms: each rank blocks inside its
+    custom-node import until its peer arrives, so a rank answering /system_stats already
+    proves the group came up.
     """
-    global _comfy_process, _comfy_boot_seconds
+    global _comfy_process, _comfy_boot_seconds, _ranks, _shadow_ranks
 
     with _start_lock:
-        if _comfy_process is not None and _comfy_process.poll() is None and _comfy_is_ready():
+        if _ranks and all(
+            rank.process is not None and rank.process.poll() is None and rank.is_ready()
+            for rank in _ranks
+        ):
             return
 
-        if _comfy_process is not None and _comfy_process.poll() is not None:
-            log(f"ComfyUI exited with code {_comfy_process.returncode}; restarting it.")
-            _comfy_process = None
+        for rank in _ranks:
+            if rank.process is not None and rank.process.poll() is not None:
+                log(
+                    f"ComfyUI rank {rank.rank} exited with code {rank.process.returncode}; "
+                    "restarting the whole group."
+                )
+                _stop_ranks()
+                break
 
         # Covers the wait even when we join a start already in flight, so comfy_boot
         # reflects time-to-ready rather than time-since-fork.
         boot_began = time.monotonic()
 
-        if _comfy_process is None:
-            for directory in (COMFY_OUTPUT_DIR, COMFY_TEMP_DIR, COMFY_INPUT_DIR):
-                try:
-                    os.makedirs(directory, exist_ok=True)
-                except OSError as error:
-                    log(f"WARNING: could not create {directory}: {error}")
-
-            command = [
-                sys.executable,
-                "main.py",
-                "--listen",
-                COMFY_HOST,  # localhost only: RunPod Serverless exposes no ports
-                "--port",
-                str(COMFY_PORT),
-                "--preview-method",
-                "none",  # previews waste VRAM and bandwidth in a headless worker
-                "--disable-auto-launch",
-                "--disable-metadata",
-                "--output-directory",
-                COMFY_OUTPUT_DIR,
-                "--temp-directory",
-                COMFY_TEMP_DIR,
-                "--input-directory",
-                COMFY_INPUT_DIR,
-            ]
-            extra_args = parse_extra_args(os.environ.get("COMFY_EXTRA_ARGS", ""))
-            command.extend(extra_args)
-
-            # Logged in full and on its own line so an A/B run can be attributed to the
-            # exact flags it used - `--highvram` in particular is invisible otherwise.
-            log(f"Starting ComfyUI: {' '.join(command)} (cwd={COMFY_DIR})")
-            log(
-                "ComfyUI effective args: "
-                f"COMFY_EXTRA_ARGS={os.environ.get('COMFY_EXTRA_ARGS', '<unset>')!r} "
-                f"-> extra={extra_args or '[]'}"
-            )
-            # Resolved here, not at import: the GPU is only knowable once the worker is
-            # actually placed on a host.
-            _comfy_process = subprocess.Popen(command, cwd=COMFY_DIR, env=build_comfy_env())
+        if not _ranks or all(rank.process is None for rank in _ranks):
+            world = GPU_CONFIG.world_size if (GPU_CONFIG and GPU_CONFIG.dual) else 1
+            _ranks = [ComfyRank(index) for index in range(world)]
+            _shadow_ranks = [rank for rank in _ranks if rank.shadow]
+            for rank in _ranks:
+                _launch_rank(rank)
+            _comfy_process = _ranks[0].process
 
         deadline = time.monotonic() + COMFY_STARTUP_TIMEOUT
         while time.monotonic() < deadline:
-            if _comfy_process.poll() is not None:
-                code = _comfy_process.returncode
-                _comfy_process = None
-                raise RuntimeError(
-                    f"ComfyUI exited during startup with code {code}. "
-                    "Check the ComfyUI log above for the underlying error."
-                )
-            if _comfy_is_ready():
+            for rank in _ranks:
+                if rank.process is not None and rank.process.poll() is not None:
+                    code = rank.process.returncode
+                    _stop_ranks()
+                    raise RuntimeError(
+                        f"ComfyUI rank {rank.rank} exited during startup with code {code}. "
+                        "Check the ComfyUI log above for the underlying error."
+                    )
+            if all(rank.is_ready() for rank in _ranks):
                 elapsed = time.monotonic() - boot_began
                 _comfy_boot_seconds = elapsed
-                log(f"ComfyUI is ready after ~{elapsed:.1f}s")
+                log(f"ComfyUI is ready after ~{elapsed:.1f}s ({len(_ranks)} rank(s))")
+                if GPU_CONFIG is not None and GPU_CONFIG.dual:
+                    _verify_dual_ranks()
                 return
             time.sleep(1)
 
+        _stop_ranks()
         raise RuntimeError(f"ComfyUI did not become ready within {COMFY_STARTUP_TIMEOUT}s")
+
+
+def _stop_ranks() -> None:
+    """Terminate every rank. Used on a failed start and on shutdown."""
+    global _comfy_process
+    for rank in _ranks:
+        process = rank.process
+        rank.process = None
+        if process is None or process.poll() is not None:
+            continue
+        try:
+            process.terminate()
+            process.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            process.kill()
+        except Exception as error:  # pragma: no cover - defensive
+            log(f"WARNING: could not stop rank {rank.rank}: {error}")
+    _comfy_process = None
 
 
 # --------------------------------------------------------------------------------------
@@ -839,6 +1039,11 @@ class WorkflowError(RuntimeError):
 
 
 def queue_prompt(workflow: dict, client_id: str) -> str:
+    # Shadows first. They only ever wait for rank 0, never the other way round, so telling
+    # them last would put a needless gap at the front of every job - and if a shadow
+    # rejects the graph we want to know before rank 0 has started spending GPU seconds.
+    _queue_on_shadows(workflow, client_id)
+
     response = requests.post(
         f"{COMFY_URL}/prompt",
         json={"prompt": workflow, "client_id": client_id},
@@ -859,6 +1064,103 @@ def queue_prompt(workflow: dict, client_id: str) -> str:
     if not prompt_id:
         raise WorkflowError(f"ComfyUI did not return a prompt_id: {payload}")
     return prompt_id
+
+
+def _queue_on_shadows(workflow: dict, client_id: str) -> None:
+    """Give every shadow rank its own copy of the graph, minus the file-producing tail."""
+    if not _shadow_ranks:
+        return
+
+    shadow, description = shadow_graph.build_shadow_workflow(workflow)
+    for rank in _shadow_ranks:
+        try:
+            response = requests.post(
+                f"{rank.url}/prompt",
+                json={"prompt": shadow, "client_id": client_id},
+                timeout=60,
+            )
+        except requests.RequestException as error:
+            raise WorkflowError(
+                f"Could not submit the workflow to rank {rank.rank} ({error}). Rank 0 "
+                "would deadlock on the first collective, so the job is refused instead."
+            ) from error
+
+        if response.status_code >= 400:
+            try:
+                detail = response.json()
+            except ValueError:
+                detail = response.text
+            raise WorkflowError(
+                f"Rank {rank.rank} rejected the shadow workflow ({description}): "
+                f"{json.dumps(detail, default=str)}"
+            )
+    log(f"Queued the shadow workflow on {len(_shadow_ranks)} rank(s): {description}")
+
+
+def _drain_shadow_ranks(reason: str) -> None:
+    """Interrupt shadows and empty their scratch directories.
+
+    Runs after every job, successful or not. Two jobs' worth of reasons:
+
+      * a shadow that is still executing when the next job arrives would answer the next
+        job's collectives with the previous job's tensors; and
+      * even with the sink rewrite, an unrecognised output node in a caller's workflow
+        could still leave a rendered file on a shadow's disk. Under Confidential
+        Generation that would be a second plaintext copy of the customer's video, so it
+        is deleted on the same job boundary as rank 0's plaintext.
+    """
+    for rank in _shadow_ranks:
+        try:
+            requests.post(f"{rank.url}/interrupt", timeout=10)
+        except requests.RequestException as error:
+            log(f"WARNING: could not interrupt rank {rank.rank} ({reason}): {error}")
+        for directory in (rank.output_dir, rank.temp_dir):
+            _empty_directory(directory)
+
+
+def _empty_directory(path: str) -> None:
+    """Remove everything inside a directory this handler owns, keeping the directory."""
+    try:
+        if not os.path.isdir(path):
+            return
+        for name in os.listdir(path):
+            target = os.path.join(path, name)
+            if os.path.islink(target) or os.path.isfile(target):
+                os.remove(target)
+            elif os.path.isdir(target):
+                shutil.rmtree(target, ignore_errors=True)
+    except OSError as error:
+        log(f"WARNING: could not empty {path}: {error}")
+
+
+def gpu_perf_fields() -> list[str]:
+    """Per-rank peak VRAM for the [perf] line, read from each rank's own /h3/gpu route."""
+    if GPU_CONFIG is None or not GPU_CONFIG.dual:
+        return []
+
+    fields: list[str] = []
+    for rank in _ranks:
+        try:
+            status = rank.gpu_status(timeout=5)
+        except Exception as error:  # pragma: no cover - a metric must never fail a job
+            fields.append(f"gpu{rank.rank}_vram=unavailable")
+            log(f"WARNING: could not read rank {rank.rank} VRAM: {error}")
+            continue
+        for device in status.get("devices") or []:
+            fields.append(
+                f"gpu{rank.rank}_peak_alloc_mb={device.get('peak_allocated_mb')} "
+                f"gpu{rank.rank}_peak_reserved_mb={device.get('peak_reserved_mb')}"
+            )
+    return fields
+
+
+def reset_gpu_peaks() -> None:
+    """Zero every rank's peak-memory counters so the next job's numbers are its own."""
+    for rank in _ranks:
+        try:
+            requests.get(f"{rank.url}/h3/gpu", params={"reset": "1"}, timeout=5)
+        except Exception:  # pragma: no cover - best effort
+            pass
 
 
 def get_history(prompt_id: str) -> dict:
@@ -2249,6 +2551,10 @@ def handler(job: dict) -> dict:
         # Always runs, so a failed or rejected job cannot orphan staged input images.
         for path in staged_assets:
             cleanup_input_image(path)
+        # Shadow ranks are stopped and swept on the same boundary as rank 0's plaintext:
+        # nothing job-specific may survive into the next request on a warm worker.
+        if _shadow_ranks:
+            _drain_shadow_ranks(reason=status)
         # The key was request-scoped; it stops being reachable here. See the "Secrets in
         # memory" section of docs/confidential-generation.md for what this is and is not
         # worth - CPython cannot promise every copy is gone.
@@ -2358,17 +2664,22 @@ def build_preload_workflow() -> dict:
 
 
 def _interrupt_comfy() -> None:
-    """Ask ComfyUI to abandon the running prompt.
+    """Ask every rank to abandon the running prompt.
+
+    Every rank, not just rank 0: leaving a shadow mid-graph would have it answer the next
+    job's collectives with this job's tensors.
 
     Used when the preload overruns its timeout: without this the synthetic prompt keeps
     running and the first real job queues behind it, which would be strictly worse than
     not preloading at all.
     """
-    try:
-        requests.post(f"{COMFY_URL}/interrupt", timeout=10)
-        log("Preload: sent /interrupt to ComfyUI.")
-    except Exception as error:
-        log(f"WARNING: could not interrupt ComfyUI after preload timeout: {error}")
+    targets = [rank.url for rank in _ranks] or [COMFY_URL]
+    for url in targets:
+        try:
+            requests.post(f"{url}/interrupt", timeout=10)
+        except Exception as error:
+            log(f"WARNING: could not interrupt ComfyUI at {url} after preload timeout: {error}")
+    log(f"Preload: sent /interrupt to {len(targets)} rank(s).")
 
 
 # Which node class stands in for which component, for the preload timing line.
@@ -2442,12 +2753,9 @@ def run_flashboot_preload() -> float | None:
 
 def _shutdown(signum, _frame) -> None:
     log(f"Received signal {signum}; stopping ComfyUI.")
-    if _comfy_process is not None and _comfy_process.poll() is None:
-        _comfy_process.terminate()
-        try:
-            _comfy_process.wait(timeout=20)
-        except subprocess.TimeoutExpired:
-            _comfy_process.kill()
+    # Every rank, not just rank 0: a surviving shadow would hold its GPU and its half of
+    # the NCCL group open after the worker is supposed to be gone.
+    _stop_ranks()
     sys.exit(0)
 
 
@@ -2457,6 +2765,20 @@ def main() -> None:
     log_callback_configuration()
     log(f"COMFY_DIR = {COMFY_DIR}")
     log_torch_environment()
+
+    # The GPU execution plan, before anything else can depend on it. A dual-mode request
+    # that cannot be honoured stops the worker here: quietly serving single-GPU results
+    # from an endpoint configured for a two-GPU benchmark would poison the measurement
+    # this image exists to produce.
+    if GPU_MODE_ERROR is not None:
+        log(f"FATAL: {GPU_MODE_ERROR}")
+        raise SystemExit(1)
+    log(GPU_CONFIG.describe())
+    if GPU_CONFIG.dual:
+        log(
+            f"[H3-GPU] launching {GPU_CONFIG.world_size} ComfyUI ranks on ports "
+            f"{[gpu_config.comfy_port_for_rank(r, COMFY_PORT) for r in range(GPU_CONFIG.world_size)]}"
+        )
 
     # Fail fast on misconfigured output storage rather than at the end of a paid 5-minute
     # generation. Validates R2 credentials and the key-wrapping key at boot.
@@ -2470,6 +2792,13 @@ def main() -> None:
         try:
             start_comfyui()
         except Exception as error:
+            if GPU_CONFIG.dual:
+                # In single mode a failed eager start is recoverable - the first job just
+                # pays for the boot. In dual mode it means the group never formed, and the
+                # only thing a retry could produce is an unlabelled single-GPU benchmark.
+                log(f"FATAL: dual-GPU start failed: {error}")
+                _stop_ranks()
+                raise SystemExit(1) from error
             log(f"WARNING: eager ComfyUI start failed ({error}); will retry on first job.")
 
     # The preload runs after ComfyUI is ready and before the serverless loop starts, so
@@ -2483,8 +2812,14 @@ def main() -> None:
     else:
         log("FlashBoot preload disabled")
 
+    # The preload's staging is not the first job's memory, so its peaks must not be
+    # attributed to it.
+    reset_gpu_peaks()
+
     startup_fields = [
         f"proc={PROCESS_ID}",
+        f"gpu_mode={GPU_CONFIG.mode}",
+        f"gpu_count={GPU_CONFIG.world_size}",
         f"to_serverless_ready={_secs(time.monotonic() - _PROCESS_START)}",
         f"comfy_boot={_secs(_comfy_boot_seconds)}",
         f"preload_enabled={'true' if PRELOAD_ENABLED else 'false'}",
