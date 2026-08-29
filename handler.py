@@ -1143,6 +1143,56 @@ class WorkflowError(RuntimeError):
     """A workflow was rejected or failed inside ComfyUI (a user/job error, not a bug)."""
 
 
+#: How much of a server-supplied error string is worth keeping. Long enough to diagnose,
+#: short enough that an unbounded body - an HTML proxy page, a stack trace - cannot be
+#: dumped into a log line or a RunPod job result.
+MAX_ERROR_CHARS = 300
+
+
+def _clip(value, limit: int = MAX_ERROR_CHARS) -> str:
+    text = str(value)
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}... [+{len(text) - limit} chars]"
+
+
+def summarise_comfy_rejection(detail) -> str:
+    """Say why ComfyUI rejected a workflow without quoting the workflow back.
+
+    ComfyUI's 400 body describes each failing input with `details` and
+    `extra_info.received_value`, and both of those are the node's *actual argument value*.
+    For MiniMaxH3ImageToVideo that argument is the user's prompt, so interpolating the
+    body wholesale put plaintext user content into three places at once: the container log,
+    the RunPod job result, and the progress callback.
+
+    Only the fields that answer "which node, and why" are kept. That is everything an
+    operator needs and nothing the caller wrote.
+    """
+    if not isinstance(detail, dict):
+        return _clip(detail)
+
+    parts: list[str] = []
+    top = detail.get("error")
+    if isinstance(top, dict):
+        parts.append(f"{top.get('type')}: {_clip(top.get('message'), 200)}")
+    elif top:
+        parts.append(_clip(top, 200))
+
+    for node_id, node in (detail.get("node_errors") or {}).items():
+        if not isinstance(node, dict):
+            continue
+        class_type = node.get("class_type", "?")
+        for failure in node.get("errors") or []:
+            if not isinstance(failure, dict):
+                continue
+            parts.append(
+                f"node #{node_id} ({class_type}): {failure.get('type')} - "
+                f"{_clip(failure.get('message'), 200)}"
+            )
+
+    return "; ".join(parts) if parts else "no diagnostic detail in the response"
+
+
 def queue_prompt(workflow: dict, client_id: str) -> str:
     # Shadows first. They only ever wait for rank 0, never the other way round, so telling
     # them last would put a needless gap at the front of every job - and if a shadow
@@ -1162,7 +1212,9 @@ def queue_prompt(workflow: dict, client_id: str) -> str:
             detail = response.json()
         except ValueError:
             detail = response.text
-        raise WorkflowError(f"ComfyUI rejected the workflow: {json.dumps(detail, default=str)}")
+        raise WorkflowError(
+            f"ComfyUI rejected the workflow: {summarise_comfy_rejection(detail)}"
+        )
 
     payload = response.json()
     prompt_id = payload.get("prompt_id")
@@ -1197,7 +1249,7 @@ def _queue_on_shadows(workflow: dict, client_id: str) -> None:
                 detail = response.text
             raise WorkflowError(
                 f"Rank {rank.rank} rejected the shadow workflow ({description}): "
-                f"{json.dumps(detail, default=str)}"
+                f"{summarise_comfy_rejection(detail)}"
             )
     log(f"Queued the shadow workflow on {len(_shadow_ranks)} rank(s): {description}")
 
@@ -1291,10 +1343,21 @@ def _raise_if_history_failed(history: dict, prompt_id: str) -> None:
             raise WorkflowError(
                 "ComfyUI execution failed in node "
                 f"{detail.get('node_type')} (#{detail.get('node_id')}): "
-                f"{detail.get('exception_type')}: {detail.get('exception_message')}"
+                f"{detail.get('exception_type')}: "
+                f"{_clip(detail.get('exception_message'))}"
             )
 
-    raise WorkflowError(f"ComfyUI reported a failed execution for prompt {prompt_id}: {status}")
+    # Message *kinds*, never their payloads: a status message body is server-controlled
+    # and has already been seen to carry node inputs.
+    kinds = [
+        entry[0] for entry in (status.get("messages") or [])
+        if isinstance(entry, (list, tuple)) and entry
+    ]
+    raise WorkflowError(
+        f"ComfyUI reported a failed execution for prompt {prompt_id}: "
+        f"status={status.get('status_str')!r} completed={status.get('completed')} "
+        f"messages={kinds}"
+    )
 
 
 # Node classes that mean the graph has moved past sampling into decode/encode work.
