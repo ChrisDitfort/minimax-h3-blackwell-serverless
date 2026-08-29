@@ -8,13 +8,13 @@ name: Build Experimental Dual-GPU Image
 #
 # Two ways to get the models into the image:
 #
-#   rebase (default)  Take the known-good image, which already carries the four model
+#   rebase (default)  Take the known-good image, which already carries all model
 #                     layers, and swap the code layers underneath them for freshly built
 #                     ones. Two minutes, no downloads, and the result provably differs
 #                     from the known-good image by nothing but this repository's code.
 #
-#   full_rebuild      Stream the four models from Hugging Face and append them to the new
-#                     code image, exactly as build.yml does. ~30 minutes and 42 GB. Use it
+#   full_rebuild      Stream every file in models.tsv from Hugging Face and append it to
+#                     the new code image, exactly as build.yml does. Use it
 #                     if the base image ever stops being rebasable.
 
 # `push` on the experiment branch as well as manual dispatch, and deliberately so:
@@ -27,6 +27,8 @@ on:
   push:
     branches:
       - dual-gpu-experiment
+    paths-ignore:
+      - "docs/**"
   workflow_dispatch:
     inputs:
       tag:
@@ -37,13 +39,13 @@ on:
       base_tag:
         description: "Known-good image to take the model layers from."
         type: string
-        default: "latest"
+        default: "multimodal-1"
       old_code_tag:
         description: "The code image base_tag was built on. Only used by the rebase path."
         type: string
-        default: "code"
+        default: "code-multimodal-1"
       full_rebuild:
-        description: "Re-download and append the four model layers instead of rebasing."
+        description: "Re-download and append every models.tsv layer instead of rebasing."
         type: boolean
         default: false
 
@@ -59,7 +61,7 @@ env:
   REGISTRY: ghcr.io
   IMAGE: ghcr.io/chrisditfort/minimax-h3-blackwell-serverless
   # A push event carries no inputs, so every input needs a fallback here.
-  DEFAULT_TAG: multimodal-2
+  DEFAULT_TAG: multimodal-3
   DEFAULT_BASE_TAG: multimodal-1
   DEFAULT_OLD_CODE_TAG: code-multimodal-1
   # multimodal-1 now carries every weight in models.tsv, so a rebase is the right way to
@@ -144,6 +146,10 @@ jobs:
           context: .
           push: true
           tags: ${{ env.IMAGE }}:${{ steps.guard.outputs.code_tag }}
+          build-args: |
+            H3_BUILD_SOURCE_COMMIT=${{ github.sha }}
+            H3_BUILD_IMAGE_TAG=${{ steps.guard.outputs.tag }}
+            H3_BUILD_ID=${{ github.run_id }}-${{ github.run_attempt }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: false
@@ -208,7 +214,7 @@ jobs:
           NEW_BASE: ${{ needs.build-code.outputs.code_ref }}
         run: |
           set -euo pipefail
-          # Keeps the four 5-21 GB model layers byte-for-byte and swaps only the code
+          # Keeps the large model layers byte-for-byte and swaps only the code
           # layers beneath them, so the experimental image differs from the known-good one
           # by this repository's source and nothing else.
           # The image to rebase is positional in current crane; --original was removed.
@@ -241,7 +247,8 @@ jobs:
               if "=" not in entry:
                   continue
               key = entry.split("=", 1)[0]
-              if key.startswith("H3_") or key.startswith("NCCL_"):
+              if (key.startswith("H3_") or key.startswith("NCCL_")
+                      or key == "COMFYUI_H3_COMMIT"):
                   print("--env")
                   print(entry)
           PY
@@ -374,7 +381,7 @@ jobs:
             # known-good chain and must not be disturbed.
             staging="${IMAGE}:staging-${TAG}-${step}"
 
-            echo "::group::[${step}/4] ${name} -> /${dest}"
+            echo "::group::[${step}] ${name} -> /${dest}"
             python3 scripts/build_model_layer.py \
               --url "$url" --dest "$dest" --size "$size" --sha256 "$sha" --out "$layer"
             crane append --base "$current" --new_layer "$layer" --new_tag "$staging"

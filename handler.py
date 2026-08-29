@@ -1659,18 +1659,30 @@ def _assert_fetchable_url(url: str) -> None:
             )
 
 
-def _download_image(url: str, bearer_token: str | None = None) -> bytes:
-    """Fetch an image over HTTPS, validating every redirect hop and capping the size.
+def _download_image(
+    url: str,
+    bearer_token: str | None = None,
+    *,
+    max_bytes: int = MAX_IMAGE_BYTES,
+    accept: str = "image/*",
+    what: str = "image_url",
+) -> bytes:
+    """Fetch a reference over HTTPS, validating every redirect hop and capping the size.
 
     `bearer_token` is the job-scoped credential for the Worker's internal asset route. It
     is sent only on the first hop: a redirect can point anywhere, and forwarding the token
     across it would hand a job credential to whatever host the redirect names.
+
+    `max_bytes` and `accept` are parameters rather than the image constants because video
+    and audio references come through here too. Sending `Accept: image/*` for a video is a
+    request a strict origin is entitled to refuse, and capping a 256 MB video at the 32 MB
+    image limit would reject a reference this worker advertises as supported.
     """
     current = url
     for hop in range(MAX_IMAGE_REDIRECTS + 1):
         _assert_fetchable_url(current)
 
-        headers = {"Accept": "image/*"}
+        headers = {"Accept": accept}
         if bearer_token and hop == 0:
             # Both credentials are first-hop only. A redirect can point anywhere, and
             # forwarding either one across it would hand a credential to that host.
@@ -1679,13 +1691,19 @@ def _download_image(url: str, bearer_token: str | None = None) -> bytes:
 
         # Redirects are followed manually so each destination is re-validated; letting
         # requests follow them would let a redirect land on an internal address.
-        response = requests.get(
-            current,
-            timeout=IMAGE_DOWNLOAD_TIMEOUT,
-            stream=True,
-            allow_redirects=False,
-            headers=headers,
-        )
+        try:
+            response = requests.get(
+                current,
+                timeout=IMAGE_DOWNLOAD_TIMEOUT,
+                stream=True,
+                allow_redirects=False,
+                headers=headers,
+            )
+        except requests.RequestException as error:
+            # requests includes the full URL in many exception strings. Asset URLs can
+            # contain job-scoped paths or query credentials, so preserve the cause only
+            # for local traceback chaining and return a role-only message.
+            raise ImageInputError(f"Downloading {what} failed.") from error
 
         if response.is_redirect or response.is_permanent_redirect:
             location = response.headers.get("Location")
@@ -1699,13 +1717,12 @@ def _download_image(url: str, bearer_token: str | None = None) -> bytes:
 
         with response:
             if not response.ok:
-                raise ImageInputError(f"Downloading image_url returned HTTP {response.status_code}.")
+                raise ImageInputError(f"Downloading {what} returned HTTP {response.status_code}.")
 
             declared = response.headers.get("Content-Length")
-            if declared and declared.isdigit() and int(declared) > MAX_IMAGE_BYTES:
+            if declared and declared.isdigit() and int(declared) > max_bytes:
                 raise ImageInputError(
-                    f"image_url advertises {declared} bytes, over the "
-                    f"{MAX_IMAGE_BYTES}-byte limit (H3_MAX_IMAGE_BYTES)."
+                    f"{what} advertises {declared} bytes, over the {max_bytes}-byte limit."
                 )
 
             chunks = bytearray()
@@ -1713,17 +1730,16 @@ def _download_image(url: str, bearer_token: str | None = None) -> bytes:
                 chunks.extend(chunk)
                 # Enforce the cap while streaming: a lying Content-Length must not let an
                 # unbounded body into memory.
-                if len(chunks) > MAX_IMAGE_BYTES:
+                if len(chunks) > max_bytes:
                     raise ImageInputError(
-                        f"image_url body exceeded the {MAX_IMAGE_BYTES}-byte limit "
-                        "(H3_MAX_IMAGE_BYTES)."
+                        f"{what} body exceeded the {max_bytes}-byte limit."
                     )
             return bytes(chunks)
 
-    raise ImageInputError("Too many redirects while fetching image_url.")
+    raise ImageInputError(f"Too many redirects while fetching {what}.")
 
 
-def _decode_base64_image(value: str) -> bytes:
+def _decode_base64_image(value: str, *, max_bytes: int = MAX_IMAGE_BYTES) -> bytes:
     """Decode base64 image input, accepting an optional data: URI prefix.
 
     The payload itself is never logged.
@@ -1740,10 +1756,9 @@ def _decode_base64_image(value: str) -> bytes:
 
     payload = "".join(payload.split())
     # Reject before decoding: base64 inflates by 4/3, so this bounds the decoded size too.
-    if len(payload) > (MAX_IMAGE_BYTES // 3) * 4 + 4:
+    if len(payload) > (max_bytes // 3) * 4 + 4:
         raise ImageInputError(
-            f"image_base64 decodes to more than the {MAX_IMAGE_BYTES}-byte limit "
-            "(H3_MAX_IMAGE_BYTES)."
+            f"inline reference data decodes to more than the {max_bytes}-byte limit."
         )
 
     try:
@@ -1903,7 +1918,13 @@ def _write_staged_image(data: bytes, extension: str) -> str:
     return path
 
 
-def _fetch_asset_bytes(spec: dict, role: str) -> bytes:
+def _fetch_asset_bytes(
+    spec: dict,
+    role: str,
+    *,
+    max_bytes: int = MAX_IMAGE_BYTES,
+    accept: str = "image/*",
+) -> bytes:
     """Read one asset's bytes from whichever source it declares.
 
     `url` covers both a plain https image and the Worker's job-scoped asset route - the
@@ -1923,11 +1944,13 @@ def _fetch_asset_bytes(spec: dict, role: str) -> bytes:
         if token is not None and not isinstance(token, str):
             raise ImageInputError(f"{role}: token must be a string.")
         log(f"Fetching {role} from url")
-        return _download_image(url, bearer_token=token)
+        return _download_image(
+            url, bearer_token=token, max_bytes=max_bytes, accept=accept, what=role
+        )
 
     if data_b64:
         log(f"Decoding {role} from base64")
-        return _decode_base64_image(data_b64)
+        return _decode_base64_image(data_b64, max_bytes=max_bytes)
 
     raise ImageInputError(f"{role}: no url or base64 supplied.")
 
@@ -2568,8 +2591,26 @@ def _staged_name(job_dir: str, filename: str, kind: str) -> str:
     return path
 
 
+def _require_reference_source(reference, kind: str) -> None:
+    """A reference has to say where its bytes are, and say it exactly once."""
+    sources = [bool(reference.url), bool(reference.data_base64)]
+    if not any(sources):
+        raise privora_errors.PrivoraError(
+            privora_errors.INVALID_REFERENCE_TYPE,
+            f"Each {kind} reference needs a url or inline data.",
+            {"type": kind, "accepted": ["url", "data"]},
+        )
+    if all(sources):
+        raise privora_errors.PrivoraError(
+            privora_errors.INVALID_REFERENCE_TYPE,
+            f"A {kind} reference must carry either url or data, not both.",
+            {"type": kind},
+        )
+
+
 def _stage_image_reference(reference, job_dir: str) -> str:
     """Reuses the hardened image path: magic bytes, Pillow decode, pixel and byte caps."""
+    _require_reference_source(reference, "image")
     data = _fetch_asset_bytes(
         {"url": reference.url, "base64": reference.data_base64, "token": reference.token},
         "reference image",
@@ -2589,9 +2630,15 @@ def _stage_media_reference(reference, kind: str, job_dir: str) -> str:
     reaches the filesystem, which is what makes traversal and cross-job collision
     impossible rather than merely unlikely.
     """
+    _require_reference_source(reference, kind)
+    limit = (
+        privora_media.MAX_VIDEO_BYTES if kind == "video" else privora_media.MAX_AUDIO_BYTES
+    )
     data = _fetch_asset_bytes(
         {"url": reference.url, "base64": reference.data_base64, "token": reference.token},
         "reference " + kind,
+        max_bytes=limit,
+        accept=("video/*" if kind == "video" else "audio/*") + ", application/octet-stream",
     )
     privora_media.check_size(data, kind)
     container = privora_media.sniff(data, kind)
@@ -2620,27 +2667,34 @@ def build_privora_job(job_input: dict, generation_id: str) -> tuple[dict, str, d
     plan = privora_workflows.build(request, MODEL_INVENTORY, request.generation_mode)
     job_dir = _job_input_dir(generation_id)
 
-    for item in plan.staging:
-        reference = item["reference"]
-        if reference.type == "image":
-            name = _stage_image_reference(reference, job_dir)
-        else:
-            name = _stage_media_reference(reference, reference.type, job_dir)
-        plan.graph[item["node"]]["inputs"][item["field"]] = name
+    try:
+        for item in plan.staging:
+            reference = item["reference"]
+            if reference.type == "image":
+                name = _stage_image_reference(reference, job_dir)
+            else:
+                name = _stage_media_reference(reference, reference.type, job_dir)
+            plan.graph[item["node"]]["inputs"][item["field"]] = name
 
-    # Durations are only knowable after the probe, so the duration rules run here rather
-    # than in parse() - still before the model is touched, which is the point.
-    privora_references.validate_durations(request.references)
-    videos = [privora_media.MediaInfo("video", v.duration_seconds or 0.0, "")
-              for v in request.references.videos if v.duration_seconds]
-    if videos:
-        privora_media.check_aggregate(
-            videos, "video", limit_seconds=privora_media.MAX_TOTAL_VIDEO_SECONDS)
-    audios = [privora_media.MediaInfo("audio", a.duration_seconds or 0.0, "")
-              for a in request.references.audios if a.duration_seconds]
-    if audios:
-        privora_media.check_aggregate(
-            audios, "audio", limit_seconds=privora_media.MAX_TOTAL_AUDIO_SECONDS)
+        # Durations are only knowable after the probe, so the duration rules run here
+        # rather than in parse() - still before the model is touched, which is the point.
+        privora_references.validate_durations(request.references)
+        videos = [privora_media.MediaInfo("video", v.duration_seconds or 0.0, "")
+                  for v in request.references.videos if v.duration_seconds]
+        if videos:
+            privora_media.check_aggregate(
+                videos, "video", limit_seconds=privora_media.MAX_TOTAL_VIDEO_SECONDS)
+        audios = [privora_media.MediaInfo("audio", a.duration_seconds or 0.0, "")
+                  for a in request.references.audios if a.duration_seconds]
+        if audios:
+            privora_media.check_aggregate(
+                audios, "audio", limit_seconds=privora_media.MAX_TOTAL_AUDIO_SECONDS)
+    except BaseException:
+        # The caller only learns this directory's path from a successful return, so on any
+        # failure it is ours to remove. Otherwise a rejected job would leave staged
+        # reference plaintext behind on a warm worker.
+        cleanup_job_dir(job_dir)
+        raise
 
     metadata = {**request.as_metadata(), **plan.as_metadata()}
     log(
@@ -2669,6 +2723,11 @@ def worker_capabilities() -> dict:
         "processId": PROCESS_ID,
         "gpuMode": GPU_CONFIG.mode if GPU_CONFIG else "unresolved",
         "comfyuiCommit": os.environ.get("COMFYUI_H3_COMMIT", "unknown"),
+        "build": {
+            "sourceCommit": os.environ.get("H3_BUILD_SOURCE_COMMIT", "unknown"),
+            "imageTag": os.environ.get("H3_BUILD_IMAGE_TAG", "unknown"),
+            "buildId": os.environ.get("H3_BUILD_ID", "unknown"),
+        },
     }
     return document
 
@@ -2792,6 +2851,18 @@ def handler(job: dict) -> dict:
         token=progress.get("token"),
     )
 
+    # The id the artefact is filed under, and the name of this job's isolated reference
+    # directory. Resolved before the request is routed, because the PrivoraVideo branch
+    # below passes it to build_privora_job(). Taken from the output block first: that is
+    # the one the storage key is derived from, an encrypted container records this id in
+    # its authenticated header, and the upload endpoint refuses a container whose header
+    # names a different job.
+    generation_id = str(
+        _spec(job_input, "output").get("jobId")
+        or _spec(job_input, "progress").get("jobId")
+        or job_id
+    )
+
     try:
         if str(job_input.get("mode") or "").strip().lower() == "capabilities":
             # A discovery probe. Answered without loading a model, staging anything or
@@ -2806,21 +2877,9 @@ def handler(job: dict) -> dict:
             workflow, job_dir, privora_metadata = build_privora_job(job_input, generation_id)
             timer._workflow = workflow
 
-        # The id the artefact is filed under, and the name of this job's isolated
-        # reference directory. Resolved first because the bridge below needs it.
-        generation_id = str(
-            _spec(job_input, "output").get("jobId")
-            or _spec(job_input, "progress").get("jobId")
-            or job_id
-        )
-
         # Resolved before anything expensive starts: a job that cannot be protected the way
         # it asked should cost zero GPU seconds, not fail after two minutes of sampling.
         protector = build_protector_for_job(job_input)
-        # generation_id is resolved above, before the bridge. It is taken from the output
-        # block first because that is the one the storage key is derived from: an encrypted
-        # container records this id in its authenticated header, and the upload endpoint
-        # refuses a container whose header names a different job.
         timer.privacy_mode = protector.mode
         log(
             f"generation_id={generation_id} privacy_mode={protector.mode} "

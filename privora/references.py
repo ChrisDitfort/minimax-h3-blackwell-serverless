@@ -218,6 +218,18 @@ def validate(references: ReferenceSet, *, max_references: int = PRODUCT_MAX_REFE
             {"type": "audio", "limit": MAX_STANDALONE_AUDIO, "supplied": len(references.audios)},
         )
 
+    soundtrack_count = sum(
+        1 for video in references.videos if video.soundtrack is not None
+    )
+    if soundtrack_count > MAX_VIDEO_SOUNDTRACKS:
+        raise errors.PrivoraError(
+            errors.INVALID_REFERENCE_COUNT,
+            f"At most {MAX_VIDEO_SOUNDTRACKS} video soundtracks are supported; "
+            f"{soundtrack_count} were supplied.",
+            {"type": "soundtrack", "limit": MAX_VIDEO_SOUNDTRACKS,
+             "supplied": soundtrack_count},
+        )
+
     total = references.file_count
     if total > max_references:
         raise errors.PrivoraError(
@@ -227,6 +239,13 @@ def validate(references: ReferenceSet, *, max_references: int = PRODUCT_MAX_REFE
         )
 
     for reference in references.all:
+        if reference.type != "video" and reference.soundtrack is not None:
+            raise errors.PrivoraError(
+                errors.INVALID_REFERENCE_TYPE,
+                "soundtrack is valid only on a video reference.",
+                {"field": "soundtrack", "parentType": reference.type,
+                 "requiredParentType": "video"},
+            )
         allowed = ROLES_BY_TYPE.get(reference.type)
         if allowed is None:
             raise errors.PrivoraError(
@@ -242,6 +261,30 @@ def validate(references: ReferenceSet, *, max_references: int = PRODUCT_MAX_REFE
                 {"type": reference.type, "role": reference.role, "allowed": sorted(allowed)},
             )
 
+    for index, video in enumerate(references.videos, start=1):
+        soundtrack = video.soundtrack
+        if soundtrack is None:
+            continue
+        if not isinstance(soundtrack, Reference) or soundtrack.type != "audio":
+            raise errors.PrivoraError(
+                errors.INVALID_REFERENCE_TYPE,
+                "A video soundtrack must be an audio reference.",
+                {"type": "soundtrack", "videoIndex": index, "required": "audio"},
+            )
+        if soundtrack.soundtrack is not None:
+            raise errors.PrivoraError(
+                errors.INVALID_REFERENCE_TYPE,
+                "A soundtrack cannot contain another soundtrack.",
+                {"type": "soundtrack", "videoIndex": index},
+            )
+        if soundtrack.role not in AUDIO_ROLES:
+            raise errors.PrivoraError(
+                errors.INVALID_REFERENCE_ROLE,
+                f"Role {soundtrack.role!r} is not valid for a video soundtrack.",
+                {"type": "audio", "role": soundtrack.role,
+                 "allowed": sorted(AUDIO_ROLES), "videoIndex": index},
+            )
+
 
 def validate_durations(references: ReferenceSet) -> None:
     """Check measured durations. Separate from `validate` because it needs the files.
@@ -251,21 +294,30 @@ def validate_durations(references: ReferenceSet) -> None:
     """
     for index, video in enumerate(references.videos, start=1):
         duration = video.duration_seconds
-        if duration is None:
-            continue
-        if duration < MIN_VIDEO_SECONDS:
+        if duration is not None and duration < MIN_VIDEO_SECONDS:
             raise errors.PrivoraError(
                 errors.INVALID_REFERENCE_DURATION,
                 f"Reference video {index} is {duration:.1f}s; the minimum is {MIN_VIDEO_SECONDS:.0f}s.",
                 {"type": "video", "index": index, "seconds": round(duration, 2),
                  "min": MIN_VIDEO_SECONDS, "max": MAX_VIDEO_SECONDS},
             )
-        if duration > MAX_VIDEO_SECONDS:
+        if duration is not None and duration > MAX_VIDEO_SECONDS:
             raise errors.PrivoraError(
                 errors.INVALID_REFERENCE_DURATION,
                 f"Reference video {index} is {duration:.1f}s; the maximum is {MAX_VIDEO_SECONDS:.0f}s.",
                 {"type": "video", "index": index, "seconds": round(duration, 2),
                  "min": MIN_VIDEO_SECONDS, "max": MAX_VIDEO_SECONDS},
+            )
+
+        soundtrack = video.soundtrack
+        soundtrack_duration = soundtrack.duration_seconds if soundtrack is not None else None
+        if soundtrack_duration is not None and soundtrack_duration > MAX_AUDIO_SECONDS:
+            raise errors.PrivoraError(
+                errors.INVALID_REFERENCE_DURATION,
+                f"Video soundtrack {index} is {soundtrack_duration:.1f}s; the maximum is "
+                f"{MAX_AUDIO_SECONDS:.0f}s.",
+                {"type": "soundtrack", "videoIndex": index,
+                 "seconds": round(soundtrack_duration, 2), "max": MAX_AUDIO_SECONDS},
             )
 
     for index, audio in enumerate(references.audios, start=1):

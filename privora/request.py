@@ -20,6 +20,8 @@ cannot keep - see MODE_NOTES.
 from __future__ import annotations
 
 import random
+import re
+from difflib import get_close_matches
 from dataclasses import dataclass, field
 
 from . import canvas as canvas_module
@@ -34,6 +36,19 @@ REFERENCES = "references"
 REMIX = "remix"
 
 MODES = (CREATE, ANIMATE, REFERENCES, REMIX)
+
+#: The stable canonical surface. Canonical requests are strict so a misspelling such as
+#: ``generatonMode`` cannot silently fall back to the quality path. The legacy adapter is
+#: selected before this allowlist and deliberately remains permissive during cutover.
+CANONICAL_FIELDS = frozenset(
+    {
+        "mode", "prompt", "quality", "aspectRatio", "duration", "seed",
+        "generationMode", "firstFrame", "lastFrame", "references",
+        "referenceFidelity", "camera", "style", "privacy", "encryption",
+        "progress", "output",
+    }
+)
+_SAFE_FIELD_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,63}\Z")
 
 #: Which model family each mode needs. The two checkpoints are separate files and cannot
 #: serve each other's mode.
@@ -136,21 +151,47 @@ def _resolve_seed(value) -> int:
     return value
 
 
-def _reference_from(spec, expected_type: str | None = None) -> Reference:
+def _reference_from(
+    spec,
+    expected_type: str | None = None,
+    *,
+    require_explicit_type: bool = False,
+) -> Reference:
     if not isinstance(spec, dict):
         raise errors.PrivoraError(
             errors.INVALID_REFERENCE_TYPE, "Each reference must be an object.", {}
         )
-    kind = str(spec.get("type") or expected_type or "").strip().lower()
+    declared_type = spec.get("type")
+    if require_explicit_type and not isinstance(declared_type, str):
+        raise errors.PrivoraError(
+            errors.INVALID_REFERENCE_TYPE,
+            "A video soundtrack must explicitly declare type 'audio'.",
+            {"field": "soundtrack.type", "required": "audio"},
+        )
+    kind = str(declared_type or expected_type or "").strip().lower()
     if kind not in references_module.ROLES_BY_TYPE:
         raise errors.PrivoraError(
             errors.INVALID_REFERENCE_TYPE,
             f"Reference type {kind!r} is not supported. Supported types are image, video and audio.",
             {"type": kind},
         )
+    if expected_type is not None and kind != expected_type:
+        raise errors.PrivoraError(
+            errors.INVALID_REFERENCE_TYPE,
+            f"This reference must have type {expected_type!r}.",
+            {"required": expected_type, "supplied": kind},
+        )
     soundtrack = None
     if spec.get("soundtrack") is not None:
-        soundtrack = _reference_from(spec["soundtrack"], expected_type="audio")
+        if kind != "video":
+            raise errors.PrivoraError(
+                errors.INVALID_REFERENCE_TYPE,
+                "soundtrack is valid only on a video reference.",
+                {"field": "soundtrack", "parentType": kind, "requiredParentType": "video"},
+            )
+        soundtrack = _reference_from(
+            spec["soundtrack"], expected_type="audio", require_explicit_type=True
+        )
     return Reference(
         type=kind,
         role=str(spec.get("role") or "general").strip().lower(),
@@ -193,6 +234,28 @@ def parse(payload: dict, *, max_references: int = references_module.PRODUCT_MAX_
 
     if "workflow" in payload or ("width" in payload and "height" in payload and "mode" not in payload):
         return parse_legacy(payload)
+
+    unknown = [key for key in payload if key not in CANONICAL_FIELDS]
+    if unknown:
+        # JSON field values are never reflected. Identifier-shaped field names are useful
+        # for correcting a typo; hostile/non-identifier keys are represented by a count so
+        # an attacker cannot turn an error response into an exfiltration channel.
+        safe_names = sorted(
+            key for key in unknown
+            if (
+                isinstance(key, str)
+                and _SAFE_FIELD_NAME.fullmatch(key)
+                and get_close_matches(key, CANONICAL_FIELDS, n=1, cutoff=0.72)
+            )
+        )
+        details = {"count": len(unknown)}
+        if len(safe_names) == len(unknown):
+            details["fields"] = safe_names
+        raise errors.PrivoraError(
+            errors.UNKNOWN_FIELD,
+            "The canonical request contains unsupported top-level fields.",
+            details,
+        )
 
     mode = str(payload.get("mode") or CREATE).strip().lower()
     if mode not in MODES:
@@ -248,17 +311,35 @@ def parse(payload: dict, *, max_references: int = references_module.PRODUCT_MAX_
 
     collected = _collect_references(payload.get("references"))
 
+    if mode == CREATE and (first_frame is not None or last_frame is not None):
+        raise errors.PrivoraError(
+            errors.UNSUPPORTED_MODE,
+            "create does not accept firstFrame or lastFrame; use animate instead.",
+            {"mode": mode, "fields": [
+                name for name, value in (("firstFrame", first_frame), ("lastFrame", last_frame))
+                if value is not None
+            ]},
+        )
     if mode == ANIMATE and first_frame is None and last_frame is None:
         raise errors.PrivoraError(
             errors.MISSING_FRAME,
             "animate needs at least a firstFrame or a lastFrame.",
             {"mode": mode},
         )
-    if mode in (REFERENCES, REMIX) and collected.is_empty():
+    if mode == REFERENCES and collected.is_empty():
         raise errors.PrivoraError(
             errors.INVALID_REFERENCE_COUNT,
             f"{mode} needs at least one reference.",
             {"mode": mode},
+        )
+    if mode in (REFERENCES, REMIX) and (first_frame is not None or last_frame is not None):
+        raise errors.PrivoraError(
+            errors.UNSUPPORTED_MODE,
+            f"{mode} does not accept firstFrame or lastFrame.",
+            {"mode": mode, "fields": [
+                name for name, value in (("firstFrame", first_frame), ("lastFrame", last_frame))
+                if value is not None
+            ]},
         )
     if mode in (CREATE, ANIMATE) and not collected.is_empty():
         raise errors.PrivoraError(
@@ -268,6 +349,14 @@ def parse(payload: dict, *, max_references: int = references_module.PRODUCT_MAX_
         )
 
     references_module.validate(collected, max_references=max_references)
+    if mode == REMIX and not any(
+        video.role == "source" for video in collected.videos
+    ):
+        raise errors.PrivoraError(
+            errors.INVALID_REFERENCE_COUNT,
+            "remix needs at least one video reference with role 'source'.",
+            {"mode": mode, "required": {"type": "video", "role": "source"}},
+        )
     references_module.assign_ordinals(collected)
 
     return GenerationRequest(
@@ -309,11 +398,29 @@ def parse_legacy(payload: dict) -> GenerationRequest:
             {"schema": "legacy"},
         )
 
+    raw_steps = payload.get("steps", 20)
+    try:
+        if isinstance(raw_steps, bool):
+            raise ValueError
+        steps = int(raw_steps)
+    except (TypeError, ValueError) as error:
+        raise errors.PrivoraError(
+            errors.INVALID_STEPS,
+            "Legacy steps must be an integer between 1 and 100.",
+            {"schema": "legacy", "min": 1, "max": 100},
+        ) from error
+    if not 1 <= steps <= 100:
+        raise errors.PrivoraError(
+            errors.INVALID_STEPS,
+            "Legacy steps must be between 1 and 100.",
+            {"schema": "legacy", "min": 1, "max": 100, "supplied": steps},
+        )
+
     resolved = canvas_module.canvas_from_dimensions(
         width=width,
         height=height,
         frames=int(payload.get("frames", 124)),
-        steps=int(payload.get("steps", 20)),
+        steps=steps,
     )
 
     first_frame = None
@@ -377,7 +484,9 @@ def capabilities(*, ref2va_available: bool) -> dict:
             "fps": canvas_module.FPS,
             "frameGrid": "frames % 17 == 5",
             "minSeconds": round(canvas_module.MIN_FRAMES / canvas_module.FPS, 4),
-            "maxSeconds": round(canvas_module.MAX_FRAMES / canvas_module.FPS, 4),
+            "maxSeconds": round(
+                canvas_module.maximum_aligned_frame_count() / canvas_module.FPS, 4
+            ),
             "trainedRangeSeconds": [
                 round(canvas_module.TRAINED_MIN_FRAMES / canvas_module.FPS, 4),
                 round(canvas_module.TRAINED_MAX_FRAMES / canvas_module.FPS, 4),

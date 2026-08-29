@@ -19,7 +19,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from privora import errors, models, workflows  # noqa: E402
+from privora import canvas, errors, models, workflows  # noqa: E402
 from privora import request as request_module  # noqa: E402
 
 FL2VA_CKPT = models.CHECKPOINTS[models.FL2VA]
@@ -172,20 +172,126 @@ class LegacyStepsTests(unittest.TestCase):
         self.assertNotIn("lora", plan.graph)
         self.assertEqual(plan.graph["sigmas"]["inputs"]["steps"], 20)
 
-    def test_a_legacy_four_step_request_does_not_silently_become_turbo(self):
-        # A caller who asked for fewer steps on base weights gets exactly that. Swapping
-        # in a distilled model would change what they are paying for without being asked.
-        parsed = request_module.parse(
-            {"prompt": "x", "width": 1024, "height": 576, "frames": 124, "steps": 4, "seed": 1}
-        )
-        self.assertEqual(parsed.generation_mode, models.QUALITY)
-        plan = workflows.build(parsed, FULL, parsed.generation_mode)
-        self.assertNotIn("lora", plan.graph)
+    def test_every_legal_explicit_step_count_reaches_the_scheduler_verbatim(self):
+        # Legacy steps select base-model sampling depth, never a distilled Turbo LoRA.
+        for steps in (4, 8, 14, 20, 30):
+            with self.subTest(steps=steps):
+                parsed = request_module.parse({
+                    "prompt": "x", "width": 1024, "height": 576,
+                    "frames": 124, "steps": steps, "seed": 1,
+                })
+                self.assertEqual(parsed.generation_mode, models.QUALITY)
+                plan = workflows.build(parsed, FULL, parsed.generation_mode)
+                self.assertNotIn("lora", plan.graph)
+                self.assertEqual(plan.graph[workflows.SIGMAS]["inputs"]["steps"], steps)
+                self.assertEqual(plan.as_metadata(), {
+                    "generationMode": "quality", "steps": steps, "acceleration": "none",
+                })
 
     def test_steps_to_generation_mode_only_recognises_the_base_count(self):
         self.assertEqual(models.steps_to_generation_mode(models.FL2VA, 20), models.QUALITY)
         self.assertIsNone(models.steps_to_generation_mode(models.FL2VA, 8))
         self.assertIsNone(models.steps_to_generation_mode(models.FL2VA, 4))
+
+
+class CapabilityExecutionConsistencyTests(unittest.TestCase):
+    """Every advertised product choice must parse and build on the described inventory."""
+
+    def setUp(self):
+        self.capabilities = request_module.capabilities(ref2va_available=True)
+        self.capabilities.update(FULL.describe())
+
+    def _request_for_mode(self, mode, **extra):
+        payload = {"mode": mode, "prompt": "x", "seed": 1, **extra}
+        if mode == "animate":
+            payload["firstFrame"] = {"type": "image", "id": "frame"}
+        elif mode == "references":
+            payload["references"] = [{"type": "image", "role": "character", "id": "ref"}]
+        elif mode == "remix":
+            payload["references"] = [{"type": "video", "role": "source", "id": "source"}]
+        return request_module.parse(payload)
+
+    def test_every_advertised_mode_parses_and_has_a_builder(self):
+        for mode, described in self.capabilities["modes"].items():
+            with self.subTest(mode=mode):
+                self.assertTrue(described["available"])
+                request = self._request_for_mode(mode)
+                plan = workflows.build(request, FULL, request.generation_mode)
+                expected = ("MiniMaxH3ImageToVideo" if request.family == models.FL2VA
+                            else "MiniMaxH3ReferenceToVideo")
+                self.assertEqual(plan.graph[workflows.CONDITIONING]["class_type"], expected)
+
+    def test_every_advertised_tier_and_ratio_resolves_to_the_reported_canvas(self):
+        for quality, tier in self.capabilities["quality"].items():
+            for ratio, dimensions in tier["dimensions"].items():
+                with self.subTest(quality=quality, ratio=ratio):
+                    request = self._request_for_mode(
+                        "create", quality=quality, aspectRatio=ratio
+                    )
+                    plan = workflows.build(request, FULL, request.generation_mode)
+                    inputs = plan.graph[workflows.CONDITIONING]["inputs"]
+                    self.assertEqual(f"{inputs['width']}x{inputs['height']}", dimensions)
+
+    def test_advertised_duration_boundary_builds_and_an_over_grid_value_is_rejected(self):
+        maximum = self.capabilities["duration"]["maxSeconds"]
+        request = self._request_for_mode("create", duration=maximum)
+        plan = workflows.build(request, FULL, request.generation_mode)
+        self.assertEqual(
+            plan.graph[workflows.CONDITIONING]["inputs"]["length"],
+            canvas.maximum_aligned_frame_count(),
+        )
+        with self.assertRaises(errors.PrivoraError):
+            self._request_for_mode("create", duration=150)
+
+    def test_advertised_reference_boundaries_and_fidelity_build(self):
+        references = [
+            {"type": "image", "role": "character", "id": f"i-{index}"}
+            for index in range(self.capabilities["references"]["maxImages"])
+        ] + [
+            {"type": "video", "role": "motion", "id": f"v-{index}"}
+            for index in range(self.capabilities["references"]["maxVideos"])
+        ]
+        request = request_module.parse({
+            "mode": "references", "prompt": "x", "references": references,
+        })
+        self.assertEqual(request.references.file_count,
+                         self.capabilities["references"]["maxTotal"])
+        self.assertEqual(
+            len(workflows.build(request, FULL).staging),
+            self.capabilities["references"]["maxTotal"],
+        )
+
+        with self.assertRaises(errors.PrivoraError):
+            request_module.parse({
+                "mode": "references", "prompt": "x",
+                "references": references + [{"type": "audio", "role": "music"}],
+            })
+
+        for fidelity in self.capabilities["references"]["fidelity"]:
+            with self.subTest(fidelity=fidelity):
+                parsed = self._request_for_mode("references", referenceFidelity=fidelity)
+                plan = workflows.build(parsed, FULL)
+                expected = "max" if fidelity == "high" else "match"
+                self.assertEqual(
+                    plan.graph[workflows.CONDITIONING]["inputs"]["ref_image_size"], expected
+                )
+
+    def test_advertised_generation_modes_match_each_family_executable_routes(self):
+        expected_steps = {"quality": 20, "turbo": 8, "turboFast": 4}
+        for family, mode in (
+            (models.FL2VA, "create"), (models.REF2VA, "references")
+        ):
+            for wire_mode in self.capabilities["byFamily"][family]:
+                with self.subTest(family=family, generation_mode=wire_mode):
+                    parsed = self._request_for_mode(mode, generationMode=wire_mode)
+                    plan = workflows.build(parsed, FULL, parsed.generation_mode)
+                    self.assertEqual(plan.as_metadata()["steps"], expected_steps[wire_mode])
+
+        self.assertNotIn("turbo", self.capabilities["byFamily"][models.REF2VA])
+        ref_turbo = self._request_for_mode("references", generationMode="turbo")
+        with self.assertRaises(errors.PrivoraError) as caught:
+            workflows.build(ref_turbo, FULL, ref_turbo.generation_mode)
+        self.assertEqual(caught.exception.code, errors.UNSUPPORTED_MODE)
 
 
 class GraphStructureTests(unittest.TestCase):

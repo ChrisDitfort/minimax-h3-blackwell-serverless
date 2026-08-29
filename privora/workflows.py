@@ -59,16 +59,24 @@ IMAGE_LOADER = "PixaromaLoadImage"
 class WorkflowPlan:
     """A built graph plus the staging the handler has to do before submitting it."""
 
-    def __init__(self, graph: dict, staging: list[dict], acceleration: models.Acceleration):
+    def __init__(
+        self,
+        graph: dict,
+        staging: list[dict],
+        acceleration: models.Acceleration,
+        *,
+        sampling_steps: int | None = None,
+    ):
         self.graph = graph
         #: [{"node": <id>, "field": "image", "reference": Reference}] - what to write where.
         self.staging = staging
         self.acceleration = acceleration
+        self.sampling_steps = acceleration.steps if sampling_steps is None else sampling_steps
 
     def as_metadata(self) -> dict:
         data = {
             "generationMode": models._wire(self.acceleration.mode),
-            "steps": self.acceleration.steps,
+            "steps": self.sampling_steps,
             "acceleration": self.acceleration.kind,
         }
         if self.acceleration.note:
@@ -100,7 +108,7 @@ def _model_source(graph: dict, acceleration: models.Acceleration) -> list:
 
 
 def _tail(graph: dict, model_link: list, request: GenerationRequest,
-          acceleration: models.Acceleration) -> None:
+          sampling_steps: int) -> None:
     """Sampler through save. Identical for both families, which is the point."""
     graph[NOISE] = {"class_type": "RandomNoise", "inputs": {"noise_seed": request.seed}}
     graph[GUIDER] = {
@@ -113,7 +121,7 @@ def _tail(graph: dict, model_link: list, request: GenerationRequest,
         "inputs": {
             "model": model_link,
             "scheduler": SCHEDULER,
-            "steps": acceleration.steps,
+            "steps": sampling_steps,
             "denoise": 1.0,
         },
     }
@@ -193,8 +201,9 @@ def build_fl2va(request: GenerationRequest, acceleration: models.Acceleration) -
         inputs["last_frame"] = _stage_image(graph, staging, "last_frame", request.last_frame)
 
     graph[CONDITIONING] = {"class_type": "MiniMaxH3ImageToVideo", "inputs": inputs}
-    _tail(graph, _model_source(graph, acceleration), request, acceleration)
-    return WorkflowPlan(graph, staging, acceleration)
+    sampling_steps = request.canvas.steps if request.legacy else acceleration.steps
+    _tail(graph, _model_source(graph, acceleration), request, sampling_steps)
+    return WorkflowPlan(graph, staging, acceleration, sampling_steps=sampling_steps)
 
 
 def build_ref2va(request: GenerationRequest, acceleration: models.Acceleration) -> WorkflowPlan:
@@ -243,8 +252,9 @@ def build_ref2va(request: GenerationRequest, acceleration: models.Acceleration) 
         inputs[node_id] = [node_id, 0]
 
     graph[CONDITIONING] = {"class_type": "MiniMaxH3ReferenceToVideo", "inputs": inputs}
-    _tail(graph, _model_source(graph, acceleration), request, acceleration)
-    return WorkflowPlan(graph, staging, acceleration)
+    sampling_steps = request.canvas.steps if request.legacy else acceleration.steps
+    _tail(graph, _model_source(graph, acceleration), request, sampling_steps)
+    return WorkflowPlan(graph, staging, acceleration, sampling_steps=sampling_steps)
 
 
 BUILDERS = {CREATE: build_fl2va, ANIMATE: build_fl2va}

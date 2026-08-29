@@ -97,6 +97,13 @@ class CanvasArithmeticTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             canvas.resolve_canvas(duration_seconds=200)  # 4800 frames > 3600
 
+    def test_the_largest_legal_frame_count_is_derived_from_the_grid(self):
+        maximum = canvas.maximum_aligned_frame_count()
+        self.assertEqual(maximum, 3592)
+        self.assertLessEqual(maximum, canvas.MAX_FRAMES)
+        self.assertEqual(maximum % canvas.FRAME_GRID_MODULUS, canvas.FRAME_GRID_REMAINDER)
+        self.assertGreater(canvas.align_frame_count(maximum + 1), canvas.MAX_FRAMES)
+
     def test_long_durations_are_available(self):
         # The node accepts up to 3600 frames and was trained to ~362 (~15s). The product
         # has only ever shipped ~5s, so this is real headroom rather than a limit.
@@ -176,12 +183,88 @@ class ReferenceLimitTests(unittest.TestCase):
         collected.videos[0].duration_seconds = 8.0
         refs.validate_durations(collected)
 
+    def test_a_video_soundtrack_uses_the_audio_duration_limit(self):
+        soundtrack = refs.Reference("audio", "ambience", duration_seconds=15.01)
+        video = refs.Reference("video", "motion", duration_seconds=8.0,
+                               soundtrack=soundtrack)
+        with self.assertRaises(errors.PrivoraError) as caught:
+            refs.validate_durations(refs.ReferenceSet(videos=[video]))
+        self.assertEqual(caught.exception.code, errors.INVALID_REFERENCE_DURATION)
+        self.assertEqual(caught.exception.details["type"], "soundtrack")
+
+        soundtrack.duration_seconds = 15.0
+        refs.validate_durations(refs.ReferenceSet(videos=[video]))
+
     def test_fidelity_maps_to_the_nodes_own_option(self):
         self.assertEqual(refs.resolve_fidelity("standard"), "match")
         self.assertEqual(refs.resolve_fidelity("high"), "max")
         self.assertEqual(refs.resolve_fidelity(None), "match")
         with self.assertRaises(errors.PrivoraError):
             refs.resolve_fidelity("ultra")
+
+
+class SoundtrackContractTests(unittest.TestCase):
+    def _parse(self, reference):
+        return request_module.parse({
+            "mode": "references", "prompt": "x", "references": [reference],
+        })
+
+    def test_the_canonical_nested_audio_shape_is_accepted(self):
+        parsed = self._parse({
+            "type": "video", "role": "motion", "id": "video-1",
+            "soundtrack": {"type": "audio", "role": "ambience", "id": "audio-1"},
+        })
+        soundtrack = parsed.references.videos[0].soundtrack
+        self.assertIsNotNone(soundtrack)
+        self.assertEqual((soundtrack.type, soundtrack.role), ("audio", "ambience"))
+        self.assertEqual(parsed.references.file_count, 2)
+
+    def test_soundtrack_is_rejected_on_image_and_audio_references(self):
+        for parent_type, parent_role in (("image", "character"), ("audio", "music")):
+            with self.subTest(parent_type=parent_type):
+                with self.assertRaises(errors.PrivoraError) as caught:
+                    self._parse({
+                        "type": parent_type, "role": parent_role,
+                        "soundtrack": {"type": "audio", "role": "ambience"},
+                    })
+                self.assertEqual(caught.exception.code, errors.INVALID_REFERENCE_TYPE)
+
+    def test_soundtrack_must_explicitly_be_audio(self):
+        for soundtrack in (
+            {"role": "ambience"},
+            {"type": "image", "role": "general"},
+            {"type": "video", "role": "general"},
+        ):
+            with self.subTest(soundtrack=soundtrack):
+                with self.assertRaises(errors.PrivoraError) as caught:
+                    self._parse({"type": "video", "role": "motion",
+                                 "soundtrack": soundtrack})
+                self.assertEqual(caught.exception.code, errors.INVALID_REFERENCE_TYPE)
+
+    def test_soundtrack_must_be_an_object_with_an_audio_role(self):
+        for soundtrack in (
+            ["not", "an", "object"],
+            {"type": "audio", "role": "character"},
+        ):
+            with self.subTest(soundtrack=soundtrack):
+                with self.assertRaises(errors.PrivoraError) as caught:
+                    self._parse({"type": "video", "role": "motion",
+                                 "soundtrack": soundtrack})
+                self.assertIn(caught.exception.code,
+                              (errors.INVALID_REFERENCE_TYPE, errors.INVALID_REFERENCE_ROLE))
+
+    def test_reference_validator_defends_the_soundtrack_shape_too(self):
+        for parent in (
+            refs.Reference("image", "character", soundtrack=refs.Reference("audio")),
+            refs.Reference("audio", "music", soundtrack=refs.Reference("audio")),
+        ):
+            with self.subTest(parent=parent.type):
+                collected = refs.ReferenceSet(
+                    images=[parent] if parent.type == "image" else [],
+                    audios=[parent] if parent.type == "audio" else [],
+                )
+                with self.assertRaises(errors.PrivoraError):
+                    refs.validate(collected)
 
 
 class OrdinalTests(unittest.TestCase):
@@ -310,6 +393,69 @@ class ModeRoutingTests(unittest.TestCase):
         with self.assertRaises(errors.PrivoraError):
             request_module.parse({"mode": "references", "prompt": "x"})
 
+    def test_create_rejects_keyframes(self):
+        for field in ("firstFrame", "lastFrame"):
+            with self.subTest(field=field):
+                with self.assertRaises(errors.PrivoraError) as caught:
+                    request_module.parse({
+                        "mode": "create", "prompt": "x",
+                        field: {"type": "image", "id": "frame"},
+                    })
+                self.assertEqual(caught.exception.code, errors.UNSUPPORTED_MODE)
+
+    def test_animate_rejects_references_even_with_a_keyframe(self):
+        with self.assertRaises(errors.PrivoraError) as caught:
+            request_module.parse({
+                "mode": "animate", "prompt": "x",
+                "firstFrame": {"type": "image", "id": "frame"},
+                "references": [reference_payload("image", "character")],
+            })
+        self.assertEqual(caught.exception.code, errors.UNSUPPORTED_MODE)
+
+    def test_references_rejects_keyframes(self):
+        for field in ("firstFrame", "lastFrame"):
+            with self.subTest(field=field):
+                with self.assertRaises(errors.PrivoraError) as caught:
+                    request_module.parse({
+                        "mode": "references", "prompt": "x",
+                        "references": [reference_payload("image", "character")],
+                        field: {"type": "image", "id": "frame"},
+                    })
+                self.assertEqual(caught.exception.code, errors.UNSUPPORTED_MODE)
+
+    def test_remix_requires_a_source_role_video(self):
+        invalid_sets = (
+            [reference_payload("image", "character")],
+            [reference_payload("audio", "music")],
+            [reference_payload("video", "motion")],
+            [reference_payload("video", "motion"), reference_payload("image", "style")],
+        )
+        for references in invalid_sets:
+            with self.subTest(references=references):
+                with self.assertRaises(errors.PrivoraError) as caught:
+                    request_module.parse({"mode": "remix", "prompt": "x",
+                                          "references": references})
+                self.assertEqual(caught.exception.code, errors.INVALID_REFERENCE_COUNT)
+                self.assertEqual(caught.exception.details["required"],
+                                 {"type": "video", "role": "source"})
+
+    def test_remix_accepts_a_source_video_and_rejects_keyframes(self):
+        payload = {
+            "mode": "remix", "prompt": "x",
+            "references": [reference_payload("video", "source")],
+        }
+        self.assertEqual(request_module.parse(payload).family, "ref2va")
+        with self.assertRaises(errors.PrivoraError):
+            request_module.parse({**payload, "firstFrame": {"type": "image", "id": "f"}})
+
+    def test_keyframes_must_be_images(self):
+        with self.assertRaises(errors.PrivoraError) as caught:
+            request_module.parse({
+                "mode": "animate", "prompt": "x",
+                "firstFrame": {"type": "video", "id": "not-an-image"},
+            })
+        self.assertEqual(caught.exception.code, errors.INVALID_REFERENCE_TYPE)
+
     def test_create_rejects_references_rather_than_ignoring_them(self):
         with self.assertRaises(errors.PrivoraError) as caught:
             request_module.parse({
@@ -380,6 +526,42 @@ class LegacyCompatibilityTests(unittest.TestCase):
             self.assertIn(field, metadata)
         self.assertEqual(metadata["schema"], "legacy")
 
+    def test_legacy_steps_are_limited_to_the_existing_one_to_one_hundred_range(self):
+        for supplied in (0, 101, True, "not-a-number"):
+            with self.subTest(supplied=supplied):
+                with self.assertRaises(errors.PrivoraError) as caught:
+                    request_module.parse(dict(self.LEGACY, steps=supplied))
+                self.assertEqual(caught.exception.code, errors.INVALID_STEPS)
+
+    def test_legacy_parser_remains_permissive_about_unrelated_fields(self):
+        parsed = request_module.parse(dict(self.LEGACY, backend="runpod", fast=True))
+        self.assertTrue(parsed.legacy)
+
+
+class CanonicalFieldTests(unittest.TestCase):
+    def test_the_stable_top_level_allowlist_is_exact(self):
+        self.assertEqual(request_module.CANONICAL_FIELDS, {
+            "mode", "prompt", "quality", "aspectRatio", "duration", "seed",
+            "generationMode", "firstFrame", "lastFrame", "references",
+            "referenceFidelity", "camera", "style", "privacy", "encryption",
+            "progress", "output",
+        })
+
+    def test_a_likely_misspelling_is_rejected_instead_of_falling_back(self):
+        with self.assertRaises(errors.PrivoraError) as caught:
+            request_module.parse({
+                "mode": "create", "prompt": "x", "generatonMode": "turbo",
+            })
+        self.assertEqual(caught.exception.code, errors.UNKNOWN_FIELD)
+        self.assertEqual(caught.exception.details["fields"], ["generatonMode"])
+
+    def test_unknown_field_values_and_hostile_names_are_not_echoed(self):
+        secret = "REFERENCE_TOKEN_CANARY_4E2A"
+        with self.assertRaises(errors.PrivoraError) as caught:
+            request_module.parse({"mode": "create", "prompt": "x", secret: secret})
+        rendered = str(caught.exception.as_response())
+        self.assertNotIn(secret, rendered)
+
 
 class ErrorSanitisationTests(unittest.TestCase):
     """A rejection must never carry the prompt or a filename back to the caller."""
@@ -430,6 +612,16 @@ class CapabilitiesTests(unittest.TestCase):
         reported = request_module.capabilities(ref2va_available=True)
         self.assertEqual(set(reported["aspectRatios"]), set(canvas.ASPECT_RATIOS))
         self.assertEqual(set(reported["quality"]), set(canvas.QUALITY_TIERS))
+
+    def test_advertised_max_duration_is_executable_and_the_next_grid_is_not(self):
+        maximum = request_module.capabilities(ref2va_available=True)["duration"]["maxSeconds"]
+        parsed = request_module.parse({"mode": "create", "prompt": "x", "duration": maximum})
+        self.assertEqual(parsed.canvas.frames, canvas.maximum_aligned_frame_count())
+        self.assertLessEqual(parsed.canvas.frames, canvas.MAX_FRAMES)
+
+        with self.assertRaises(errors.PrivoraError) as caught:
+            request_module.parse({"mode": "create", "prompt": "x", "duration": 150})
+        self.assertEqual(caught.exception.code, errors.INVALID_DURATION)
 
 
 if __name__ == "__main__":

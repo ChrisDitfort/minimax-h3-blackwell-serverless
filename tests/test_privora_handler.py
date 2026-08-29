@@ -16,6 +16,7 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest import mock
 
 os.environ.setdefault("COMFY_INPUT_DIR", tempfile.mkdtemp(prefix="h3-privora-input-"))
 os.environ.setdefault("COMFY_OUTPUT_DIR", tempfile.mkdtemp(prefix="h3-privora-output-"))
@@ -35,7 +36,7 @@ if "websocket" not in sys.modules:
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import handler  # noqa: E402
-from privora import errors, models  # noqa: E402
+from privora import errors, media, models  # noqa: E402
 
 CANARY = "PROMPT_CANARY_PRIVORA_7F91A2"
 
@@ -217,6 +218,382 @@ class TurboPrivacyParityTests(unittest.TestCase):
         differing = {node for node in set(quality) | set(turbo)
                      if quality.get(node) != turbo.get(node)}
         self.assertEqual(differing, {"lora", "guider", "sigmas"})
+
+
+class HandlerEntrypointTests(unittest.TestCase):
+    """handler() itself, not just the bridge underneath it.
+
+    Every other test in this file calls build_privora_job() directly. That left the
+    routing in handler() untested, and it was broken: generation_id was read by the
+    PrivoraVideo branch and only assigned below it, so a canonical request raised
+    UnboundLocalError before it could reach a model. The legacy path never entered that
+    branch, so the whole suite stayed green and a live legacy job still passed.
+
+    These tests exercise the entrypoint and stop at ComfyUI, which is the first thing
+    that genuinely needs a GPU.
+    """
+
+    def _run(self, job_input, inventory=FULL_INVENTORY):
+        reached = {}
+
+        def fake_start():
+            reached["comfy"] = True
+            raise handler.WorkflowError("stop: ComfyUI is out of scope for this test")
+
+        saved_inventory, saved_start = handler.MODEL_INVENTORY, handler.start_comfyui
+        handler.MODEL_INVENTORY, handler.start_comfyui = inventory, fake_start
+        try:
+            return handler.handler({"id": "test-job", "input": job_input}), reached
+        finally:
+            handler.MODEL_INVENTORY, handler.start_comfyui = saved_inventory, saved_start
+
+    def test_a_canonical_create_request_is_routed_and_built(self):
+        result, reached = self._run(
+            {"mode": "create", "prompt": "a calm sea", "quality": "standard",
+             "aspectRatio": "16:9", "duration": 5, "seed": 7}
+        )
+        # It got all the way to ComfyUI, which means routing, validation, canvas
+        # resolution and graph construction all ran.
+        self.assertTrue(reached.get("comfy"), f"never reached ComfyUI: {result}")
+        self.assertNotIn("UnboundLocalError", str(result))
+
+    def test_a_canonical_request_never_fails_with_an_unbound_local(self):
+        for mode, extra in (
+            ("create", {}),
+            ("animate", {"firstFrame": {"url": "https://example.invalid/a.png"}}),
+            ("references", {"references": [{"type": "image", "role": "character",
+                                            "url": "https://example.invalid/a.png"}]}),
+        ):
+            with self.subTest(mode=mode):
+                result, _ = self._run({"mode": mode, "prompt": "x", "seed": 1, **extra})
+                self.assertNotIn("UnboundLocalError", str(result))
+
+    def test_capabilities_is_answered_without_touching_comfyui(self):
+        result, reached = self._run({"mode": "capabilities"})
+        self.assertIn("capabilities", result)
+        self.assertFalse(reached.get("comfy"), "a capabilities probe must not start ComfyUI")
+        self.assertIn("modes", result["capabilities"])
+        self.assertIn("generationModes", result["capabilities"])
+
+    def test_a_legacy_workflow_request_still_reaches_comfyui(self):
+        result, reached = self._run(
+            {"workflow": {"1": {"class_type": "UNETLoader", "inputs": {}}}}
+        )
+        self.assertTrue(reached.get("comfy"), f"legacy path regressed: {result}")
+
+
+class StagingFailureTests(unittest.TestCase):
+    """A rejected job must not leave reference plaintext on a warm worker."""
+
+    PLAINTEXT = b"CONFIDENTIAL_REFERENCE_PLAINTEXT_CANARY"
+
+    def _job_path(self, generation_id):
+        return os.path.join(os.path.realpath(handler.COMFY_INPUT_DIR), "job-" + generation_id)
+
+    def _assert_job_removed(self, generation_id):
+        self.assertFalse(
+            os.path.exists(self._job_path(generation_id)),
+            "a failed staging run left its plaintext job directory behind",
+        )
+
+    def _write_stage(self, reference, kind, job_dir):
+        index = len(os.listdir(job_dir)) + 1
+        filename = f"ref-{index}.{'png' if kind == 'image' else kind}"
+        path = handler._staged_name(job_dir, filename, kind)
+        with open(path, "wb") as handle:
+            handle.write(self.PLAINTEXT)
+        return os.path.join(os.path.basename(job_dir), filename)
+
+    def test_a_failed_reference_leaves_no_staged_files_behind(self):
+        before = set(os.listdir(handler.COMFY_INPUT_DIR))
+        with WithInventory():
+            with self.assertRaises(errors.PrivoraError):
+                handler.build_privora_job(
+                    {"mode": "references", "prompt": "x", "seed": 1,
+                     "references": [{"type": "image", "role": "character"}]},
+                    "gen-staging-failure",
+                )
+        self.assertEqual(
+            set(os.listdir(handler.COMFY_INPUT_DIR)), before,
+            "a failed staging run left its job directory behind",
+        )
+
+    def test_image_failure_after_one_successful_stage_is_cleaned(self):
+        generation_id = "cleanup-image-failure"
+        payload = {
+            "mode": "references", "prompt": "x",
+            "references": [
+                {"type": "image", "role": "character", "url": "https://x/1"},
+                {"type": "image", "role": "style", "url": "https://x/2"},
+            ],
+        }
+        calls = 0
+
+        def stage(reference, job_dir):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise handler.ImageInputError("invalid second image")
+            return self._write_stage(reference, "image", job_dir)
+
+        with WithInventory(), mock.patch.object(handler, "_stage_image_reference", stage):
+            with self.assertRaises(handler.ImageInputError):
+                handler.build_privora_job(payload, generation_id)
+        self.assertEqual(calls, 2)
+        self._assert_job_removed(generation_id)
+
+    def test_video_failure_after_a_successful_image_stage_is_cleaned(self):
+        generation_id = "cleanup-video-failure"
+        payload = {
+            "mode": "references", "prompt": "x",
+            "references": [
+                {"type": "image", "role": "character", "url": "https://x/image"},
+                {"type": "video", "role": "motion", "url": "https://x/video"},
+            ],
+        }
+        with (
+            WithInventory(),
+            mock.patch.object(
+                handler, "_stage_image_reference",
+                side_effect=lambda reference, job_dir: self._write_stage(
+                    reference, "image", job_dir
+                ),
+            ),
+            mock.patch.object(
+                handler, "_stage_media_reference",
+                side_effect=errors.PrivoraError(
+                    errors.REFERENCE_PREPROCESSING_FAILED,
+                    "The supplied video reference could not be read.", {"type": "video"},
+                ),
+            ),
+        ):
+            with self.assertRaises(errors.PrivoraError):
+                handler.build_privora_job(payload, generation_id)
+        self._assert_job_removed(generation_id)
+
+    def test_audio_failure_after_a_successful_image_stage_is_cleaned(self):
+        generation_id = "cleanup-audio-failure"
+        payload = {
+            "mode": "references", "prompt": "x",
+            "references": [
+                {"type": "image", "role": "character", "url": "https://x/image"},
+                {"type": "audio", "role": "music", "url": "https://x/audio"},
+            ],
+        }
+        with (
+            WithInventory(),
+            mock.patch.object(
+                handler, "_stage_image_reference",
+                side_effect=lambda reference, job_dir: self._write_stage(
+                    reference, "image", job_dir
+                ),
+            ),
+            mock.patch.object(
+                handler, "_stage_media_reference",
+                side_effect=errors.PrivoraError(
+                    errors.REFERENCE_PREPROCESSING_FAILED,
+                    "The supplied audio reference could not be read.", {"type": "audio"},
+                ),
+            ),
+        ):
+            with self.assertRaises(errors.PrivoraError):
+                handler.build_privora_job(payload, generation_id)
+        self._assert_job_removed(generation_id)
+
+    def test_invalid_later_reference_after_a_successful_stage_is_cleaned(self):
+        generation_id = "cleanup-invalid-later"
+        payload = {
+            "mode": "references", "prompt": "x",
+            "references": [
+                {"type": "image", "role": "character", "url": "https://x/first"},
+                {"type": "image", "role": "style"},
+            ],
+        }
+        with (
+            WithInventory(),
+            mock.patch.object(handler, "_fetch_asset_bytes", return_value=self.PLAINTEXT),
+            mock.patch.object(handler, "_validate_image_bytes", return_value=".png"),
+        ):
+            with self.assertRaises(errors.PrivoraError) as caught:
+                handler.build_privora_job(payload, generation_id)
+        self.assertEqual(caught.exception.code, errors.INVALID_REFERENCE_TYPE)
+        self._assert_job_removed(generation_id)
+
+    def test_fetch_timeout_after_a_successful_stage_is_cleaned(self):
+        generation_id = "cleanup-fetch-timeout"
+        payload = {
+            "mode": "references", "prompt": "x",
+            "references": [
+                {"type": "image", "role": "character", "url": "https://x/first"},
+                {"type": "image", "role": "style", "url": "https://x/second"},
+            ],
+        }
+        timeout = handler.requests.exceptions.Timeout("signed-url-canary")
+        with (
+            WithInventory(),
+            mock.patch.object(handler, "_fetch_asset_bytes",
+                              side_effect=[self.PLAINTEXT, timeout]),
+            mock.patch.object(handler, "_validate_image_bytes", return_value=".png"),
+        ):
+            with self.assertRaises(handler.requests.exceptions.Timeout):
+                handler.build_privora_job(payload, generation_id)
+        self._assert_job_removed(generation_id)
+
+    def test_post_staging_duration_validation_failure_is_cleaned(self):
+        generation_id = "cleanup-validation-failure"
+        payload = {
+            "mode": "references", "prompt": "x",
+            "references": [
+                {"type": "video", "role": "motion", "url": "https://x/video"},
+            ],
+        }
+
+        def stage(reference, kind, job_dir):
+            reference.duration_seconds = 20.0
+            return self._write_stage(reference, kind, job_dir)
+
+        with WithInventory(), mock.patch.object(handler, "_stage_media_reference", stage):
+            with self.assertRaises(errors.PrivoraError) as caught:
+                handler.build_privora_job(payload, generation_id)
+        self.assertEqual(caught.exception.code, errors.INVALID_REFERENCE_DURATION)
+        self._assert_job_removed(generation_id)
+
+    def test_measured_soundtrack_duration_is_rejected_and_cleaned(self):
+        generation_id = "cleanup-soundtrack-duration"
+        payload = {
+            "mode": "references", "prompt": "x",
+            "references": [{
+                "type": "video", "role": "motion", "url": "https://x/video",
+                "soundtrack": {
+                    "type": "audio", "role": "ambience", "url": "https://x/audio",
+                },
+            }],
+        }
+
+        def stage(reference, kind, job_dir):
+            reference.duration_seconds = 8.0 if kind == "video" else 20.0
+            return self._write_stage(reference, kind, job_dir)
+
+        with WithInventory(), mock.patch.object(handler, "_stage_media_reference", stage):
+            with self.assertRaises(errors.PrivoraError) as caught:
+                handler.build_privora_job(payload, generation_id)
+        self.assertEqual(caught.exception.code, errors.INVALID_REFERENCE_DURATION)
+        self.assertEqual(caught.exception.details["type"], "soundtrack")
+        self._assert_job_removed(generation_id)
+
+    def test_a_reference_with_no_source_is_a_coded_client_error(self):
+        with WithInventory():
+            with self.assertRaises(errors.PrivoraError) as caught:
+                handler.build_privora_job(
+                    {"mode": "references", "prompt": "x", "seed": 1,
+                     "references": [{"type": "image", "role": "character"}]},
+                    "gen-no-source",
+                )
+        response = caught.exception.as_response()
+        self.assertEqual(response["errorCode"], errors.INVALID_REFERENCE_TYPE)
+        self.assertTrue(caught.exception.is_client_error)
+
+    def test_a_reference_with_two_sources_is_refused(self):
+        with WithInventory():
+            with self.assertRaises(errors.PrivoraError) as caught:
+                handler.build_privora_job(
+                    {"mode": "references", "prompt": "x", "seed": 1,
+                     "references": [{"type": "image", "role": "character",
+                                     "url": "https://example.invalid/a.png",
+                                     "data": "AAAA"}]},
+                    "gen-two-sources",
+                )
+        self.assertEqual(caught.exception.code, errors.INVALID_REFERENCE_TYPE)
+
+
+class ReferenceFetchLimitTests(unittest.TestCase):
+    """Video and audio references share the image fetcher; they must not share its cap.
+
+    capabilities() advertises 256 MB of video and 64 MB of audio. Before this was
+    parameterised, every reference went through the image path's 32 MB limit and an
+    `Accept: image/*` header, so a supported reference could be refused by our own
+    downloader - or by a strict origin answering 406.
+    """
+
+    def _capture(self, kind):
+        seen = {}
+
+        def fake_download(url, bearer_token=None, *, max_bytes, accept, what):
+            seen.update(max_bytes=max_bytes, accept=accept, what=what)
+            raise handler.ImageInputError("stop: the network is out of scope here")
+
+        job_dir = tempfile.mkdtemp()
+        saved = handler._download_image
+        handler._download_image = fake_download
+        try:
+            reference = types.SimpleNamespace(
+                url="https://example.invalid/a.bin", data_base64=None, token=None,
+                type=kind, duration_seconds=None,
+            )
+            with self.assertRaises(handler.ImageInputError):
+                if kind == "image":
+                    handler._stage_image_reference(reference, job_dir)
+                else:
+                    handler._stage_media_reference(reference, kind, job_dir)
+        finally:
+            handler._download_image = saved
+            shutil.rmtree(job_dir, ignore_errors=True)
+        return seen
+
+    def test_a_video_reference_uses_the_video_cap(self):
+        seen = self._capture("video")
+        self.assertEqual(seen["max_bytes"], media.MAX_VIDEO_BYTES)
+        self.assertEqual(seen["accept"], "video/*, application/octet-stream")
+
+    def test_an_audio_reference_uses_the_audio_cap(self):
+        seen = self._capture("audio")
+        self.assertEqual(seen["max_bytes"], media.MAX_AUDIO_BYTES)
+        self.assertEqual(seen["accept"], "audio/*, application/octet-stream")
+
+    def test_an_image_reference_keeps_the_image_cap(self):
+        seen = self._capture("image")
+        self.assertEqual(seen["max_bytes"], handler.MAX_IMAGE_BYTES)
+        self.assertEqual(seen["accept"], "image/*")
+
+    def test_a_fetch_timeout_does_not_echo_url_or_bearer_material(self):
+        url_secret = "URL_SECRET_CANARY_51A9"
+        bearer_secret = "BEARER_SECRET_CANARY_20F3"
+        timeout = handler.requests.exceptions.Timeout(
+            f"timed out fetching https://example.com/?token={url_secret}"
+        )
+        with (
+            mock.patch.object(handler, "_assert_fetchable_url"),
+            mock.patch.object(handler.requests, "get", side_effect=timeout),
+        ):
+            with self.assertRaises(handler.ImageInputError) as caught:
+                handler._download_image(
+                    f"https://example.com/?token={url_secret}",
+                    bearer_token=bearer_secret,
+                    what="reference video",
+                )
+        rendered = str(caught.exception)
+        self.assertNotIn(url_secret, rendered)
+        self.assertNotIn(bearer_secret, rendered)
+        self.assertEqual(rendered, "Downloading reference video failed.")
+
+
+class CapabilityBuildIdentityTests(unittest.TestCase):
+    def test_capabilities_exposes_safe_immutable_build_identity(self):
+        values = {
+            "H3_BUILD_SOURCE_COMMIT": "abc123def456",
+            "H3_BUILD_IMAGE_TAG": "multimodal-3",
+            "H3_BUILD_ID": "98765-1",
+            "COMFYUI_H3_COMMIT": "dec5d945",
+        }
+        with WithInventory(), mock.patch.dict(os.environ, values, clear=False):
+            worker = handler.worker_capabilities()["worker"]
+        self.assertEqual(worker["build"], {
+            "sourceCommit": values["H3_BUILD_SOURCE_COMMIT"],
+            "imageTag": values["H3_BUILD_IMAGE_TAG"],
+            "buildId": values["H3_BUILD_ID"],
+        })
+        self.assertEqual(worker["comfyuiCommit"], "dec5d945")
+        self.assertNotIn("path", str(worker).lower())
 
 
 if __name__ == "__main__":

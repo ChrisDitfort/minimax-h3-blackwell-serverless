@@ -66,6 +66,23 @@ def align_frame_count(frames: int) -> int:
     return frames
 
 
+def maximum_aligned_frame_count() -> int:
+    """Largest frame count that is both on H3's grid and within the node ceiling.
+
+    ``MAX_FRAMES`` itself is not necessarily executable: 3600 is off the 17k+5 grid,
+    and aligning it upward produces 3609. Walking backward through ``align_frame_count``
+    keeps capability reporting tied to the validation arithmetic instead of publishing a
+    separately hard-coded duration that can drift.
+    """
+    for requested in range(MAX_FRAMES, MIN_FRAMES - 1, -1):
+        aligned = align_frame_count(requested)
+        if aligned <= MAX_FRAMES:
+            return aligned
+    raise RuntimeError(  # pragma: no cover - impossible with the pinned node schema
+        "The configured H3 frame bounds contain no legal frame count."
+    )
+
+
 def video_latent_t(frame_count: int) -> int:
     """Latent temporal length. Identical to the node's `video_latent_t`."""
     if frame_count <= 5:

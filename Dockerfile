@@ -14,6 +14,10 @@
 #   * ComfyUI-Pixaroma H3 nodes, already baked into custom_nodes
 FROM ghcr.io/nightfall93/runpod-comfyui-minimax-h3:cuda13-blackwell
 
+ARG H3_BUILD_SOURCE_COMMIT=unknown
+ARG H3_BUILD_IMAGE_TAG=unknown
+ARG H3_BUILD_ID=local
+
 USER root
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
@@ -122,6 +126,10 @@ ENV H3_GPU_MODE=single \
     H3_SP_MASTER_PORT=29513 \
     H3_SP_VAE=1 \
     H3_SP_SELFTEST=1 \
+    H3_BUILD_SOURCE_COMMIT=${H3_BUILD_SOURCE_COMMIT} \
+    H3_BUILD_IMAGE_TAG=${H3_BUILD_IMAGE_TAG} \
+    H3_BUILD_ID=${H3_BUILD_ID} \
+    COMFYUI_H3_COMMIT=dec5d945 \
     NCCL_DEBUG=WARN
 
 WORKDIR /opt/serverless
