@@ -172,8 +172,9 @@ jobs:
             echo "::endgroup::"
           done < models.tsv
 
-          if [ "$step" -ne 4 ]; then
-            echo "::error::Expected 4 model layers, appended ${step}. Check models.tsv."
+          expected=$(grep -cvE '^\s*(#|$)' models.tsv)
+          if [ "$step" -ne "$expected" ]; then
+            echo "::error::Expected ${expected} model layers, appended ${step}. Check models.tsv."
             exit 1
           fi
 
@@ -224,7 +225,7 @@ jobs:
           # image survives and can be promoted with the promote_tag input instead of
           # re-downloading 42 GB.
           echo "Staging tags retained (reused by the next run):"
-          for step in 1 2 3 4; do
+          for step in $(seq 1 "$(grep -cvE '^\s*(#|$)' models.tsv)"); do
             echo "  ${IMAGE}:staging-${step}"
           done
           echo

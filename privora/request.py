@@ -23,7 +23,8 @@ import random
 from dataclasses import dataclass, field
 
 from . import canvas as canvas_module
-from . import errors, references as references_module
+from . import errors, models as models_module
+from . import references as references_module
 from .prompt import CompiledPrompt, compile_prompt
 from .references import Reference, ReferenceSet
 
@@ -66,6 +67,8 @@ class GenerationRequest:
     first_frame: Reference | None = None
     last_frame: Reference | None = None
     ref_image_size: str = "match"
+    #: quality | turbo | turbo_fast. Resolved to a checkpoint+LoRA by privora.models.
+    generation_mode: str = models_module.DEFAULT_GENERATION_MODE
     #: Carried through untouched; the handler owns privacy, not this layer.
     privacy: dict = field(default_factory=dict)
     encryption: dict = field(default_factory=dict)
@@ -278,6 +281,7 @@ def parse(payload: dict, *, max_references: int = references_module.PRODUCT_MAX_
         first_frame=first_frame,
         last_frame=last_frame,
         ref_image_size=references_module.resolve_fidelity(payload.get("referenceFidelity")),
+        generation_mode=models_module.parse_generation_mode(payload.get("generationMode")),
         privacy=payload.get("privacy") or {},
         encryption=payload.get("encryption") or {},
         output=payload.get("output") or {},
@@ -318,6 +322,14 @@ def parse_legacy(payload: dict) -> GenerationRequest:
             url=payload.get("image_url"), data_base64=payload.get("image_base64"),
         )
 
+    family = MODE_FAMILY[ANIMATE if first_frame is not None else CREATE]
+    legacy_mode = models_module.steps_to_generation_mode(family, resolved.steps)
+    if legacy_mode is None:
+        # An unusual legacy step count keeps running on the base checkpoint at that
+        # count. Turbo is never selected implicitly: swapping the model underneath a
+        # caller who only asked for fewer steps would change what they are paying for.
+        legacy_mode = models_module.QUALITY
+
     return GenerationRequest(
         mode=ANIMATE if first_frame is not None else CREATE,
         prompt=compile_prompt(prompt_text),
@@ -328,6 +340,7 @@ def parse_legacy(payload: dict) -> GenerationRequest:
         encryption=payload.get("encryption") or {},
         output=payload.get("output") or {},
         progress=payload.get("progress") or {},
+        generation_mode=legacy_mode,
         legacy=True,
     )
 

@@ -5,11 +5,24 @@
 # (MODEL_REVISION=eb8a16107c595128b3a578f82d2ce2f75920c355). Sizes and checksums are
 # copied verbatim from that script's DOWNLOAD_SIZES / DOWNLOAD_SHA256 tables.
 #
-# REF2VA is deliberately excluded: the Cloudflare workflow is FL2VA text-to-video only,
-# and skipping it saves ~21 GB of image size.
+# REF2VA is now included: reference generation (images / videos / audio) is a separate
+# checkpoint, not a mode of FL2VA, so the +21 GB is what reference modes cost.
+#
+# The Turbo LoRAs are pinned to a DIFFERENT revision on purpose. They did not exist at
+# eb8a16107c59 - the loras/ directory was added later - and
+# re-pinning the diffusion weights to pick them up would change the DiT bytes that every
+# existing benchmark was measured against. Two revisions, each pinned, is the honest way
+# to add new files without disturbing old measurements.
+# Turbo LoRA revision: 4cc1d817b6184899b41293954329f576cb5ae86b
+#
+# There is no 8-step Ref2VA LoRA published at that revision; only 4-step, at v0.1.
 #
 # name<TAB>url<TAB>dest(path inside image)<TAB>size_bytes<TAB>sha256
 fl2va	https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/eb8a16107c595128b3a578f82d2ce2f75920c355/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors	opt/comfyui-baked/models/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors	20970379616	e889202c41dafb67b10d67b97f0d8541508036a6090af23425a5c2615d03c47a
 qwen3vl	https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/eb8a16107c595128b3a578f82d2ce2f75920c355/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors	opt/comfyui-baked/models/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors	15687142551	35a88d51044231fe332301d7a62aa81e3f2cba62febeb446e2c1e3e0ef76f2c6
 video_vae	https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/eb8a16107c595128b3a578f82d2ce2f75920c355/vae/minimax_h3_video_vae_fp16.safetensors	opt/comfyui-baked/models/vae/minimax_h3_video_vae_fp16.safetensors	5207808496	7c1f131492e7eddacaac9069a61b81bdd39de5cc96561e677c5eab1cdce5e522
 audio_vae	https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/eb8a16107c595128b3a578f82d2ce2f75920c355/vae/minimax_h3_audio_vae_fp32.safetensors	opt/comfyui-baked/models/vae/minimax_h3_audio_vae_fp32.safetensors	605254808	8e505d95dd1561d47abd43d4238fd40d9bb1ae9e147ed0a4cba778d76ae4db48
+ref2va	https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/eb8a16107c595128b3a578f82d2ce2f75920c355/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors	opt/comfyui-baked/models/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors	20970379616	9255f52b6677845ad238f20dfaafa94727053694127ab7f255c048f0f9365779
+turbo_fl2v_4step	https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/4cc1d817b6184899b41293954329f576cb5ae86b/loras/minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors	opt/comfyui-baked/models/loras/minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors	1956192992	c396a9a06f58399e9df9754b18299818d84a2ddd371724ba48fe4a41221437dc
+turbo_fl2v_8step	https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/4cc1d817b6184899b41293954329f576cb5ae86b/loras/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors	opt/comfyui-baked/models/loras/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors	1956193000	2339acdf19bfe123f46b971ea35d367a84adb85de43627e1eceafa5a5b2b111e
+turbo_ref2v_4step	https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/4cc1d817b6184899b41293954329f576cb5ae86b/loras/minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors	opt/comfyui-baked/models/loras/minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors	1956193000	5b9ab5ade15d0775676d01a907268a69a1468dc6033b3b0d3ded5502f3ebb84c

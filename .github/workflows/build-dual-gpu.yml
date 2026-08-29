@@ -59,7 +59,7 @@ env:
   REGISTRY: ghcr.io
   IMAGE: ghcr.io/chrisditfort/minimax-h3-blackwell-serverless
   # A push event carries no inputs, so every input needs a fallback here.
-  DEFAULT_TAG: privacy-fix-1
+  DEFAULT_TAG: multimodal-1
   DEFAULT_BASE_TAG: latest
   DEFAULT_OLD_CODE_TAG: code
 
@@ -373,8 +373,9 @@ jobs:
             echo "::endgroup::"
           done < models.tsv
 
-          if [ "$step" -ne 4 ]; then
-            echo "::error::Expected 4 model layers, appended ${step}."
+          expected=$(grep -cvE '^\s*(#|$)' models.tsv)
+          if [ "$step" -ne "$expected" ]; then
+            echo "::error::Expected ${expected} model layers, appended ${step}."
             exit 1
           fi
           echo "final_ref=${current}" >> "$GITHUB_ENV"

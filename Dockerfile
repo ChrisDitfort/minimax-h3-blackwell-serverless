@@ -58,6 +58,7 @@ RUN python3 -m pip install --no-cache-dir --break-system-packages \
 RUN mkdir -p "$COMFY_DIR/models/diffusion_models/h3" \
              "$COMFY_DIR/models/text_encoders" \
              "$COMFY_DIR/models/vae" \
+             "$COMFY_DIR/models/loras" \
              /workspace/runpod-slim/ComfyUI/input \
              /workspace/runpod-slim/ComfyUI/output \
              /tmp/comfy-temp \
@@ -96,6 +97,11 @@ COPY artifacts.py /opt/serverless/artifacts.py
 # handler process and every ComfyUI rank import the same copy; the one-file shim in
 # custom_nodes is how ComfyUI is told to load it, since that is the only directory it
 # scans. Nothing in it runs unless H3_GPU_MODE=dual - see the ENV block below.
+# The PrivoraVideo product abstraction: modes, roles, the prompt compiler, the canvas
+# solver and the workflow builders. This is what keeps ComfyUI node names and H3 prompt
+# syntax out of the control plane.
+COPY privora /opt/serverless/privora
+
 COPY h3_parallel /opt/serverless/h3_parallel
 COPY comfy_custom_nodes/h3_parallel_boot.py ${COMFY_DIR}/custom_nodes/h3_parallel_boot.py
 
