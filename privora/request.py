@@ -157,6 +157,7 @@ def _reference_from(spec, expected_type: str | None = None) -> Reference:
         id=spec.get("id"),
         url=spec.get("url"),
         data_base64=spec.get("data") or spec.get("dataBase64"),
+        token=spec.get("token"),
         soundtrack=soundtrack,
     )
 

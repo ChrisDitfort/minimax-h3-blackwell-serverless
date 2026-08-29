@@ -117,6 +117,9 @@ class Reference:
     id: str | None = None
     url: str | None = None
     data_base64: str | None = None
+    #: Bearer token for the Worker's job-scoped asset route. Never logged, never
+    #: returned - it reaches _fetch_asset_bytes and nowhere else.
+    token: str | None = None
     #: Measured during preprocessing. None until then.
     duration_seconds: float | None = None
     #: For a video: the soundtrack travels with it rather than as a separate reference.

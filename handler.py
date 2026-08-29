@@ -67,6 +67,15 @@ from artifacts import (
 from h3_parallel import config as gpu_config
 from h3_parallel import shadow as shadow_graph
 
+# The PrivoraVideo product abstraction. The handler stays a thin executor: privora
+# decides what to run; this file still owns staging, privacy and output as before.
+from privora import errors as privora_errors
+from privora import media as privora_media
+from privora import models as privora_models
+from privora import references as privora_references
+from privora import request as privora_request
+from privora import workflows as privora_workflows
+
 # --------------------------------------------------------------------------------------
 # Configuration
 # --------------------------------------------------------------------------------------
@@ -2512,6 +2521,154 @@ def _discard_output_file(path: str) -> None:
         log(f"WARNING: could not remove output file: {error}")
 
 
+
+# --------------------------------------------------------------------------------------
+# PrivoraVideo request bridge
+# --------------------------------------------------------------------------------------
+#
+# Two request shapes reach this worker and both keep working:
+#
+#   {"workflow": {...}}   the pre-rebuild contract - a raw ComfyUI graph built by the
+#                         Cloudflare Worker. Passed through untouched, as it always was.
+#   {"mode": "...", ...}  the PrivoraVideo schema. privora parses it and builds the graph;
+#                         this section stages the reference media into it.
+#
+# Everything after the graph exists - submission, progress, output, encryption, cleanup -
+# is the same code on both paths. A new API must not become a new privacy boundary.
+
+#: Resolved once at boot from the real model directories, so capabilities and every
+#: rejection describe the image that was actually built rather than the one intended.
+MODEL_INVENTORY = privora_models.ModelInventory(
+    diffusion_dir=os.path.join(COMFY_DIR, "models", "diffusion_models"),
+    lora_dir=os.path.join(COMFY_DIR, "models", "loras"),
+)
+
+
+def _job_input_dir(generation_id: str) -> str:
+    """A per-job directory inside ComfyUI's input tree.
+
+    Isolated per job so one caller's references can never be visible to the next, and
+    inside COMFY_INPUT_DIR because ComfyUI's loaders resolve names relative to it.
+    """
+    safe = "".join(c for c in str(generation_id) if c.isalnum() or c in "-_")[:64]
+    path = os.path.join(os.path.realpath(COMFY_INPUT_DIR), "job-" + (safe or uuid.uuid4().hex))
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _staged_name(job_dir: str, filename: str, kind: str) -> str:
+    """Write-path containment check, then the name relative to the input directory."""
+    path = os.path.realpath(os.path.join(job_dir, filename))
+    if os.path.dirname(path) != os.path.realpath(job_dir):
+        raise privora_errors.PrivoraError(
+            privora_errors.REFERENCE_PREPROCESSING_FAILED,
+            "A reference could not be staged safely.", {"type": kind},
+        )
+    return path
+
+
+def _stage_image_reference(reference, job_dir: str) -> str:
+    """Reuses the hardened image path: magic bytes, Pillow decode, pixel and byte caps."""
+    data = _fetch_asset_bytes(
+        {"url": reference.url, "base64": reference.data_base64, "token": reference.token},
+        "reference image",
+    )
+    extension = _validate_image_bytes(data)
+    filename = "ref-" + uuid.uuid4().hex + extension
+    with open(_staged_name(job_dir, filename, "image"), "wb") as handle:
+        handle.write(data)
+    os.chmod(os.path.join(job_dir, filename), 0o644)  # data, never executable
+    return os.path.join(os.path.basename(job_dir), filename)
+
+
+def _stage_media_reference(reference, kind: str, job_dir: str) -> str:
+    """Fetch, validate and write one video or audio reference.
+
+    The filename is generated. Nothing the caller supplied - id, url, original name -
+    reaches the filesystem, which is what makes traversal and cross-job collision
+    impossible rather than merely unlikely.
+    """
+    data = _fetch_asset_bytes(
+        {"url": reference.url, "base64": reference.data_base64, "token": reference.token},
+        "reference " + kind,
+    )
+    privora_media.check_size(data, kind)
+    container = privora_media.sniff(data, kind)
+
+    filename = "ref-" + uuid.uuid4().hex + "." + container
+    path = _staged_name(job_dir, filename, kind)
+    with open(path, "wb") as handle:
+        handle.write(data)
+    os.chmod(path, 0o644)
+
+    info = privora_media.probe(path, kind)
+    reference.duration_seconds = info.duration_seconds
+    log("Staged " + kind + " reference (" + str(len(data)) + " bytes, "
+        + format(info.duration_seconds, ".1f") + "s, " + info.codec + ")")
+    return os.path.join(os.path.basename(job_dir), filename)
+
+
+def build_privora_job(job_input: dict, generation_id: str) -> tuple[dict, str, dict]:
+    """Parse a PrivoraVideo request into a ComfyUI graph with its references staged.
+
+    Returns (graph, job directory, metadata). The directory comes back so the caller can
+    remove it on every exit path rather than trusting this function to have cleaned up
+    after an exception it did not catch.
+    """
+    request = privora_request.parse(job_input)
+    plan = privora_workflows.build(request, MODEL_INVENTORY, request.generation_mode)
+    job_dir = _job_input_dir(generation_id)
+
+    for item in plan.staging:
+        reference = item["reference"]
+        if reference.type == "image":
+            name = _stage_image_reference(reference, job_dir)
+        else:
+            name = _stage_media_reference(reference, reference.type, job_dir)
+        plan.graph[item["node"]]["inputs"][item["field"]] = name
+
+    # Durations are only knowable after the probe, so the duration rules run here rather
+    # than in parse() - still before the model is touched, which is the point.
+    privora_references.validate_durations(request.references)
+    videos = [privora_media.MediaInfo("video", v.duration_seconds or 0.0, "")
+              for v in request.references.videos if v.duration_seconds]
+    if videos:
+        privora_media.check_aggregate(
+            videos, "video", limit_seconds=privora_media.MAX_TOTAL_VIDEO_SECONDS)
+    audios = [privora_media.MediaInfo("audio", a.duration_seconds or 0.0, "")
+              for a in request.references.audios if a.duration_seconds]
+    if audios:
+        privora_media.check_aggregate(
+            audios, "audio", limit_seconds=privora_media.MAX_TOTAL_AUDIO_SECONDS)
+
+    metadata = {**request.as_metadata(), **plan.as_metadata()}
+    log(
+        "Privora request: mode=" + request.mode + " model=" + request.family
+        + " generationMode=" + str(metadata["generationMode"])
+        + " steps=" + str(metadata["steps"])
+        + " canvas=" + str(request.canvas.width) + "x" + str(request.canvas.height)
+        + " frames=" + str(request.canvas.frames)
+        + " references=" + str(request.references.file_count)
+    )
+    return plan.graph, job_dir, metadata
+
+
+def cleanup_job_dir(job_dir) -> None:
+    """Remove a job's staged references. Only ever touches directories we created."""
+    if not job_dir:
+        return
+    try:
+        resolved = os.path.realpath(job_dir)
+        root = os.path.realpath(COMFY_INPUT_DIR)
+        if not resolved.startswith(root + os.sep) or not os.path.basename(resolved).startswith("job-"):
+            log("WARNING: refusing to clean up unexpected reference directory " + resolved)
+            return
+        shutil.rmtree(resolved, ignore_errors=True)
+    except OSError as error:
+        log("WARNING: could not remove staged references: " + str(error))
+
+
+
 # --------------------------------------------------------------------------------------
 # RunPod entrypoint
 # --------------------------------------------------------------------------------------
@@ -2565,6 +2722,9 @@ def handler(job: dict) -> dict:
     job_id = job.get("id", "<unknown>")
     staged_assets: list[str] = []
     protector: artifacts.ArtifactProtector | None = None
+    # Set only on the PrivoraVideo path; removed in `finally` on every exit.
+    job_dir: str | None = None
+    privora_metadata: dict = {}
 
     global _jobs_served
     with _jobs_lock:
@@ -2587,21 +2747,27 @@ def handler(job: dict) -> dict:
 
     try:
         if not isinstance(workflow, dict) or not workflow:
-            status = "bad_request"
-            return {"error": "input.workflow is required and must be a ComfyUI API-format object."}
+            # No raw graph: this is a PrivoraVideo request. privora validates it, resolves
+            # the canvas and generation mode, and builds the graph; from the next line on
+            # both paths are the same code.
+            workflow, job_dir, privora_metadata = build_privora_job(job_input, generation_id)
+            timer._workflow = workflow
 
-        # Resolved before anything expensive starts: a job that cannot be protected the way
-        # it asked should cost zero GPU seconds, not fail after two minutes of sampling.
-        protector = build_protector_for_job(job_input)
-        # The id the artefact is filed under. Taken from the output block first, because
-        # that is the one the storage key is derived from: an encrypted container records
-        # this id in its authenticated header, and the upload endpoint refuses a container
-        # whose header names a different job.
+        # The id the artefact is filed under, and the name of this job's isolated
+        # reference directory. Resolved first because the bridge below needs it.
         generation_id = str(
             _spec(job_input, "output").get("jobId")
             or _spec(job_input, "progress").get("jobId")
             or job_id
         )
+
+        # Resolved before anything expensive starts: a job that cannot be protected the way
+        # it asked should cost zero GPU seconds, not fail after two minutes of sampling.
+        protector = build_protector_for_job(job_input)
+        # generation_id is resolved above, before the bridge. It is taken from the output
+        # block first because that is the one the storage key is derived from: an encrypted
+        # container records this id in its authenticated header, and the upload endpoint
+        # refuses a container whose header names a different job.
         timer.privacy_mode = protector.mode
         log(
             f"generation_id={generation_id} privacy_mode={protector.mode} "
@@ -2688,6 +2854,11 @@ def handler(job: dict) -> dict:
         status = "ok"
 
         result = {"images": images, "prompt_id": prompt_id, "privacyMode": protector.mode}
+        if privora_metadata:
+            # What was actually run, not what was asked for: resolved canvas, real frame
+            # count and duration, the seed used, and the generation mode with its step
+            # count. A caller should never have to re-derive any of it.
+            result["generation"] = privora_metadata
 
         # Only now is the job genuinely done: the upload has already succeeded, because
         # WorkerUploadStore raises rather than returning on a failed PUT.
@@ -2701,6 +2872,13 @@ def handler(job: dict) -> dict:
 
         return result
 
+    except privora_errors.PrivoraError as error:
+        # Structured and already sanitised: the message carries counts and limits, never
+        # the prompt, a reference filename or a local path. `internal` is logged only.
+        log(f"Job {job_id}: {error.as_log_line()}")
+        status = "client_error" if error.is_client_error else "error"
+        reporter.phase(PHASE_FAILED, error={"code": error.code, "message": error.message})
+        return error.as_response()
     except WorkflowError as error:
         # Covers ImageInputError too: a caller-facing validation failure, not a crash.
         log(f"Job {job_id}: workflow error: {error}")
@@ -2719,6 +2897,9 @@ def handler(job: dict) -> dict:
         # Always runs, so a failed or rejected job cannot orphan staged input images.
         for path in staged_assets:
             cleanup_input_image(path)
+        # And the same for a Privora job's reference directory - on success, on rejection,
+        # on timeout and on an exception nobody anticipated.
+        cleanup_job_dir(job_dir)
         # Shadow ranks are stopped and swept on the same boundary as rank 0's plaintext:
         # nothing job-specific may survive into the next request on a warm worker.
         if _shadow_ranks:
