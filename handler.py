@@ -72,6 +72,7 @@ from h3_parallel import shadow as shadow_graph
 from privora import errors as privora_errors
 from privora import media as privora_media
 from privora import models as privora_models
+from privora import canvas as privora_canvas
 from privora import references as privora_references
 from privora import request as privora_request
 from privora import workflows as privora_workflows
@@ -2653,6 +2654,52 @@ def build_privora_job(job_input: dict, generation_id: str) -> tuple[dict, str, d
     return plan.graph, job_dir, metadata
 
 
+def worker_capabilities() -> dict:
+    """What this image can actually do.
+
+    Assembled from the product schema plus a filesystem look at which weights were baked
+    in, so an image built without the Ref2VA checkpoint reports reference modes as
+    unavailable instead of advertising them and failing at job time.
+    """
+    document = privora_request.capabilities(
+        ref2va_available=MODEL_INVENTORY.has_family(privora_models.REF2VA)
+    )
+    document.update(MODEL_INVENTORY.describe())
+    document["worker"] = {
+        "processId": PROCESS_ID,
+        "gpuMode": GPU_CONFIG.mode if GPU_CONFIG else "unresolved",
+        "comfyuiCommit": os.environ.get("COMFYUI_H3_COMMIT", "unknown"),
+    }
+    return document
+
+
+def verify_model_arithmetic() -> None:
+    """Check the canvas constants against the installed node source, at boot.
+
+    privora/canvas.py restates ComfyUI's own geometry so a bad request can be refused
+    before a model load. A copy of somebody else's arithmetic is a liability unless
+    something checks it, and a base-image bump that changed the canvas rule would
+    otherwise surface as subtly wrong output rather than as a startup warning.
+    """
+    try:
+        import comfy_extras.nodes_minimax_h3 as node_module
+    except Exception as error:
+        log(f"canvas verification skipped: ComfyUI not importable here ({type(error).__name__})")
+        return
+
+    problems = privora_canvas.verify_against_comfyui(node_module)
+    if problems:
+        for problem in problems:
+            log(f"WARNING: canvas drift - {problem}")
+        log(
+            "WARNING: privora/canvas.py no longer matches the installed MiniMax H3 node. "
+            "Requests will still run, but the dimensions and durations this worker reports "
+            "may not be the ones the model uses."
+        )
+    else:
+        log("canvas arithmetic verified against the installed MiniMax H3 node")
+
+
 def cleanup_job_dir(job_dir) -> None:
     """Remove a job's staged references. Only ever touches directories we created."""
     if not job_dir:
@@ -2746,6 +2793,12 @@ def handler(job: dict) -> dict:
     )
 
     try:
+        if str(job_input.get("mode") or "").strip().lower() == "capabilities":
+            # A discovery probe. Answered without loading a model, staging anything or
+            # starting ComfyUI, so the control plane can ask cheaply and often.
+            status = "ok"
+            return {"capabilities": worker_capabilities()}
+
         if not isinstance(workflow, dict) or not workflow:
             # No raw graph: this is a PrivoraVideo request. privora validates it, resolves
             # the canvas and generation mode, and builds the graph; from the next line on
@@ -3128,6 +3181,14 @@ def main() -> None:
             f"[H3-GPU] launching {GPU_CONFIG.world_size} ComfyUI ranks on ports "
             f"{[gpu_config.comfy_port_for_rank(r, COMFY_PORT) for r in range(GPU_CONFIG.world_size)]}"
         )
+
+    verify_model_arithmetic()
+    installed = MODEL_INVENTORY.describe()
+    log(
+        "models: fl2va=" + str(installed["models"].get("fl2va"))
+        + " ref2va=" + str(installed["models"].get("ref2va"))
+        + " turbo=" + str(installed["turbo"])
+    )
 
     # Fail fast on misconfigured output storage rather than at the end of a paid 5-minute
     # generation. Validates R2 credentials and the key-wrapping key at boot.
