@@ -62,6 +62,8 @@ env:
   DEFAULT_TAG: multimodal-1
   DEFAULT_BASE_TAG: latest
   DEFAULT_OLD_CODE_TAG: code
+  # models.tsv carries weights :latest does not, so a rebase cannot build this image.
+  DEFAULT_FULL_REBUILD: "true"
 
 jobs:
   # ------------------------------------------------------------------------------------
@@ -76,6 +78,7 @@ jobs:
       code_ref: ${{ steps.record.outputs.code_ref }}
       code_tag: ${{ steps.guard.outputs.code_tag }}
       tag: ${{ steps.guard.outputs.tag }}
+      full_rebuild: ${{ steps.guard.outputs.full_rebuild }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -84,6 +87,7 @@ jobs:
         id: guard
         env:
           TAG_INPUT: ${{ inputs.tag }}
+          FULL_REBUILD_INPUT: ${{ inputs.full_rebuild }}
         run: |
           set -euo pipefail
           TAG="${TAG_INPUT:-$DEFAULT_TAG}"
@@ -97,6 +101,11 @@ jobs:
             echo "::error::'${TAG}' is not a valid lowercase OCI tag."
             exit 1
           fi
+          # Job-level `if` cannot read `env`, so the effective value is resolved here
+          # and published as an output the dependent jobs can gate on.
+          FULL_REBUILD="${FULL_REBUILD_INPUT:-$DEFAULT_FULL_REBUILD}"
+          echo "full_rebuild=${FULL_REBUILD}" >> "$GITHUB_OUTPUT"
+          echo "Model layers: $([ "$FULL_REBUILD" = "true" ] && echo "full append" || echo "rebase")"
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "code_tag=code-${TAG}" >> "$GITHUB_OUTPUT"
           echo "Publishing experimental image to ${IMAGE}:${TAG}"
@@ -151,7 +160,7 @@ jobs:
   # ------------------------------------------------------------------------------------
   rebase:
     needs: build-code
-    if: ${{ inputs.full_rebuild != true }}
+    if: ${{ needs.build-code.outputs.full_rebuild != 'true' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -302,7 +311,7 @@ jobs:
   # ------------------------------------------------------------------------------------
   append-models:
     needs: build-code
-    if: ${{ inputs.full_rebuild == true }}
+    if: ${{ needs.build-code.outputs.full_rebuild == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
