@@ -106,6 +106,14 @@ COPY artifacts.py /opt/serverless/artifacts.py
 # syntax out of the control plane.
 COPY privora /opt/serverless/privora
 
+# Protect the real ComfyUI API boundary that ordinary unit mocks cannot reproduce.
+# MiniMaxH3ReferenceToVideo uses V3 Autogrow sockets: an incorrectly named socket can pass
+# /prompt validation and fail only when execute() is invoked.  This reads the source baked
+# into the pinned base image, builds representative Privora graphs, and fails the image
+# build before publication if the two contracts do not normalise to the same kwargs.
+COPY scripts/verify_ref2va_contract.py /opt/serverless/scripts/verify_ref2va_contract.py
+RUN python3 /opt/serverless/scripts/verify_ref2va_contract.py --comfy-root "$COMFY_DIR"
+
 COPY h3_parallel /opt/serverless/h3_parallel
 COPY comfy_custom_nodes/h3_parallel_boot.py ${COMFY_DIR}/custom_nodes/h3_parallel_boot.py
 

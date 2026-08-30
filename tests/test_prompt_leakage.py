@@ -238,6 +238,37 @@ class ExecutionErrorLeakTests(unittest.TestCase):
             handler._raise_if_history_failed(history, "prompt-id")
         self.assertNotIn(PROMPT_CANARY, str(caught.exception))
 
+    def test_free_form_websocket_exception_text_is_not_forwarded(self):
+        detail = {
+            "node_id": "conditioning",
+            "node_type": "MiniMaxH3ReferenceToVideo",
+            "exception_type": "RuntimeError",
+            "exception_message": (
+                f"failed to encode {PROMPT}; fetched https://example.invalid/signed?token=secret"
+            ),
+        }
+        error = handler.ComfyExecutionError(detail, source="websocket")
+        rendered = str(error)
+        self.assertNotIn(PROMPT_CANARY, rendered)
+        self.assertNotIn("example.invalid", rendered)
+        self.assertNotIn("secret", rendered)
+        self.assertIn("MiniMaxH3ReferenceToVideo", rendered)
+        self.assertIn("RuntimeError", rendered)
+        self.assertEqual(error.public_message, "ComfyUI workflow execution failed.")
+        self.assertNotIn(PROMPT_CANARY, error.public_message)
+
+    def test_safe_unexpected_keyword_diagnostic_survives(self):
+        error = handler.ComfyExecutionError({
+            "node_id": "conditioning",
+            "node_type": "MiniMaxH3ReferenceToVideo",
+            "exception_type": "TypeError",
+            "exception_message": (
+                "MiniMaxH3ReferenceToVideo.execute() got an unexpected keyword argument "
+                "'ref_image_1'"
+            ),
+        }, source="websocket")
+        self.assertIn("unexpected keyword argument ref_image_1", str(error))
+
 
 class JobLoggingTests(unittest.TestCase):
     """The per-job log lines describe the job's shape, never its content."""

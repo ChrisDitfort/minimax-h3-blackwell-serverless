@@ -54,6 +54,27 @@ SAVE = "save"
 #: isolated input directory and puts its generated name here; nothing user-supplied ever
 #: reaches a filename.
 IMAGE_LOADER = "PixaromaLoadImage"
+VIDEO_LOADER = "LoadVideo"
+VIDEO_COMPONENTS = "GetVideoComponents"
+AUDIO_LOADER = "LoadAudio"
+
+# ComfyUI dec5d945 exposes MiniMaxH3ReferenceToVideo's variadic media sockets through
+# COMFY_AUTOGROW_V3.  API-format graphs address those sockets by their *dotted* path and
+# their template index is zero-based.  The node normaliser turns, for example,
+# ``ref_images.ref_image_0`` into ``execute(ref_images={"ref_image_0": ...})``.  A bare
+# ``ref_image_1`` is not normalised: it reaches execute() as an unexpected keyword, which
+# is exactly how multimodal-3 failed before sampling.
+REF_IMAGE_GROUP = "ref_images"
+REF_VIDEO_GROUP = "ref_videos"
+REF_VIDEO_AUDIO_GROUP = "ref_video_audios"
+REF_AUDIO_GROUP = "ref_audios"
+
+
+def _autogrow_socket(group: str, prefix: str, index: int) -> str:
+    """Return the exact API-format socket id for one V3 Autogrow item."""
+    if index < 0:
+        raise ValueError("Autogrow indices are zero-based and cannot be negative")
+    return f"{group}.{prefix}{index}"
 
 
 class WorkflowPlan:
@@ -209,10 +230,13 @@ def build_fl2va(request: GenerationRequest, acceleration: models.Acceleration) -
 def build_ref2va(request: GenerationRequest, acceleration: models.Acceleration) -> WorkflowPlan:
     """references and remix.
 
-    Reference inputs use the node's autogrow naming - ref_image_1..9, ref_video_1..3,
-    ref_video_audio_N paired by index to ref_video_N, ref_audio_1..3. Ordering here must
-    match privora.references.assign_ordinals(), because that is what the compiled prompt's
-    <Picture n> / <Video n> / <Audio n> tags were numbered against.
+    Reference inputs use the node's API-format Autogrow paths:
+    ref_images.ref_image_0..8, ref_videos.ref_video_0..2,
+    ref_video_audios.ref_video_audio_N paired by index to ref_videos.ref_video_N, and
+    ref_audios.ref_audio_0..2.  The graph sockets are zero-based; H3's prompt tags remain
+    one-based.  Ordering here must match privora.references.assign_ordinals(), because that
+    is what the compiled prompt's <Picture n> / <Video n> / <Audio n> tags were numbered
+    against.
     """
     graph: dict = {}
     staging: list[dict] = []
@@ -229,27 +253,42 @@ def build_ref2va(request: GenerationRequest, acceleration: models.Acceleration) 
         "ref_image_size": request.ref_image_size,
     }
 
-    for index, image in enumerate(request.references.images, start=1):
-        node_id = f"ref_image_{index}"
-        inputs[node_id] = _stage_image(graph, staging, node_id, image)
+    for index, image in enumerate(request.references.images):
+        node_id = f"ref_image_{index + 1}"
+        socket = _autogrow_socket(REF_IMAGE_GROUP, "ref_image_", index)
+        inputs[socket] = _stage_image(graph, staging, node_id, image)
 
-    for index, video in enumerate(request.references.videos, start=1):
-        node_id = f"ref_video_{index}"
-        graph[node_id] = {"class_type": "LoadVideo", "inputs": {"file": ""}}
+    for index, video in enumerate(request.references.videos):
+        ordinal = index + 1
+        node_id = f"ref_video_{ordinal}"
+        frames_node = f"ref_video_frames_{ordinal}"
+        graph[node_id] = {"class_type": VIDEO_LOADER, "inputs": {"file": ""}}
         staging.append({"node": node_id, "field": "file", "reference": video})
-        inputs[node_id] = [node_id, 0]
+        # Native LoadVideo returns a VIDEO object.  The pinned H3 node asks for an IMAGE
+        # batch of frames, so feed it GetVideoComponents output 0 rather than relying on
+        # ComfyUI to coerce incompatible socket types.
+        graph[frames_node] = {
+            "class_type": VIDEO_COMPONENTS,
+            "inputs": {"video": [node_id, 0]},
+        }
+        socket = _autogrow_socket(REF_VIDEO_GROUP, "ref_video_", index)
+        inputs[socket] = [frames_node, 0]
 
         if video.soundtrack is not None:
-            audio_node = f"ref_video_audio_{index}"
-            graph[audio_node] = {"class_type": "LoadAudio", "inputs": {"audio": ""}}
+            audio_node = f"ref_video_audio_{ordinal}"
+            graph[audio_node] = {"class_type": AUDIO_LOADER, "inputs": {"audio": ""}}
             staging.append({"node": audio_node, "field": "audio", "reference": video.soundtrack})
-            inputs[audio_node] = [audio_node, 0]
+            socket = _autogrow_socket(
+                REF_VIDEO_AUDIO_GROUP, "ref_video_audio_", index
+            )
+            inputs[socket] = [audio_node, 0]
 
-    for index, audio in enumerate(request.references.audios, start=1):
-        node_id = f"ref_audio_{index}"
-        graph[node_id] = {"class_type": "LoadAudio", "inputs": {"audio": ""}}
+    for index, audio in enumerate(request.references.audios):
+        node_id = f"ref_audio_{index + 1}"
+        graph[node_id] = {"class_type": AUDIO_LOADER, "inputs": {"audio": ""}}
         staging.append({"node": node_id, "field": "audio", "reference": audio})
-        inputs[node_id] = [node_id, 0]
+        socket = _autogrow_socket(REF_AUDIO_GROUP, "ref_audio_", index)
+        inputs[socket] = [node_id, 0]
 
     graph[CONDITIONING] = {"class_type": "MiniMaxH3ReferenceToVideo", "inputs": inputs}
     sampling_steps = request.canvas.steps if request.legacy else acceleration.steps

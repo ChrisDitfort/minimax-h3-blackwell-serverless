@@ -331,7 +331,7 @@ class GraphStructureTests(unittest.TestCase):
         self.assertIn("last_frame", plan.graph)
         self.assertEqual({s["node"] for s in plan.staging}, {"first_frame", "last_frame"})
 
-    def test_reference_inputs_use_the_nodes_autogrow_names(self):
+    def test_reference_inputs_use_dotted_zero_based_autogrow_paths(self):
         plan = workflows.build(request_module.parse({
             "mode": "references", "prompt": "x", "seed": 1,
             "references": [
@@ -342,10 +342,58 @@ class GraphStructureTests(unittest.TestCase):
             ],
         }), FULL, models.QUALITY)
         inputs = plan.graph["conditioning"]["inputs"]
-        for name in ("ref_image_1", "ref_image_2", "ref_video_1", "ref_video_audio_1", "ref_audio_1"):
+        for name in (
+            "ref_images.ref_image_0",
+            "ref_images.ref_image_1",
+            "ref_videos.ref_video_0",
+            "ref_video_audios.ref_video_audio_0",
+            "ref_audios.ref_audio_0",
+        ):
             self.assertIn(name, inputs, name)
+        for bare_name in (
+            "ref_image_1", "ref_image_2", "ref_video_1", "ref_video_audio_1", "ref_audio_1"
+        ):
+            self.assertNotIn(bare_name, inputs, bare_name)
         # The soundtrack is index-paired to its video, which is how the node pairs them.
-        self.assertEqual(inputs["ref_video_audio_1"], ["ref_video_audio_1", 0])
+        self.assertEqual(
+            inputs["ref_video_audios.ref_video_audio_0"], ["ref_video_audio_1", 0]
+        )
+
+    def test_one_image_ref2va_graph_matches_the_pinned_execute_contract(self):
+        plan = workflows.build(references(referenceFidelity="standard"), FULL, models.QUALITY)
+        inputs = plan.graph[workflows.CONDITIONING]["inputs"]
+
+        # ComfyUI dec5d945 normalises this dotted V3 socket into the execute() keyword
+        # ref_images={"ref_image_0": IMAGE}.  multimodal-3 emitted bare ref_image_1,
+        # which survived /prompt validation and raised TypeError during execution.
+        self.assertEqual(inputs["ref_images.ref_image_0"], ["ref_image_1", 0])
+        self.assertNotIn("ref_image_1", inputs)
+        self.assertEqual(inputs["ref_image_size"], "match")
+        self.assertEqual(plan.graph["ref_image_1"]["class_type"], workflows.IMAGE_LOADER)
+        self.assertEqual(plan.graph["unet"]["inputs"]["unet_name"], REF2VA_CKPT)
+        self.assertNotIn("lora", plan.graph)
+        self.assertEqual(plan.graph["sigmas"]["inputs"]["steps"], 20)
+        self.assertIn("<Picture 1>", inputs["prompt"])
+        self.assertNotIn("<Picture 2>", inputs["prompt"])
+
+    def test_reference_video_is_decoded_to_the_image_frames_h3_requires(self):
+        plan = workflows.build(request_module.parse({
+            "mode": "references", "prompt": "x", "seed": 1,
+            "references": [{"type": "video", "role": "motion"}],
+        }), FULL, models.QUALITY)
+        graph = plan.graph
+        self.assertEqual(graph["ref_video_1"]["class_type"], workflows.VIDEO_LOADER)
+        self.assertEqual(
+            graph["ref_video_frames_1"],
+            {
+                "class_type": workflows.VIDEO_COMPONENTS,
+                "inputs": {"video": ["ref_video_1", 0]},
+            },
+        )
+        self.assertEqual(
+            graph[workflows.CONDITIONING]["inputs"]["ref_videos.ref_video_0"],
+            ["ref_video_frames_1", 0],
+        )
 
     def test_every_staged_reference_has_a_loader_node(self):
         plan = workflows.build(request_module.parse({

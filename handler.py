@@ -34,6 +34,7 @@ import binascii
 import hashlib
 import json
 import os
+import re
 import secrets
 import shlex
 import shutil
@@ -1166,6 +1167,58 @@ def _clip(value, limit: int = MAX_ERROR_CHARS) -> str:
     return f"{text[:limit]}... [+{len(text) - limit} chars]"
 
 
+_SAFE_DIAGNOSTIC_IDENTIFIER = re.compile(r"[A-Za-z0-9_.:-]{1,160}\Z")
+_UNEXPECTED_KEYWORD = re.compile(
+    r"got an unexpected keyword argument ['\"]([A-Za-z_][A-Za-z0-9_.-]{0,127})['\"]"
+)
+
+
+def _safe_diagnostic_identifier(value) -> str:
+    """Keep a ComfyUI class/id token only when it cannot contain user content."""
+    text = str(value or "unknown")
+    return text if _SAFE_DIAGNOSTIC_IDENTIFIER.fullmatch(text) else "unknown"
+
+
+def _safe_execution_detail(exception_type, message) -> str | None:
+    """Retain useful classifications without forwarding a node's arbitrary message.
+
+    ComfyUI's execution event is server-controlled but its exception message can quote a
+    node input.  That input may be the prompt, a staged filename or a signed URL.  Preserve
+    only patterns whose captured value is restricted to a safe identifier alphabet.
+    """
+    exception_name = _safe_diagnostic_identifier(exception_type)
+    text = str(message or "")
+    if exception_name == "TypeError":
+        match = _UNEXPECTED_KEYWORD.search(text)
+        if match:
+            return f"unexpected keyword argument {match.group(1)}"
+    if "out of memory" in text.lower():
+        return "out of memory"
+    return None
+
+
+class ComfyExecutionError(WorkflowError):
+    """A structured, content-safe failure from one executing ComfyUI node."""
+
+    public_message = "ComfyUI workflow execution failed."
+
+    def __init__(self, detail: dict, *, source: str) -> None:
+        self.node_id = _safe_diagnostic_identifier(detail.get("node_id"))
+        self.node_class = _safe_diagnostic_identifier(detail.get("node_type"))
+        self.exception_class = _safe_diagnostic_identifier(detail.get("exception_type"))
+        self.source = _safe_diagnostic_identifier(source)
+        safe_detail = _safe_execution_detail(
+            self.exception_class, detail.get("exception_message")
+        )
+        message = (
+            f"ComfyUI execution failed in node {self.node_class} (#{self.node_id}): "
+            f"{self.exception_class}"
+        )
+        if safe_detail:
+            message += f" ({safe_detail})"
+        super().__init__(message)
+
+
 def summarise_comfy_rejection(detail) -> str:
     """Say why ComfyUI rejected a workflow without quoting the workflow back.
 
@@ -1350,12 +1403,7 @@ def _raise_if_history_failed(history: dict, prompt_id: str) -> None:
         # messages are ["execution_error", {...}] pairs
         if isinstance(entry, (list, tuple)) and len(entry) == 2 and entry[0] == "execution_error":
             detail = entry[1] or {}
-            raise WorkflowError(
-                "ComfyUI execution failed in node "
-                f"{detail.get('node_type')} (#{detail.get('node_id')}): "
-                f"{detail.get('exception_type')}: "
-                f"{_clip(detail.get('exception_message'))}"
-            )
+            raise ComfyExecutionError(detail, source="history")
 
     # Message *kinds*, never their payloads: a status message body is server-controlled
     # and has already been seen to carry node inputs.
@@ -1438,11 +1486,7 @@ def await_execution(
                                 if reporter is not None:
                                     reporter.step(int(value), int(total))
                         elif event_type == "execution_error" and data.get("prompt_id") == prompt_id:
-                            raise WorkflowError(
-                                "ComfyUI execution error in node "
-                                f"{data.get('node_type')} (#{data.get('node_id')}): "
-                                f"{data.get('exception_type')}: {data.get('exception_message')}"
-                            )
+                            raise ComfyExecutionError(data, source="websocket")
                         elif (
                             event_type in ("execution_success", "execution_interrupted")
                             and data.get("prompt_id") == prompt_id
@@ -2993,10 +3037,35 @@ def handler(job: dict) -> dict:
         return error.as_response()
     except WorkflowError as error:
         # Covers ImageInputError too: a caller-facing validation failure, not a crash.
-        log(f"Job {job_id}: workflow error: {error}")
+        if isinstance(error, ComfyExecutionError):
+            references = privora_metadata.get("references") or {}
+            log(
+                f"Job {job_id}: diagnostic category=comfy_execution "
+                f"stage={_safe_diagnostic_identifier(reporter._phase)} "
+                f"node_class={error.node_class} node_id={error.node_id} "
+                f"exception_class={error.exception_class} source={error.source} "
+                f"model={_safe_diagnostic_identifier(privora_metadata.get('model'))} "
+                f"generation_mode={_safe_diagnostic_identifier(privora_metadata.get('generationMode'))} "
+                f"references={int(references.get('total') or 0)} "
+                f"images={int(references.get('images') or 0)} "
+                f"videos={int(references.get('videos') or 0)} "
+                f"audio={int(references.get('audio') or 0)} "
+                f"soundtracks={int(references.get('soundtracks') or 0)}"
+            )
+            # Node/class detail is operator evidence, not part of the public job result or
+            # progress callback.  Even the deliberately restricted diagnostic stays on
+            # the trusted worker log side of the boundary.
+            log(f"Job {job_id}: workflow error: {error}")
+            public_message = error.public_message
+        else:
+            log(f"Job {job_id}: workflow error: {error}")
+            public_message = str(error)
         status = "workflow_error"
-        reporter.phase(PHASE_FAILED, error={"code": "workflow_error", "message": str(error)})
-        return {"error": str(error)}
+        reporter.phase(
+            PHASE_FAILED,
+            error={"code": "workflow_error", "message": public_message},
+        )
+        return {"error": public_message}
     except Exception as error:
         log(f"Job {job_id}: unhandled error: {type(error).__name__}: {error}")
         status = "exception"
