@@ -208,7 +208,7 @@ jobs:
           go install github.com/google/go-containerregistry/cmd/crane@v0.20.6
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
-      - name: Verify existing package ownership or establish a new private-package plan
+      - name: Require an existing private package linked to this repository
         id: package_preflight
         shell: bash
         env:
@@ -231,8 +231,8 @@ jobs:
           PY
             echo "package_exists=true" >> "$GITHUB_OUTPUT"
           elif grep -q 'HTTP 404' "$RUNNER_TEMP/package-preflight.err"; then
-            echo "Package does not exist yet; GitHub will create it private and link this workflow repository on first push."
-            echo "package_exists=false" >> "$GITHUB_OUTPUT"
+            echo "::error::The GHCR package does not exist. A GITHUB_TOKEN first push from this public source repository would create a public package, so publication is blocked. Pre-provision a private package and grant this repository Actions write access before retrying."
+            exit 1
           else
             echo "::error::Could not verify GHCR package ownership with the repository GITHUB_TOKEN"
             cat "$RUNNER_TEMP/package-preflight.err"
