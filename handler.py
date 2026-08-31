@@ -2765,8 +2765,8 @@ def worker_capabilities() -> dict:
     document.update(MODEL_INVENTORY.describe())
     application_release = {
         "sourceCommit": os.environ.get("H3_BUILD_SOURCE_COMMIT", "unknown"),
+        "imageRepository": os.environ.get("H3_IMAGE_REPOSITORY", "unknown"),
         "imageTag": os.environ.get("H3_BUILD_IMAGE_TAG", "unknown"),
-        "spaceRevision": os.environ.get("H3_SPACE_REVISION", "unknown"),
         "imageDigest": os.environ.get("H3_IMAGE_DIGEST", "unknown"),
         "buildId": os.environ.get("H3_BUILD_ID", "unknown"),
         "comfyuiRevision": os.environ.get("COMFYUI_H3_COMMIT", "unknown"),

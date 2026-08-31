@@ -67,36 +67,38 @@ The legacy Pixaroma alias
 `diffusion_models/h3/minimax_h3_fl2va_pruned_int8_convrot.safetensors` points to the first
 ComfyUI destination. It is an alias, not a ninth payload.
 
-## Private Docker Space publication
+## Private GHCR publication
 
-`.github/workflows/publish-hf-space.yml` is manual-only. It checks out a full immutable
-source commit, runs the Python and JavaScript suites, stages an explicit small-file
-allowlist, runs the weight guard, and performs a credentialed dry run before any upload.
-It uses a Hugging Face Trusted Publisher with:
+`.github/workflows/build-slim-ghcr.yml` is manual-only. Its definition lives on `main` so
+GitHub exposes `workflow_dispatch`, but it checks out and verifies an immutable commit from
+`hf-cached-models-slim`; it never builds the legacy `main` Dockerfile. The workflow:
 
-```text
-Provider: GitHub Actions
-GitHub repository: ChrisDitfort/minimax-h3-blackwell-serverless
-Branch: main
-Workflow: publish-hf-space.yml
-HF_OIDC_RESOURCE: spaces/CDitfort/privora-h3-runpod-worker
-```
+1. runs `python -m unittest discover -s tests -p 'test_*.py'`;
+2. runs all six existing Node test files with `node --test`;
+3. creates a small Docker context through `scripts/stage_slim_image.py`;
+4. rejects every exact manifest weight name and any alternate large model-like file;
+5. builds `Dockerfile.slim` remotely for `linux/amd64`;
+6. pushes an immutable canary tag and full source-commit tag to
+   `ghcr.io/chrisditfort/privora-h3-runpod-worker`;
+7. verifies the package remains private and reads OCI metadata without pulling layers;
+8. uploads only `slim-image-release.json`, never image or model bytes, as an artifact.
 
-There is no permanent `HF_TOKEN` fallback. The workflow uploads source files only and
-never uses GitHub artifacts. Hugging Face performs the Docker build; the workflow reads
-registry manifests/config metadata but never pulls image layers.
+Authentication is the source repository's ephemeral `GITHUB_TOKEN` with
+`packages: write`. The package namespace matches the source repository owner, avoiding a
+cross-account credential. Tags `latest`, `multimodal-4`, `code`, and `staging-*` are
+reserved and refused.
 
 ## Later RunPod test endpoint (do not apply during this phase)
 
 Create a **new** endpoint, leave the existing endpoint and `multimodal-4` untouched, then:
 
-1. Set its container image to the verified private Space registry image, preferably by
-   immutable digest rather than `:latest`.
+1. Set its container image to the verified private GHCR image by immutable digest, not a
+   mutable tag.
 2. Set RunPod's Model field to `CDitfort/privora-minimax-h3-models`.
 3. Set `H3_MODEL_REPO`, `H3_MODEL_REVISION`, and `H3_MODEL_MANIFEST_VERSION` to the exact
    values above.
-4. Set `H3_SPACE_REVISION` and `H3_IMAGE_DIGEST` to the verified application artifacts so
-   capabilities report both immutable release identities.
+4. Set `H3_IMAGE_DIGEST` to the verified OCI digest. The source commit, repository, tag,
+   and build ID are already embedded in the image's trusted build-identity file.
 5. Start with zero production traffic and validate cache activation before spending GPU
    time on an inference canary.
 

@@ -12,8 +12,11 @@ from cached_models import CachedModelError, activate_cached_models
 
 MANIFEST_PATH = "/opt/serverless/models/h3-cache-manifest.json"
 HANDLER_PATH = "/opt/serverless/handler.py"
-BUILD_IDENTITY_PATH = "/opt/serverless/space-build-identity.json"
-_SAFE_IDENTITY = re.compile(r"^[A-Za-z0-9._:/@+-]{1,256}$")
+BUILD_IDENTITY_PATH = "/opt/serverless/slim-build-identity.json"
+_SOURCE_COMMIT = re.compile(r"^[0-9a-f]{40}$")
+_SAFE_BUILD_ID = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+_SAFE_IMAGE_TAG = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
+_IMAGE_REPOSITORY = "ghcr.io/chrisditfort/privora-h3-runpod-worker"
 
 
 def _load_build_identity() -> None:
@@ -23,19 +26,29 @@ def _load_build_identity() -> None:
         with open(BUILD_IDENTITY_PATH, encoding="utf-8") as handle:
             document = json.load(handle)
     except (OSError, json.JSONDecodeError) as error:
-        raise CachedModelError(f"Could not load Space build identity: {error}") from error
-    expected = {
-        "sourceCommit": "H3_BUILD_SOURCE_COMMIT",
-        "buildId": "H3_BUILD_ID",
-        "spaceRepository": "H3_SPACE_REPOSITORY",
-    }
+        raise CachedModelError(f"Could not load slim-image build identity: {error}") from error
     if not isinstance(document, dict) or document.get("schemaVersion") != 1:
-        raise CachedModelError("Unsupported Space build identity schema")
-    for field, environment_name in expected.items():
-        value = document.get(field)
-        if not isinstance(value, str) or not _SAFE_IDENTITY.fullmatch(value):
-            raise CachedModelError(f"Invalid Space build identity field: {field}")
-        os.environ.setdefault(environment_name, value)
+        raise CachedModelError("Unsupported slim-image build identity schema")
+    source_commit = document.get("sourceCommit")
+    build_id = document.get("buildId")
+    image_repository = document.get("imageRepository")
+    image_tag = document.get("imageTag")
+    if not isinstance(source_commit, str) or not _SOURCE_COMMIT.fullmatch(source_commit):
+        raise CachedModelError("Invalid slim-image source commit")
+    if not isinstance(build_id, str) or not _SAFE_BUILD_ID.fullmatch(build_id):
+        raise CachedModelError("Invalid slim-image build id")
+    if image_repository != _IMAGE_REPOSITORY:
+        raise CachedModelError("Invalid slim-image repository")
+    if not isinstance(image_tag, str) or not _SAFE_IMAGE_TAG.fullmatch(image_tag):
+        raise CachedModelError("Invalid slim-image tag")
+    if image_tag in {"latest", "multimodal-4", "code"} or image_tag.startswith("staging-"):
+        raise CachedModelError("Reserved slim-image tag")
+    # These values come from the allowlisted build context and are authoritative. Runtime
+    # configuration cannot rewrite the source/tag identity of bytes already in the image.
+    os.environ["H3_BUILD_SOURCE_COMMIT"] = source_commit
+    os.environ["H3_BUILD_ID"] = build_id
+    os.environ["H3_IMAGE_REPOSITORY"] = image_repository
+    os.environ["H3_BUILD_IMAGE_TAG"] = image_tag
 
 
 def main() -> int:

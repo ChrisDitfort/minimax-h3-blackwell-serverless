@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create the minimal, allowlisted source tree published to the private Docker Space."""
+"""Create the minimal, allowlisted Docker context for the private slim GHCR image."""
 
 from __future__ import annotations
 
@@ -12,15 +12,15 @@ import shutil
 from pathlib import Path, PurePosixPath
 
 
-EXPECTED_SPACE_REPOSITORY = "CDitfort/privora-h3-runpod-worker"
+EXPECTED_IMAGE_REPOSITORY = "ghcr.io/chrisditfort/privora-h3-runpod-worker"
 MAX_SOURCE_BYTES = 10 * 1024 * 1024
 SOURCE_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 BUILD_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+IMAGE_TAG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
 
 STATIC_MAPPINGS = {
-    "Dockerfile.hf-space": "Dockerfile",
-    ".dockerignore.hf-space": ".dockerignore",
-    "space/README.md": "README.md",
+    "Dockerfile.slim": "Dockerfile",
+    ".dockerignore.slim": ".dockerignore",
     "handler.py": "handler.py",
     "artifacts.py": "artifacts.py",
     "bootstrap.py": "bootstrap.py",
@@ -74,8 +74,10 @@ def approved_mappings(source_root: Path) -> dict[str, str]:
             raise StagingError(f"required package directory is missing or linked: {package}")
         for path in sorted(package_root.rglob("*.py")):
             relative_parts = path.relative_to(source_root).parts
-            parents_inside_source = [source_root.joinpath(*relative_parts[:index])
-                                     for index in range(1, len(relative_parts))]
+            parents_inside_source = [
+                source_root.joinpath(*relative_parts[:index])
+                for index in range(1, len(relative_parts))
+            ]
             if any(parent.is_symlink() for parent in parents_inside_source):
                 raise StagingError(f"package source traverses a symlink: {path}")
             relative = path.relative_to(source_root).as_posix()
@@ -96,15 +98,20 @@ def stage(
     *,
     source_commit: str,
     build_id: str,
-    space_repository: str,
+    image_repository: str,
+    image_tag: str,
 ) -> dict:
     source_root = source_root.resolve(strict=True)
     if not SOURCE_COMMIT_RE.fullmatch(source_commit):
         raise StagingError("source commit must be a full lowercase Git SHA")
     if not BUILD_ID_RE.fullmatch(build_id):
         raise StagingError("build id contains unsupported characters")
-    if space_repository != EXPECTED_SPACE_REPOSITORY:
-        raise StagingError("Space repository does not match the approved destination")
+    if image_repository != EXPECTED_IMAGE_REPOSITORY:
+        raise StagingError("image repository does not match the approved GHCR destination")
+    if not IMAGE_TAG_RE.fullmatch(image_tag) or image_tag in {"latest", "multimodal-4", "code"}:
+        raise StagingError("image tag is invalid or reserved")
+    if image_tag.startswith("staging-"):
+        raise StagingError("legacy staging tags are reserved")
     if os.path.lexists(output_root):
         raise StagingError("staging output already exists; refusing to merge or overwrite it")
     output_root.mkdir(parents=True)
@@ -124,11 +131,12 @@ def stage(
             "schemaVersion": 1,
             "sourceCommit": source_commit,
             "buildId": build_id,
-            "spaceRepository": space_repository,
+            "imageRepository": image_repository,
+            "imageTag": image_tag,
         }
-        identity_path = output_root / "space-build-identity.json"
+        identity_path = output_root / "slim-build-identity.json"
         identity_path.write_text(json.dumps(identity, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        copied.append("space-build-identity.json")
+        copied.append("slim-build-identity.json")
 
         file_records = []
         for relative in sorted(copied):
@@ -140,17 +148,17 @@ def stage(
             })
         publication = {
             "schemaVersion": 1,
-            "spaceRepository": space_repository,
+            "imageRepository": image_repository,
+            "imageTag": image_tag,
             "sourceCommit": source_commit,
             "buildId": build_id,
             "fileCount": len(file_records) + 1,
             "files": file_records,
         }
-        publication_path = output_root / "space-publication-manifest.json"
+        publication_path = output_root / "slim-context-manifest.json"
         publication_path.write_text(
             json.dumps(publication, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
-        copied.append("space-publication-manifest.json")
         return publication
     except Exception:
         shutil.rmtree(output_root, ignore_errors=True)
@@ -163,7 +171,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--source-commit", required=True)
     parser.add_argument("--build-id", required=True)
-    parser.add_argument("--space-repository", default=EXPECTED_SPACE_REPOSITORY)
+    parser.add_argument("--image-repository", default=EXPECTED_IMAGE_REPOSITORY)
+    parser.add_argument("--image-tag", required=True)
     args = parser.parse_args(argv)
     try:
         publication = stage(
@@ -171,14 +180,15 @@ def main(argv: list[str] | None = None) -> int:
             args.output,
             source_commit=args.source_commit,
             build_id=args.build_id,
-            space_repository=args.space_repository,
+            image_repository=args.image_repository,
+            image_tag=args.image_tag,
         )
     except (OSError, StagingError, ValueError, json.JSONDecodeError) as error:
-        print(f"Space staging failed: {error}")
+        print(f"Slim-image staging failed: {error}")
         return 1
     total = sum(record["bytes"] for record in publication["files"])
     print(
-        f"Space staging OK: approved_files={publication['fileCount']} "
+        f"Slim-image staging OK: approved_files={publication['fileCount']} "
         f"payload_bytes={total} model_weights=0"
     )
     return 0

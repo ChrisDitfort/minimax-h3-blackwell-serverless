@@ -1,6 +1,6 @@
 # PrivoraVideo MiniMax H3 - model-free RunPod Serverless worker.
 #
-# Hugging Face builds this Dockerfile remotely. The inherited Blackwell runtime carries
+# GitHub Actions builds this Dockerfile remotely. The inherited Blackwell runtime carries
 # CUDA, PyTorch, ComfyUI and the MiniMax H3 nodes, but not the eight approved H3 weights.
 # RunPod Cached Models supplies those bytes later at an exact immutable Hub revision.
 FROM ghcr.io/nightfall93/runpod-comfyui-minimax-h3:cuda13-blackwell
@@ -51,7 +51,7 @@ COPY artifacts.py /opt/serverless/artifacts.py
 COPY bootstrap.py /opt/serverless/bootstrap.py
 COPY cached_models.py /opt/serverless/cached_models.py
 COPY models/h3-cache-manifest.json /opt/serverless/models/h3-cache-manifest.json
-COPY space-build-identity.json /opt/serverless/space-build-identity.json
+COPY slim-build-identity.json /opt/serverless/slim-build-identity.json
 COPY privora /opt/serverless/privora
 
 COPY scripts/verify_ref2va_contract.py /opt/serverless/scripts/verify_ref2va_contract.py
@@ -60,6 +60,15 @@ RUN python3 /opt/serverless/scripts/verify_ref2va_contract.py --comfy-root "$COM
 COPY h3_parallel /opt/serverless/h3_parallel
 COPY comfy_custom_nodes/h3_parallel_boot.py ${COMFY_DIR}/custom_nodes/h3_parallel_boot.py
 
+# Confirm the inherited runtime and the copied privacy/application surface without a GPU.
+WORKDIR /opt/serverless
+RUN command -v ffmpeg >/dev/null \
+ && test -f "$COMFY_DIR/main.py" \
+ && python3 -c "import torch; assert torch.version.cuda, 'CUDA-enabled PyTorch is absent'; print('torch', torch.__version__, 'CUDA', torch.version.cuda)" \
+ && python3 -c "import artifacts, cryptography, h3_parallel, privora; print('Privora runtime contract OK')"
+
+# Exact-name rejection comes from the manifest; the size threshold is defense in depth for
+# an unexpected alternate checkpoint. This scans the final filesystem after every COPY.
 COPY scripts/guard_no_model_weights.py /opt/serverless/scripts/guard_no_model_weights.py
 RUN python3 /opt/serverless/scripts/guard_no_model_weights.py \
       --manifest /opt/serverless/models/h3-cache-manifest.json \
@@ -69,8 +78,6 @@ ENV H3_GPU_MODE=single \
     H3_SP_MASTER_PORT=29513 \
     H3_SP_VAE=1 \
     H3_SP_SELFTEST=1 \
-    H3_BUILD_IMAGE_TAG=latest \
-    H3_SPACE_REVISION=unknown \
     H3_IMAGE_DIGEST=unknown \
     COMFYUI_H3_COMMIT=dec5d945 \
     NCCL_DEBUG=WARN
@@ -79,9 +86,6 @@ LABEL org.opencontainers.image.source="https://github.com/ChrisDitfort/minimax-h
       ai.privora.model.repository="CDitfort/privora-minimax-h3-models" \
       ai.privora.model.revision="ecb69a4211d74b5798398021003bccde02d63757" \
       ai.privora.model.manifest="multimodal-4-hf-cache-v1"
-
-WORKDIR /opt/serverless
-EXPOSE 7860
 
 # bootstrap validates and links the cache before exec'ing the validated handler as PID 1.
 ENTRYPOINT ["python3", "/opt/serverless/bootstrap.py"]

@@ -582,9 +582,9 @@ class CapabilityBuildIdentityTests(unittest.TestCase):
         values = {
             "H3_BUILD_SOURCE_COMMIT": "abc123def456",
             "H3_BUILD_IMAGE_TAG": "latest",
+            "H3_IMAGE_REPOSITORY": "ghcr.io/chrisditfort/privora-h3-runpod-worker",
             "H3_BUILD_ID": "98765-1",
             "COMFYUI_H3_COMMIT": "dec5d945",
-            "H3_SPACE_REVISION": "space123",
             "H3_IMAGE_DIGEST": "sha256:image123",
             "H3_MODEL_REPO": "CDitfort/privora-minimax-h3-models",
             "H3_MODEL_REVISION": "ecb69a4211d74b5798398021003bccde02d63757",
@@ -599,8 +599,8 @@ class CapabilityBuildIdentityTests(unittest.TestCase):
         })
         self.assertEqual(worker["applicationRelease"], {
             "sourceCommit": values["H3_BUILD_SOURCE_COMMIT"],
+            "imageRepository": values["H3_IMAGE_REPOSITORY"],
             "imageTag": values["H3_BUILD_IMAGE_TAG"],
-            "spaceRevision": values["H3_SPACE_REVISION"],
             "imageDigest": values["H3_IMAGE_DIGEST"],
             "buildId": values["H3_BUILD_ID"],
             "comfyuiRevision": values["COMFYUI_H3_COMMIT"],
