@@ -179,6 +179,20 @@ class ImageMetadataTests(unittest.TestCase):
                 "config": {
                     "Entrypoint": ["python3", "/opt/serverless/bootstrap.py"],
                     "Cmd": [],
+                    "Env": [f"{key}={value}" for key, value in
+                            report_image_manifest.EXPECTED_ENVIRONMENT.items()],
+                    "Labels": {
+                        "org.opencontainers.image.source":
+                            "https://github.com/ChrisDitfort/minimax-h3-blackwell-serverless",
+                        "org.opencontainers.image.revision": "1" * 40,
+                        "org.opencontainers.image.version": "cached-models-1",
+                        "ai.privora.build.id": "12345-1",
+                        "ai.privora.model.repository":
+                            "CDitfort/privora-minimax-h3-models",
+                        "ai.privora.model.revision":
+                            "ecb69a4211d74b5798398021003bccde02d63757",
+                        "ai.privora.model.manifest": "multimodal-4-hf-cache-v1",
+                    },
                 },
             }), encoding="utf-8")
             result = report_image_manifest.main([
@@ -187,6 +201,9 @@ class ImageMetadataTests(unittest.TestCase):
                 "--digest", "sha256:" + "a" * 64,
                 "--platform-digest", "sha256:" + "b" * 64,
                 "--registry-ref", IMAGE_REPOSITORY + "@sha256:" + "a" * 64,
+                "--source-commit", "1" * 40,
+                "--image-tag", "cached-models-1",
+                "--build-id", "12345-1",
             ])
             self.assertEqual(result, 0)
 
