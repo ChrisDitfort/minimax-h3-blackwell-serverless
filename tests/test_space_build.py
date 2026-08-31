@@ -40,6 +40,10 @@ class SpaceDockerfileTests(unittest.TestCase):
         self.assertNotIn("docker build", workflow)
         self.assertNotIn("docker pull", workflow)
 
+    def test_remote_test_requirements_include_the_image_fixture_dependency(self):
+        requirements = (ROOT / "scripts/requirements-hf-space.txt").read_text(encoding="utf-8")
+        self.assertIn("Pillow==12.3.0", requirements)
+
 
 class StagingTests(unittest.TestCase):
     def test_staging_contains_only_the_allowlist_and_zero_weights(self):
