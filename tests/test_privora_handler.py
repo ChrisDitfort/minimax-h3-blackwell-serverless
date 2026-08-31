@@ -581,9 +581,14 @@ class CapabilityBuildIdentityTests(unittest.TestCase):
     def test_capabilities_exposes_safe_immutable_build_identity(self):
         values = {
             "H3_BUILD_SOURCE_COMMIT": "abc123def456",
-            "H3_BUILD_IMAGE_TAG": "multimodal-3",
+            "H3_BUILD_IMAGE_TAG": "latest",
             "H3_BUILD_ID": "98765-1",
             "COMFYUI_H3_COMMIT": "dec5d945",
+            "H3_SPACE_REVISION": "space123",
+            "H3_IMAGE_DIGEST": "sha256:image123",
+            "H3_MODEL_REPO": "CDitfort/privora-minimax-h3-models",
+            "H3_MODEL_REVISION": "ecb69a4211d74b5798398021003bccde02d63757",
+            "H3_MODEL_MANIFEST_VERSION": "multimodal-4-hf-cache-v1",
         }
         with WithInventory(), mock.patch.dict(os.environ, values, clear=False):
             worker = handler.worker_capabilities()["worker"]
@@ -592,8 +597,22 @@ class CapabilityBuildIdentityTests(unittest.TestCase):
             "imageTag": values["H3_BUILD_IMAGE_TAG"],
             "buildId": values["H3_BUILD_ID"],
         })
+        self.assertEqual(worker["applicationRelease"], {
+            "sourceCommit": values["H3_BUILD_SOURCE_COMMIT"],
+            "imageTag": values["H3_BUILD_IMAGE_TAG"],
+            "spaceRevision": values["H3_SPACE_REVISION"],
+            "imageDigest": values["H3_IMAGE_DIGEST"],
+            "buildId": values["H3_BUILD_ID"],
+            "comfyuiRevision": values["COMFYUI_H3_COMMIT"],
+        })
+        self.assertEqual(worker["modelRelease"], {
+            "repository": values["H3_MODEL_REPO"],
+            "revision": values["H3_MODEL_REVISION"],
+            "manifest": values["H3_MODEL_MANIFEST_VERSION"],
+        })
         self.assertEqual(worker["comfyuiCommit"], "dec5d945")
         self.assertNotIn("path", str(worker).lower())
+        self.assertNotIn("token", str(worker).lower())
 
 
 if __name__ == "__main__":

@@ -2763,14 +2763,29 @@ def worker_capabilities() -> dict:
         ref2va_available=MODEL_INVENTORY.has_family(privora_models.REF2VA)
     )
     document.update(MODEL_INVENTORY.describe())
+    application_release = {
+        "sourceCommit": os.environ.get("H3_BUILD_SOURCE_COMMIT", "unknown"),
+        "imageTag": os.environ.get("H3_BUILD_IMAGE_TAG", "unknown"),
+        "spaceRevision": os.environ.get("H3_SPACE_REVISION", "unknown"),
+        "imageDigest": os.environ.get("H3_IMAGE_DIGEST", "unknown"),
+        "buildId": os.environ.get("H3_BUILD_ID", "unknown"),
+        "comfyuiRevision": os.environ.get("COMFYUI_H3_COMMIT", "unknown"),
+    }
+    model_release = {
+        "repository": os.environ.get("H3_MODEL_REPO", "unknown"),
+        "revision": os.environ.get("H3_MODEL_REVISION", "unknown"),
+        "manifest": os.environ.get("H3_MODEL_MANIFEST_VERSION", "unknown"),
+    }
     document["worker"] = {
         "processId": PROCESS_ID,
         "gpuMode": GPU_CONFIG.mode if GPU_CONFIG else "unresolved",
         "comfyuiCommit": os.environ.get("COMFYUI_H3_COMMIT", "unknown"),
+        "applicationRelease": application_release,
+        "modelRelease": model_release,
         "build": {
-            "sourceCommit": os.environ.get("H3_BUILD_SOURCE_COMMIT", "unknown"),
-            "imageTag": os.environ.get("H3_BUILD_IMAGE_TAG", "unknown"),
-            "buildId": os.environ.get("H3_BUILD_ID", "unknown"),
+            "sourceCommit": application_release["sourceCommit"],
+            "imageTag": application_release["imageTag"],
+            "buildId": application_release["buildId"],
         },
     }
     return document
