@@ -25,7 +25,7 @@ concurrency:
 env:
   HF_SPACE_REPO: CDitfort/privora-h3-runpod-worker
   HF_OIDC_RESOURCE: spaces/CDitfort/privora-h3-runpod-worker
-  SLIM_SOURCE_REVISION: 075b6b418ac4007e19ea6b7330246feb1e8f4283
+  SLIM_SOURCE_REVISION: 84eace72eaf872a0b1fa380c2ef5d2025e857503
   PYTHONUNBUFFERED: "1"
 
 jobs:
