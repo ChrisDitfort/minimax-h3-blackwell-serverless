@@ -1,0 +1,399 @@
+name: Build slim RunPod image
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "New immutable canary tag"
+        type: string
+        required: true
+        default: "cached-models-1"
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build-privora-h3-slim-ghcr
+  cancel-in-progress: false
+
+env:
+  IMAGE_NAME: ghcr.io/chrisditfort/privora-h3-runpod-worker
+  SLIM_SOURCE_BRANCH: hf-cached-models-slim
+  SLIM_SOURCE_REVISION: bd408e8fe651fe6ca3eddfdc66e6a1e36e84c0a2
+  RESOLVER_BASE_REVISION: 84eace72eaf872a0b1fa380c2ef5d2025e857503
+  BASE_IMAGE_DIGEST: sha256:4fdcd50e8e5f54f8329933c66e2eac17680cbac82d43c1a74d00465e9413a3e1
+  H3_MODEL_REPO: CDitfort/privora-minimax-h3-models
+  H3_MODEL_REVISION: ecb69a4211d74b5798398021003bccde02d63757
+  H3_MODEL_MANIFEST_VERSION: multimodal-4-hf-cache-v1
+  COMFYUI_REVISION: dec5d9450a5290bcf63430409ea41018e67f41c3
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  build-test-and-push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Check out the immutable slim-worker source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ env.SLIM_SOURCE_REVISION }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify source branch, commit, and cached-model implementation
+        shell: bash
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REPOSITORY" != "ChrisDitfort/minimax-h3-blackwell-serverless" ]]; then
+            echo "::error::This publisher is bound to ChrisDitfort/minimax-h3-blackwell-serverless"
+            exit 1
+          fi
+          if [[ "${GITHUB_REPOSITORY_OWNER,,}" != "chrisditfort" ]]; then
+            echo "::error::The GHCR namespace must match the source repository owner"
+            exit 1
+          fi
+          if [[ ! "$SLIM_SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::SLIM_SOURCE_REVISION must be a full lowercase Git commit SHA"
+            exit 1
+          fi
+          resolved="$(git rev-parse HEAD)"
+          branch_head="$(git ls-remote "https://github.com/${GITHUB_REPOSITORY}.git" "refs/heads/${SLIM_SOURCE_BRANCH}" | awk '{print $1}')"
+          if [[ "$resolved" != "$SLIM_SOURCE_REVISION" || "$branch_head" != "$SLIM_SOURCE_REVISION" ]]; then
+            echo "::error::The immutable checkout and hf-cached-models-slim branch head must both match the approved revision"
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$RESOLVER_BASE_REVISION" HEAD; then
+            echo "::error::Selected source does not descend from the validated cached-model resolver commit"
+            exit 1
+          fi
+          required=(
+            Dockerfile.slim
+            .dockerignore.slim
+            bootstrap.py
+            cached_models.py
+            models/h3-cache-manifest.json
+            scripts/stage_slim_image.py
+            scripts/guard_no_model_weights.py
+            scripts/report_image_manifest.py
+            scripts/write_slim_release.py
+          )
+          for path in "${required[@]}"; do
+            [[ -f "$path" ]] || { echo "::error::Required slim source is absent: $path"; exit 1; }
+          done
+          [[ ! -e Dockerfile.hf-space && ! -e scripts/publish_hf_space.py ]] || {
+            echo "::error::Retired Hugging Face Space publication files are present"
+            exit 1
+          }
+          grep -Fq "EXPECTED_REVISION = \"$H3_MODEL_REVISION\"" cached_models.py
+          grep -Fq "EXPECTED_MANIFEST_VERSION = \"$H3_MODEL_MANIFEST_VERSION\"" cached_models.py
+          grep -Fq "H3_MODEL_REPO=$H3_MODEL_REPO" Dockerfile.slim
+          grep -Fq "H3_MODEL_REVISION=$H3_MODEL_REVISION" Dockerfile.slim
+          grep -Fq "H3_MODEL_MANIFEST_VERSION=$H3_MODEL_MANIFEST_VERSION" Dockerfile.slim
+          grep -Fq "HF_HUB_OFFLINE=1" Dockerfile.slim
+          grep -Fq "TRANSFORMERS_OFFLINE=1" Dockerfile.slim
+          grep -Fq "@$BASE_IMAGE_DIGEST" Dockerfile.slim
+          if grep -Eq 'huggingface_hub|snapshot_download|urlopen|requests' cached_models.py; then
+            echo "::error::Cached-model resolver contains a forbidden network/download client"
+            exit 1
+          fi
+          if grep -Eq 'models\.tsv|build_model_layer|/resolve/' Dockerfile.slim; then
+            echo "::error::Slim Dockerfile contains a legacy model-download/append path"
+            exit 1
+          fi
+          if [[ ! "$IMAGE_TAG" =~ ^[a-z0-9][a-z0-9._-]{0,127}$ ]]; then
+            echo "::error::image_tag is not a valid lowercase OCI tag"
+            exit 1
+          fi
+          case "$IMAGE_TAG" in
+            latest|multimodal-4|code|staging-*)
+              echo "::error::Refusing reserved or rollback tag: $IMAGE_TAG"
+              exit 1
+              ;;
+          esac
+          echo "Source verification OK: ${SLIM_SOURCE_BRANCH}@${resolved}"
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Install test dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check \
+            -r scripts/requirements-slim-ci.txt \
+            requests websocket-client boto3 cryptography
+
+      - name: Run the full Python unittest suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m unittest discover -s tests -p 'test_*.py' 2>&1 | tee "$RUNNER_TEMP/python-tests.log"
+          grep -Eq '^Ran 548 tests in ' "$RUNNER_TEMP/python-tests.log"
+          echo "Python test contract OK: 548 tests"
+
+      - name: Run all JavaScript tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --test \
+            worker.test.js \
+            worker.internal.test.js \
+            worker.routes.test.js \
+            worker.delete.test.js \
+            worker.confidential.test.js \
+            client/confidential-generation.test.js \
+            2>&1 | tee "$RUNNER_TEMP/javascript-tests.log"
+          grep -Eq 'tests 212$' "$RUNNER_TEMP/javascript-tests.log"
+          echo "JavaScript test contract OK: 212 tests"
+
+      - name: Validate exact model manifest and source-tree exclusion
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from cached_models import EXPECTED_ASSET_PATHS, load_manifest
+
+          manifest = load_manifest("models/h3-cache-manifest.json")
+          assert len(manifest.assets) == 8
+          assert tuple(asset.path for asset in manifest.assets) == EXPECTED_ASSET_PATHS
+          print("Exact approved model inventory verified: 8 assets")
+          PY
+          python scripts/guard_no_model_weights.py \
+            --manifest models/h3-cache-manifest.json \
+            --root . \
+            --max-bytes 104857600
+
+      - name: Stage the allowlisted, zero-weight Docker context
+        id: stage
+        shell: bash
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+        run: |
+          set -euo pipefail
+          staging="$RUNNER_TEMP/privora-h3-slim-context"
+          python scripts/stage_slim_image.py \
+            --source-root . \
+            --output "$staging" \
+            --source-commit "$SLIM_SOURCE_REVISION" \
+            --build-id "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --image-repository "$IMAGE_NAME" \
+            --image-tag "$IMAGE_TAG" \
+            | tee "$RUNNER_TEMP/staging.log"
+          grep -Eq 'approved_files=29 .*model_weights=0$' "$RUNNER_TEMP/staging.log"
+          python scripts/guard_no_model_weights.py \
+            --manifest "$staging/models/h3-cache-manifest.json" \
+            --root "$staging" \
+            --max-bytes 0
+          echo "context=$staging" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to the source-owner GHCR namespace
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install pinned crane metadata client
+        shell: bash
+        run: |
+          set -euo pipefail
+          go install github.com/google/go-containerregistry/cmd/crane@v0.20.6
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Verify existing package ownership or establish a new private-package plan
+        id: package_preflight
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          endpoint="/users/${GITHUB_REPOSITORY_OWNER}/packages/container/privora-h3-runpod-worker"
+          if gh api "$endpoint" > "$RUNNER_TEMP/package-preflight.json" 2> "$RUNNER_TEMP/package-preflight.err"; then
+            python - "$RUNNER_TEMP/package-preflight.json" <<'PY'
+          import json
+          import sys
+
+          document = json.load(open(sys.argv[1], encoding="utf-8"))
+          if document.get("visibility") != "private":
+              raise SystemExit("Existing GHCR package is not private")
+          linked = (document.get("repository") or {}).get("full_name")
+          if linked != "ChrisDitfort/minimax-h3-blackwell-serverless":
+              raise SystemExit(f"Existing GHCR package is not linked to the source repository: {linked!r}")
+          print("Existing private GHCR package ownership/link verified")
+          PY
+            echo "package_exists=true" >> "$GITHUB_OUTPUT"
+          elif grep -q 'HTTP 404' "$RUNNER_TEMP/package-preflight.err"; then
+            echo "Package does not exist yet; GitHub will create it private and link this workflow repository on first push."
+            echo "package_exists=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Could not verify GHCR package ownership with the repository GITHUB_TOKEN"
+            cat "$RUNNER_TEMP/package-preflight.err"
+            exit 1
+          fi
+
+      - name: Refuse to overwrite either immutable tag
+        if: ${{ steps.package_preflight.outputs.package_exists == 'true' }}
+        shell: bash
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+        run: |
+          set -euo pipefail
+          for ref in "$IMAGE_NAME:$IMAGE_TAG" "$IMAGE_NAME:sha-$SLIM_SOURCE_REVISION"; do
+            if crane digest "$ref" > "$RUNNER_TEMP/tag-digest" 2> "$RUNNER_TEMP/tag-error"; then
+              echo "::error::Immutable tag already exists: $ref"
+              exit 1
+            fi
+            if ! grep -Eqi 'MANIFEST_UNKNOWN|manifest unknown|not found|404' "$RUNNER_TEMP/tag-error"; then
+              echo "::error::Could not prove immutable tag is unused: $ref"
+              cat "$RUNNER_TEMP/tag-error"
+              exit 1
+            fi
+            echo "Immutable tag is available: $ref"
+          done
+
+      - name: Generate deterministic OCI tags and labels
+        id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ inputs.image_tag }}
+            type=raw,value=sha-${{ env.SLIM_SOURCE_REVISION }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/ChrisDitfort/minimax-h3-blackwell-serverless
+            org.opencontainers.image.revision=${{ env.SLIM_SOURCE_REVISION }}
+            org.opencontainers.image.version=${{ inputs.image_tag }}
+            ai.privora.build.id=${{ github.run_id }}-${{ github.run_attempt }}
+            ai.privora.model.repository=${{ env.H3_MODEL_REPO }}
+            ai.privora.model.revision=${{ env.H3_MODEL_REVISION }}
+            ai.privora.model.manifest=${{ env.H3_MODEL_MANIFEST_VERSION }}
+
+      - name: Build and push the model-free image
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: ${{ steps.stage.outputs.context }}
+          file: ${{ steps.stage.outputs.context }}/Dockerfile
+          platforms: linux/amd64
+          pull: true
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: mode=max
+          sbom: true
+
+      - name: Verify immutable tags, entrypoint, platform, and compressed size
+        id: registry
+        shell: bash
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          BUILD_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          tag_digest="$(crane digest "$IMAGE_NAME:$IMAGE_TAG")"
+          source_digest="$(crane digest "$IMAGE_NAME:sha-$SLIM_SOURCE_REVISION")"
+          if [[ "$tag_digest" != "$BUILD_DIGEST" || "$source_digest" != "$BUILD_DIGEST" ]]; then
+            echo "::error::Published tags do not resolve to the BuildKit output digest"
+            exit 1
+          fi
+          platform_digest="$(crane digest --platform linux/amd64 "$IMAGE_NAME@$BUILD_DIGEST")"
+          crane manifest --platform linux/amd64 "$IMAGE_NAME@$BUILD_DIGEST" > "$RUNNER_TEMP/image-manifest.json"
+          crane config --platform linux/amd64 "$IMAGE_NAME@$BUILD_DIGEST" > "$RUNNER_TEMP/image-config.json"
+          python scripts/report_image_manifest.py \
+            --manifest "$RUNNER_TEMP/image-manifest.json" \
+            --config "$RUNNER_TEMP/image-config.json" \
+            --digest "$BUILD_DIGEST" \
+            --platform-digest "$platform_digest" \
+            --registry-ref "$IMAGE_NAME@$BUILD_DIGEST" \
+            --source-commit "$SLIM_SOURCE_REVISION" \
+            --image-tag "$IMAGE_TAG" \
+            --build-id "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Verify the published package is private and repository-linked
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          endpoint="/users/${GITHUB_REPOSITORY_OWNER}/packages/container/privora-h3-runpod-worker"
+          for attempt in $(seq 1 12); do
+            if gh api "$endpoint" > "$RUNNER_TEMP/package-final.json" 2> "$RUNNER_TEMP/package-final.err"; then
+              break
+            fi
+            if [[ "$attempt" == 12 ]]; then
+              echo "::error::GHCR package metadata did not become readable after publication"
+              cat "$RUNNER_TEMP/package-final.err"
+              exit 1
+            fi
+            sleep 5
+          done
+          python - "$RUNNER_TEMP/package-final.json" <<'PY'
+          import json
+          import sys
+
+          document = json.load(open(sys.argv[1], encoding="utf-8"))
+          assert document.get("visibility") == "private", "Published GHCR package is not private"
+          linked = (document.get("repository") or {}).get("full_name")
+          assert linked == "ChrisDitfort/minimax-h3-blackwell-serverless", linked
+          print("Published GHCR package is private and linked to the source repository")
+          PY
+
+      - name: Write metadata-only release record
+        shell: bash
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          BUILD_DIGEST: ${{ steps.build.outputs.digest }}
+          PLATFORM_DIGEST: ${{ steps.registry.outputs.platform_digest }}
+          COMPRESSED_BYTES: ${{ steps.registry.outputs.compressed_bytes }}
+        run: |
+          set -euo pipefail
+          python scripts/write_slim_release.py \
+            --output release/slim-image-release.json \
+            --source-commit "$SLIM_SOURCE_REVISION" \
+            --image-tag "$IMAGE_TAG" \
+            --image-digest "$BUILD_DIGEST" \
+            --platform-digest "$PLATFORM_DIGEST" \
+            --build-id "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --compressed-bytes "$COMPRESSED_BYTES"
+          test "$(stat -c%s release/slim-image-release.json)" -lt 100000
+
+      - name: Upload release metadata only
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: slim-image-release-${{ github.run_id }}-${{ github.run_attempt }}
+          path: release/slim-image-release.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Report immutable application and model identities
+        shell: bash
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          BUILD_DIGEST: ${{ steps.build.outputs.digest }}
+          COMPRESSED_BYTES: ${{ steps.registry.outputs.compressed_bytes }}
+        run: |
+          {
+            echo "## Privora H3 model-free GHCR canary"
+            echo
+            echo "- source: \`${SLIM_SOURCE_BRANCH}@${SLIM_SOURCE_REVISION}\`"
+            echo "- build ID: \`${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}\`"
+            echo "- image: \`${IMAGE_NAME}:${IMAGE_TAG}\`"
+            echo "- OCI digest: \`${BUILD_DIGEST}\`"
+            echo "- platform image digest: \`${{ steps.registry.outputs.platform_digest }}\`"
+            echo "- platform: \`linux/amd64\`"
+            echo "- compressed layer bytes: \`${COMPRESSED_BYTES}\`"
+            echo "- ComfyUI: \`${COMFYUI_REVISION}\`"
+            echo "- model release: \`${H3_MODEL_REPO}@${H3_MODEL_REVISION}\`"
+            echo "- model manifest: \`${H3_MODEL_MANIFEST_VERSION}\`"
+            echo "- exact approved H3 weights in image: \`0/8\`"
+            echo "- model downloads during build: \`0\`"
+          } >> "$GITHUB_STEP_SUMMARY"
