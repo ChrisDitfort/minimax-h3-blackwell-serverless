@@ -88,6 +88,10 @@ Authentication is the source repository's ephemeral `GITHUB_TOKEN` with
 cross-account credential. Tags `latest`, `multimodal-4`, `code`, and `staging-*` are
 reserved and refused.
 
+The inherited Blackwell runtime is pinned to OCI digest
+`sha256:4fdcd50e8e5f54f8329933c66e2eac17680cbac82d43c1a74d00465e9413a3e1`.
+Its ComfyUI revision remains `dec5d9450a5290bcf63430409ea41018e67f41c3`.
+
 ## Later RunPod test endpoint (do not apply during this phase)
 
 Create a **new** endpoint, leave the existing endpoint and `multimodal-4` untouched, then:

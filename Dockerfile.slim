@@ -3,7 +3,7 @@
 # GitHub Actions builds this Dockerfile remotely. The inherited Blackwell runtime carries
 # CUDA, PyTorch, ComfyUI and the MiniMax H3 nodes, but not the eight approved H3 weights.
 # RunPod Cached Models supplies those bytes later at an exact immutable Hub revision.
-FROM ghcr.io/nightfall93/runpod-comfyui-minimax-h3:cuda13-blackwell
+FROM ghcr.io/nightfall93/runpod-comfyui-minimax-h3:cuda13-blackwell@sha256:4fdcd50e8e5f54f8329933c66e2eac17680cbac82d43c1a74d00465e9413a3e1
 
 USER root
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]

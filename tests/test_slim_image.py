@@ -24,6 +24,11 @@ IMAGE_REPOSITORY = "ghcr.io/chrisditfort/privora-h3-runpod-worker"
 class SlimDockerfileTests(unittest.TestCase):
     def test_slim_image_uses_cache_bootstrap_and_never_adds_weight_layers(self):
         dockerfile = (ROOT / "Dockerfile.slim").read_text(encoding="utf-8")
+        self.assertIn(
+            "FROM ghcr.io/nightfall93/runpod-comfyui-minimax-h3:cuda13-blackwell@"
+            "sha256:4fdcd50e8e5f54f8329933c66e2eac17680cbac82d43c1a74d00465e9413a3e1",
+            dockerfile,
+        )
         self.assertIn('ENTRYPOINT ["python3", "/opt/serverless/bootstrap.py"]', dockerfile)
         self.assertIn("H3_MODEL_REVISION=ecb69a4211d74b5798398021003bccde02d63757", dockerfile)
         self.assertIn("H3_MODEL_MANIFEST_VERSION=multimodal-4-hf-cache-v1", dockerfile)
@@ -197,6 +202,10 @@ class ImageMetadataTests(unittest.TestCase):
         self.assertEqual(document["sourceBranch"], "hf-cached-models-slim")
         self.assertEqual(document["image"], IMAGE_REPOSITORY + ":cached-models-1")
         self.assertEqual(document["platformImageDigest"], "sha256:" + "b" * 64)
+        self.assertEqual(
+            document["baseImageDigest"],
+            "sha256:4fdcd50e8e5f54f8329933c66e2eac17680cbac82d43c1a74d00465e9413a3e1",
+        )
         self.assertEqual(document["modelRelease"], {
             "repository": "CDitfort/privora-minimax-h3-models",
             "revision": "ecb69a4211d74b5798398021003bccde02d63757",

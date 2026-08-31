@@ -15,6 +15,8 @@ MODEL_REVISION = "ecb69a4211d74b5798398021003bccde02d63757"
 MODEL_MANIFEST = "multimodal-4-hf-cache-v1"
 COMFYUI_REVISION = "dec5d9450a5290bcf63430409ea41018e67f41c3"
 SOURCE_BRANCH = "hf-cached-models-slim"
+BASE_IMAGE = "ghcr.io/nightfall93/runpod-comfyui-minimax-h3:cuda13-blackwell"
+BASE_IMAGE_DIGEST = "sha256:4fdcd50e8e5f54f8329933c66e2eac17680cbac82d43c1a74d00465e9413a3e1"
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 TAG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
@@ -51,6 +53,8 @@ def release_document(
         "platform": "linux/amd64",
         "compressedBytes": compressed_bytes,
         "entrypoint": ["python3", "/opt/serverless/bootstrap.py"],
+        "baseImage": BASE_IMAGE,
+        "baseImageDigest": BASE_IMAGE_DIGEST,
         "comfyuiRevision": COMFYUI_REVISION,
         "modelRelease": {
             "repository": MODEL_REPOSITORY,
