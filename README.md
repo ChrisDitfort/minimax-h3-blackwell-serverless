@@ -132,7 +132,8 @@ The worker logs its GPU stack before accepting jobs. Expect:
 [handler] torch.cuda.get_device_name(0)       = NVIDIA RTX PRO 6000 Blackwell Server Edition
 [handler] torch.cuda.get_device_capability(0) = (12, 0)
 [handler] COMFY_SAGE_ATTENTION3 = 1
-[handler] sageattn3 available, version 1.0.0
+[handler] sageattn3 present, version 1.0.0
+[handler] SageAttention3 enabled: GPU capability (12, 0) matches the wheel (12.0).
 ```
 
 and from ComfyUI itself:
@@ -143,6 +144,462 @@ Using SageAttention3
 
 A capability below `(12, 0)` or a non-CUDA-13 torch is logged as a `WARNING` — it means the
 wrong GPU was scheduled, not that the image is wrong.
+
+### If a non-Blackwell GPU gets scheduled
+
+The `sageattn3` wheel in the base image is compiled for one compute capability (`sm_120`).
+It *imports* fine on any GPU — the mismatch only surfaces at generation time, as
+`no kernel image is available for execution on the device` on **every** attention call,
+which floods the log and silently falls back to PyTorch attention for the whole run.
+
+So the worker checks the capability it was actually scheduled and turns SageAttention3 off
+up front when it does not match, letting ComfyUI choose its own backend cleanly:
+
+```
+[handler] WARNING: SageAttention3 was built for compute capability 12.0 but this worker
+          was scheduled a 9.0 GPU. Disabling it - ...
+[handler]   This is a GPU scheduling problem: pin the RunPod endpoint to an
+          RTX PRO 6000 Blackwell to get SageAttention3. Generation still works without it.
+```
+
+Seeing this means the endpoint is not pinned to Blackwell. Generation still succeeds, just
+slower. Fix it in the endpoint's GPU selection rather than in the image.
+
+## Measuring cold-start performance
+
+Every job ends with one structured line, so a run can be compared against another without
+reading the surrounding ComfyUI chatter:
+
+```
+[perf] proc=657169cad581 cold_process=true job_in_proc=1 proc_age=0.0s comfy_boot=8.4s        comfy_wait=0.1s submit=0.0s pre_sampling=13.2s first_step=5.1s sampling=47.1s        steps=20/20 decode=8.8s output=1.3s total=71.4s per_step=2.36s status=ok
+[perf] nodes KSampler=47.1s MiniMaxH3VideoVAEDecode=7.2s MiniMaxH3TextEncode=3.9s
+```
+
+| Field | Meaning |
+|---|---|
+| `proc` | Identifies the worker **process**. The same value on two jobs means the process was reused; a new value means that job paid a full cold start. On a scale-to-zero endpoint this is the only way to tell whether FlashBoot actually restored a worker |
+| `cold_process` | `true` on the first job a process serves |
+| `job_in_proc` | How many jobs this process has served, including this one |
+| `proc_age` | Seconds between process start and this job starting |
+| `comfy_boot` | How long ComfyUI itself took to answer HTTP |
+| `comfy_wait` | How much of that this job actually waited for. `~0.0s` means ComfyUI was already up and its boot was **not** on this job's clock |
+| `submit` | Time to POST the prompt to ComfyUI |
+| `pre_sampling` | Prompt queued → first sampler frame: model staging, text encode, graph setup. **This is the cold-start cost the optimisation work targets** |
+| `first_step` | First sampler frame → first completed step. Carries the model-initialisation stall, so it is not mistaken for per-step cost |
+| `sampling` | First → last sampler frame (includes `first_step`) |
+| `steps` | Steps observed / total |
+| `per_step` | `sampling` ÷ steps observed |
+| `decode` | Last sampler frame → workflow finished: VAE decode, audio, mux, save |
+| `output` | Collecting, encoding and delivering artefacts |
+| `total` | Whole handler invocation |
+| `status` | `ok`, `bad_request`, `no_output`, `workflow_error` or `exception`. Emitted for failures too — a job that times out is exactly the one whose breakdown you want |
+
+A phase whose boundary never arrived reports `n/a` rather than failing the job.
+
+### FlashBoot preload (opt-in, off by default)
+
+`pre_sampling` is ~16s on a cold Blackwell worker, and the `[perf] nodes` line shows where
+it goes: the loaders finish in ~0.6s, then `MiniMaxH3ImageToVideo` spends ~7s staging the
+text encoder and `SamplerCustomAdvanced` ~9s staging the DiT. **Executing a loader does not
+put weights on the GPU** - `model_management.load_models_gpu()` does, and only when a node
+actually uses the model. So a loader-only warmup would save nothing.
+
+`H3_FLASHBOOT_PRELOAD=1` therefore runs the smallest graph that reaches both of those
+calls, after ComfyUI is ready and before `runpod.serverless.start()`:
+
+```
+UNETLoader ─┬─────────────────────────► BasicGuider ─┐
+CLIPLoader ─┼─► MiniMaxH3ImageToVideo ───────────────┼─► SamplerCustomAdvanced ─► PreviewAny
+VAELoader  ─┘   (32x32, 5 frames)      BasicScheduler┘   (1 step)
+VAELoader (audio) ───────────────────────────────────────────────────────────────► PreviewAny
+```
+
+No `VAEDecode`, no `CreateVideo`, no `SaveVideo` - nothing is decoded and nothing is written
+to disk. `PreviewAny` is there because ComfyUI **rejects a prompt with no `OUTPUT_NODE`**
+("Prompt has no outputs"), so a graph of loaders alone would never execute at all.
+
+Why the real job then gets it for free: ComfyUI keys its output cache on `class_type` +
+inputs and deliberately excludes node id, so the real workflow's loaders - whose inputs are
+byte-identical to the preload's - hit the cache and receive **the same `ModelPatcher`
+objects**. `load_models_gpu()` finds those already in `current_loaded_models`
+(`LoadedModel.__eq__` compares by identity) and skips staging. Models survive the preload
+prompt because `unload_all_models()` only runs on OOM or under `--disable-smart-memory`.
+
+**Not preloaded:** VRAM staging for the two VAEs. There is no way to stage a VAE without
+running a decode, and decode is the expensive part. Their *loaders* run, so those cache
+entries are warm, but the ~10.8s decode phase is untouched.
+
+If the preload fails or times out, it logs and the worker starts normally - the first
+request just loads models the usual way. On timeout ComfyUI is sent `/interrupt` so the
+first real job is not queued behind an abandoned synthetic prompt.
+
+#### Measuring it
+
+```
+# A: control
+H3_FLASHBOOT_PRELOAD=0
+
+# B: preload
+H3_FLASHBOOT_PRELOAD=1
+```
+
+Startup gains a line:
+
+```
+[perf] preload proc=… status=ok total=15.9s loaded=te,dit,video_vae,… preload_te=7.1s preload_dit=8.4s
+[perf] startup proc=… to_serverless_ready=24.8s comfy_boot=7.1s preload_enabled=true preload_total=15.9s
+```
+
+Compare the **first job's `pre_sampling`** against the ~16.0s control. `sampling` and
+`per_step` must stay ~47.0s / ~2.35s; if they move, something other than residency changed.
+
+The blunt check for whether it worked: ComfyUI logs `Requested to load <name>` **only when a
+model is not already resident**. After a successful preload the first real job should show
+*fewer* `Requested to load MiniMaxH3TEModel_` / `MiniMaxH3` lines than the control.
+
+#### The honest caveat
+
+Within one process this mechanism is sound and verified in ComfyUI's source. Whether
+**FlashBoot** preserves it across a scale-to-zero is the open question: it snapshots the
+worker process, but CUDA context and VRAM residency are not ordinary process memory, and a
+restore may well come back with an empty GPU. If it does not survive, the preload merely
+moves ~16s from the first request into startup - both are billed, so that is a wash, not a
+win. Judge it on `pre_sampling`, not on the fact that the preload ran.
+
+### A/B testing `--highvram`
+
+The 96 GB Blackwell parts hold the entire ~41 GB working set with room to spare, but ComfyUI
+still selects `NORMAL_VRAM` and streams weights through pinned host RAM. Whether pinning
+them in VRAM helps is measurable without rebuilding: set `COMFY_EXTRA_ARGS` on the endpoint
+and compare runs of the **same image**.
+
+```
+# baseline
+COMFY_EXTRA_ARGS=            # or unset
+
+# candidate
+COMFY_EXTRA_ARGS=--highvram
+```
+
+Confirm the flag actually landed — startup logs it explicitly:
+
+```
+[handler] ComfyUI effective args: COMFY_EXTRA_ARGS='--highvram' -> extra=['--highvram']
+[INFO] Set vram state to: HIGH_VRAM
+```
+
+Then compare **`pre_sampling`** and **`first_step`** between the two, on jobs where
+`cold_process=true` in both. `sampling` and `per_step` should be unchanged; if they move,
+something other than residency changed and the comparison is not clean.
+
+## Cloudflare Worker API (worker.js)
+
+`worker.js` is the public API in front of both RunPod endpoints. It owns the contract and
+builds the ComfyUI graph; the RunPod handler stays a thin executor that runs whatever
+workflow it is handed. Callers never see ComfyUI node ids.
+
+Run its tests with `node --test worker.test.js` (no dependencies).
+
+### Normalized request
+
+```json
+{
+  "backend": "h3-blackwell",
+  "mode": "text_to_video",
+  "prompt": "A cinematic ocean scene",
+  "quality": "standard",
+  "duration": 5,
+  "aspect_ratio": "16:9",
+  "seed": 51
+}
+```
+
+The raw shape (`width`/`height`/`frames`/`steps`/`seed`) still works unchanged, and
+`/status/...` and `/cancel/...` are untouched.
+
+### Quality tiers
+
+Dimensions are not invented here. They come from the pinned ComfyUI build's own
+`adapt_canvas()` in `comfy_extras/nodes_minimax_h3.py`: short edge to the tier's value,
+total area capped at 768x1344, each axis rounded to 32.
+
+| Quality | Short edge | Steps | 16:9 | 9:16 | 1:1 | 4:3 | 3:4 |
+|---|---|---|---|---|---|---|---|
+| `fast` | 576 | 14 | 1024x576 | 576x1024 | 576x576 | 768x576 | 576x768 |
+| `standard` | 576 | 20 | 1024x576 | 576x1024 | 576x576 | 768x576 | 576x768 |
+| `hd` | 768 | 20 | 1344x768 | 768x1344 | 768x768 | 1024x768 | 768x1024 |
+
+`hd` is the canvas the H3 nodes themselves default to - a validated 768-class
+configuration, not an upscale or a second-stage pipeline.
+
+`GET /capabilities` returns this table live, so clients need not hardcode it.
+
+### Duration
+
+H3 runs at 24 fps and only accepts frame counts where `frames % 17 == 5`
+(`align_frame_count()` in the same file). `duration` is converted in one helper:
+
+```
+duration: 5  ->  round(5 * 24) = 120  ->  snapped up to 124 frames (5.1667s)
+```
+
+Supplying an off-grid `frames` value is a 400 that names the nearest legal counts.
+
+### Precedence
+
+Explicit raw values beat the quality preset. A raw value that *contradicts* a normalized
+one is a 400 rather than a silent guess:
+
+| Combination | Result |
+|---|---|
+| `quality` + `steps` | `steps` wins |
+| `quality`/`aspect_ratio` + `width`/`height` | `width`/`height` win |
+| `aspect_ratio` + `width`/`height` that disagree | **400** |
+| `duration` + `frames` that disagree | **400** |
+| `width` without `height` | **400** |
+
+### Structured prompt fields
+
+`camera`, `shot`, `lighting`, `style`, `motion` and `audio_prompt` are appended as labelled
+lines after the user's prompt, which is never rewritten. Absent fields add nothing.
+
+```
+A woman standing near the ocean.
+
+Camera: slow dolly forward.
+Lighting: warm sunset.
+```
+
+### Modes
+
+| Mode | Status |
+|---|---|
+| `text_to_video` | available |
+| `first_frame_to_video` | available (`first_frame.url`, https) |
+| `last_frame_to_video` | **501** - handler stages only one image |
+| `first_last_frame_to_video` | **501** - handler stages only one image |
+| `reference` (Ref2VA) | **501** - model not in the image |
+| `regenerate_2k` | **501** - no second-stage model |
+
+An unavailable mode returns 501 with a reason. It never silently degrades to
+text-to-video, which would return a video that quietly ignored the caller's keyframes.
+
+### Ref2VA status
+
+`MiniMaxH3ReferenceToVideo` **is present** in the pinned ComfyUI build, so no ComfyUI
+change is needed. What is missing is the weight file:
+
+| Item | Value |
+|---|---|
+| File | `minimax_h3_ref2va_pruned_int8_convrot.safetensors` |
+| Size | **20,970,379,616 bytes (20.97 GB)** |
+| Image impact | 43.2 GB -> ~64 GB compressed, roughly +50% |
+| Cold start | first pull on an uncached worker grows proportionally |
+| VRAM | ~20 GB more resident if held alongside FL2VA; 96 GB is sufficient |
+
+The node also needs an `audio_vae` input that FL2VA does not use, plus Autogrow inputs
+(`ref_image_0..8`, `ref_video_0..2`, `ref_video_audio_0..2`, `ref_audio_0..2`), and the
+prompt must reference `<Picture i>` / `<Video k>` / `<Audio j>` tags. The API shape is in
+place; the weights are a deliberate, separately-costed decision.
+
+### 2K status
+
+Nothing installed and nothing measured. `regenerate_2k` exists only as a reserved mode
+name so the routing layer does not need reshaping later.
+
+## Realtime progress and R2 output
+
+The browser never talks to RunPod. Cloudflare owns the public API, the storage and the
+realtime channel; RunPod owns inference and nothing else.
+
+```
+Browser ──WebSocket──> Worker ──> JobChannel (Durable Object)
+   │                     │                ▲
+   │  POST /generate     │ R2 binding     │ HTTP progress + output
+   ▼                     ▼                │
+Worker ──job payload──> RunPod handler ───┘
+                            │
+                            └──> ComfyUI (internal websocket)
+```
+
+### Why RunPod holds no Cloudflare credentials
+
+Each job is issued three short-lived HMAC tokens binding **job id + purpose + expiry**:
+`progress`, `output-upload` and `asset-download`. A progress token cannot upload a video;
+an output token for one job cannot write to another; all of them expire. The signing key
+(`JOB_TOKEN_SECRET`) never leaves Cloudflare, and R2 is reached only through the Worker's
+`H3_OUTPUTS` binding - there is no R2 API key anywhere in the image.
+
+### Internal routes (RunPod -> Cloudflare)
+
+| Route | Purpose token | Notes |
+|---|---|---|
+| `POST /internal/jobs/:id/progress` | `progress` | Normalised phase events; raw ComfyUI text is never forwarded |
+| `PUT /internal/jobs/:id/output` | `output-upload` | Raw `video/mp4` body streamed straight into R2 |
+| `GET /internal/jobs/:id/assets/:assetId` | `asset-download` | Keyframe fetch |
+
+### Public routes
+
+| Route | Notes |
+|---|---|
+| `POST /jobs/:id/assets` | Upload a keyframe. PNG/JPEG/WebP, 32 MB cap |
+| `GET /jobs/:id/video` | Streams from R2. Range supported, so browsers can seek |
+| `GET /ws/jobs/:id` | WebSocket. Current state on connect, then live events |
+
+### WebSocket protocol
+
+```jsonc
+{"type": "state",    "jobId": "...", "phase": "sampling", "step": 5, "steps": 20}
+{"type": "progress", "jobId": "...", "phase": "sampling", "step": 7, "steps": 20, "percent": 35}
+{"type": "progress", "jobId": "...", "phase": "decoding", "percent": 90}
+{"type": "completed","jobId": "...", "video": {"url": "/jobs/.../video"}}
+{"type": "failed",   "jobId": "...", "error": {"code": "...", "message": "..."}}
+{"type": "cancelled","jobId": "..."}
+```
+
+Phases: `queued`, `starting_worker`, `comfy_ready`, `loading_models`, `sampling`,
+`decoding`, `uploading`, `completed`, `failed`, `cancelled`. Step counters appear only
+during `sampling`.
+
+### R2 object naming
+
+```
+inputs/{jobId}/{assetId}.{png|jpg|webp}
+outputs/{jobId}/video.mp4
+```
+
+Keys are chosen by the Worker, never by RunPod: the handler uploads to a route that
+already knows where the object belongs, so a compromised or buggy worker cannot write
+anywhere else in the bucket. A client-supplied `r2_key` is reduced to its asset id for the
+same reason. There is no user namespace because this system has no user identity;
+`outputKey()` and `inputKey()` are the only two places that would change if one is added.
+
+**Lifecycle:** nothing is deleted automatically. Outputs are small (a 5s clip is ~1.5-3 MB)
+so this is not urgent, but an R2 lifecycle rule expiring `inputs/` after a few days and
+`outputs/` after whatever the product promises is the obvious next step. Do not add
+aggressive cleanup that could race a job still writing.
+
+### Deleting an output
+
+```
+DELETE /jobs/{jobId}/video
+```
+
+```json
+{ "id": "08ad4ace-d847-46b4-a1d6-a919d7e3a0c9", "deleted": true }
+```
+
+The key is derived from the job id inside the Worker via `outputKey()`, so a caller cannot
+name an arbitrary object - and there is deliberately **no** generic "delete this key"
+route anywhere in the API. A malformed job id is a 400 before R2 is touched at all.
+
+Idempotent: R2's delete does not fail on a missing key and the job is marked deleted either
+way, so a retry after a dropped connection returns the same answer rather than an error.
+
+Afterwards `/status/...?jobId=...` reports the output as gone instead of handing back a URL
+that would 404, while the generation itself stays `COMPLETED` - deleting an artefact is not
+a retrospective failure of the job that produced it:
+
+```jsonc
+// before
+"video": { "url": "/jobs/.../video", "key": "outputs/.../video.mp4", "size": 2196233, "deleted": false }
+// after
+"video": { "deleted": true }
+```
+
+`GET /jobs/{jobId}/video` then returns 404, including for Range requests, and the WebSocket
+`completed` event carries `{"deleted": true}` with no URL.
+
+**Access control is unchanged:** possession of the job id is the credential, exactly as it
+already is for `/status/{jobId}`. This endpoint is shaped so that a future API Runtime layer
+can call it internally *after* verifying user ownership - the ownership check belongs there,
+not here.
+
+### Retention
+
+Nothing expires by default; the bucket only carries R2's stock multipart-abort rule.
+`scripts/set_r2_lifecycle.sh` applies a prefix-scoped policy - dry-run by default, `--apply`
+to write it:
+
+| Prefix | Suggested | Why |
+|---|---|---|
+| `inputs/` | 7 days | Keyframes are only needed while the job runs, which is under two minutes |
+| `outputs/` | 30 days | Long enough that a bookmarked link is unlikely to surprise anyone; ~6 GB for 100 clips/day |
+
+These are suggestions, not a decision made for you: retention length is user-visible and
+belongs to the product. Edit the two constants at the top of the script before applying.
+
+Lifecycle expiry and `DELETE /jobs/:id/video` are deliberately separate - the endpoint is
+for deliberate removal, the policy is for outputs nobody came back for. Note that an object
+expired by lifecycle leaves the Durable Object still reporting a URL until that job's state
+is next written; `GET .../video` correctly 404s, but the status response can lag. Shortening
+retention below the DO's own lifetime would make that more visible.
+
+### Behind Cloudflare Access
+
+If the Worker is behind Access - it is, on `minimax-h3-backend` - RunPod needs an Access
+**service token** as well as its job token. They are different credentials doing different
+jobs: Access decides whether the request reaches the Worker at all, the job token decides
+what it may do once there.
+
+Set on the RunPod endpoint (any of these spellings; the first pair is Cloudflare's own):
+
+```
+CLOUDFLARE_ACCESS_CLIENT_ID / CLOUDFLARE_ACCESS_CLIENT_SECRET
+CF_ACCESS_CLIENT_ID         / CF_ACCESS_CLIENT_SECRET
+CLOUDFLARE_ACCESS_KEY_ID    / CLOUDFLARE_SECRET_ACCESS_KEY
+```
+
+The last pair is accepted because it is easy to reach for, but those names conventionally
+mean R2's *S3-API* credentials, which are a different credential and will not pass Access.
+An Access service token's client id ends in `.access`.
+
+### Troubleshooting the callback path
+
+The worker states its own view at boot, which is the fastest way to rule out the
+environment:
+
+```
+[handler] Cloudflare Access service token: configured (client id 6f1a2b...c.access, ends in '.access')
+[handler] Cloudflare Access service token: NOT configured. ...
+```
+
+Then the `[perf]` line at the end of each job:
+
+| Field | Meaning |
+|---|---|
+| `progress_callbacks=21/21` | All callbacks delivered |
+| `progress_callbacks=0/21` | Every callback rejected - look for the warning naming Access |
+| `output_upload`, `output_bytes` | Present only when the R2 path ran |
+
+Two traps worth knowing, both of which have bitten this code:
+
+* **A 302 is not a failure to `requests`.** `Response.ok` is `status_code < 400`, so
+  Access's login redirect reads as success, and `requests` follows redirects by default -
+  re-issuing the PUT as a GET without the body. Both are now explicitly rejected, and the
+  upload additionally requires the Worker's own JSON acknowledgement, because anything in
+  front of the Worker can answer 200 with HTML while storing nothing.
+* **Env vars are injected at container start.** A worker container created before the
+  variables were saved keeps the old environment no matter what the endpoint config says.
+  The same `workerId` across runs is the tell. Releasing a new endpoint version forces
+  fresh workers.
+
+* **A RunPod secret reference that never resolved.** Endpoint values may be written as
+  `{{ RUNPOD_SECRET_<name> }}`. If no account-level secret of that name exists under
+  RunPod Settings -> Secrets, RunPod passes the literal braces through rather than
+  failing. The variable then looks set, the handler sends a template string as a
+  credential, and Cloudflare Access rejects it - identical, from inside the container, to
+  a real token being refused. This is what actually broke the first working deployment,
+  and it survived several rounds of checking the Access policy, the paths and the
+  variable names, all of which were correct. The handler now treats such a value as
+  unconfigured and names it in the error.
+
+**R2 is the ground truth.** A status response can only report what the handler believed;
+the object either exists or it does not:
+
+```
+npx wrangler r2 object get minimax-h3-private-output/outputs/{jobId}/video.mp4 --remote --file out.mp4
+```
 
 ## Request schema
 
@@ -455,8 +912,16 @@ mp4 = AESGCM(dek).decrypt(
 | `COMFY_PORT` | `8188` | Internal ComfyUI port (localhost only) |
 | `COMFY_OUTPUT_DIR` | `/tmp/comfy-output` | Where ComfyUI writes results |
 | `COMFY_STARTUP_TIMEOUT` | `600` | Seconds to wait for ComfyUI readiness |
-| `COMFY_EXTRA_ARGS` | *(empty)* | Extra ComfyUI CLI arguments |
+| `COMFY_EXTRA_ARGS` | *(empty)* | Extra ComfyUI CLI arguments, shell-quoted (e.g. `--highvram`). Logged verbatim at startup |
+| `H3_PERF_NODES` | `1` | `0` suppresses the per-node `[perf] nodes` line |
+| `H3_FLASHBOOT_PRELOAD` | `0` | `1` stages the text encoder and DiT onto the GPU before the serverless loop starts |
+| `H3_FLASHBOOT_PRELOAD_TIMEOUT` | `60` | Seconds before the preload is abandoned and ComfyUI interrupted |
+| `H3_FLASHBOOT_PRELOAD_WIDTH` / `_HEIGHT` / `_LENGTH` | `32` / `32` / `5` | Synthetic graph size; the node schema's minimums |
+| `H3_FLASHBOOT_PRELOAD_UNET` / `_CLIP` / `_VIDEO_VAE` / `_AUDIO_VAE` | baked model filenames | Must match the real workflow's loader inputs exactly |
+| `H3_PERF_NODES_TOP` | `6` | How many nodes to show on that line |
 | `COMFY_SAGE_ATTENTION3` | `1` (from base) | `0` disables SageAttention3 if it destabilises |
+| `H3_SAGE_AUTODETECT` | `1` | Auto-disable SageAttention3 when the scheduled GPU is not the capability the wheel was built for. `0` forces `COMFY_SAGE_ATTENTION3` through unchecked |
+| `SAGE_SUPPORTED_CC` | `12.0` (from base) | Compute capability the `sageattn3` wheel was compiled for |
 | `H3_JOB_TIMEOUT` | `3000` | Max seconds for one workflow |
 | `H3_WS_RECV_TIMEOUT` | `30` | Websocket recv timeout (timeouts are normal) |
 | `H3_EAGER_START` | `1` | Start ComfyUI during cold start, not the first job |

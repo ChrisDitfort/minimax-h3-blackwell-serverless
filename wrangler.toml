@@ -1,0 +1,79 @@
+# Cloudflare Worker configuration for the MiniMax H3 API.
+#
+# Every value here was read from the live deployment (`wrangler whoami`,
+# `wrangler r2 bucket list`, and the Workers API for the deployed script's
+# bindings) rather than chosen. Two of them matter more than they look:
+#
+#   * The R2 binding is H3_OUTPUTS, not a name of our choosing. worker.js
+#     reads env.H3_OUTPUTS to match.
+#
+#   * RUNPOD_ENDPOINT_ID and RUNPOD_BLACKWELL_ENDPOINT_ID are plain vars that
+#     were set in the dashboard. `wrangler deploy` replaces the entire binding
+#     set with whatever this file declares, so omitting them here would delete
+#     them from the live Worker and break every request. They are restated
+#     below for exactly that reason.
+#
+# Secrets are NOT declared here - wrangler preserves existing secrets across a
+# deploy, and putting their values in a committed file would leak them.
+
+name = "minimax-h3-backend"
+main = "worker.js"
+
+# Matches what is currently deployed. No compatibility_flags: everything the
+# Worker uses (crypto.subtle, btoa/atob, crypto.randomUUID, WebSocketPair,
+# Durable Object hibernation) is available in the Workers runtime without
+# nodejs_compat, and adding a flag would change runtime behaviour for no gain.
+compatibility_date = "2026-08-25"
+
+# account_id is intentionally omitted; wrangler infers it from the logged-in
+# account (899c4111fb42559764b1bd1118d8cf79).
+
+[observability]
+enabled = true
+
+# --- R2 -------------------------------------------------------------------
+# Binding name comes from the live deployment. worker.js::requireBucket()
+# reads env.H3_OUTPUTS.
+[[r2_buckets]]
+binding = "H3_OUTPUTS"
+bucket_name = "minimax-h3-private-output"
+
+# --- Durable Objects ------------------------------------------------------
+# New in this release. One JobChannel per job id holds realtime state and fans
+# progress out to connected WebSockets.
+[[durable_objects.bindings]]
+name = "JOB_CHANNEL"
+class_name = "JobChannel"
+
+# First DO migration for this Worker. SQLite-backed classes are the current
+# default and are available on the free plan.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["JobChannel"]
+
+# --- Plain vars -----------------------------------------------------------
+# The two RunPod endpoint ids are reproduced from the live deployment so this
+# deploy does not remove them. Their API keys stay as secrets.
+[vars]
+RUNPOD_ENDPOINT_ID = "xa6b4vs5gdva3r"
+RUNPOD_BLACKWELL_ENDPOINT_ID = "d0p4f4hgxyqsy2"
+
+# Lifetime of the job-scoped callback tokens handed to RunPod. Long enough to
+# cover a slow cold start plus a full generation, short enough that a leaked
+# token is not useful for long.
+JOB_TOKEN_TTL_SECONDS = "3600"
+
+# Optional: set if the Worker is reached through a custom domain, so callback
+# URLs handed to RunPod point at the public hostname rather than whichever
+# origin the request arrived on.
+# PUBLIC_BASE_URL = "https://api.example.com"
+
+# --- Secrets --------------------------------------------------------------
+# Set with `npx wrangler secret put <NAME>`; never committed.
+#
+#   JOB_TOKEN_SECRET             REQUIRED, new in this release. HMAC key for
+#                                job-scoped callback tokens. Generate with:
+#                                  node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))"
+#
+#   RUNPOD_API_KEY               already set
+#   RUNPOD_BLACKWELL_API_KEY     already set

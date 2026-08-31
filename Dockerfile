@@ -64,6 +64,27 @@ RUN mkdir -p "$COMFY_DIR/models/diffusion_models/h3" \
  && ln -sfn ../minimax_h3_fl2va_pruned_int8_convrot.safetensors \
       "$COMFY_DIR/models/diffusion_models/h3/minimax_h3_fl2va_pruned_int8_convrot.safetensors"
 
+# Pre-apply ComfyUI's SQLite migrations at build time.
+#
+# ComfyUI keeps an asset database at <root>/user/comfyui.db and runs alembic against it on
+# every startup. A scale-to-zero endpoint gets a fresh container filesystem every time, so
+# that database never exists and the whole 0001..0006 chain is replayed on every single
+# cold start - visible in the logs as "Database upgraded from None to 0006_add_loader_path".
+# Baking it means startup finds the schema already at head.
+#
+# Safe because ComfyUI's _init_file_db() compares the current revision against head and
+# skips the upgrade entirely when they match. The file stays writable and un-mounted, so if
+# a future base image ships newer migrations the runtime simply applies the remainder.
+#
+# Driving alembic directly, rather than booting ComfyUI, keeps this GPU-free: alembic_db/env.py
+# imports only app.database.models, which pulls SQLAlchemy and nothing else. The second
+# command fails the build if the schema did not actually get stamped, so this can never
+# quietly degrade into a no-op.
+RUN cd "$COMFY_DIR" \
+ && mkdir -p user \
+ && python3 -c "from alembic import command; from alembic.config import Config; c = Config('alembic.ini'); c.set_main_option('script_location', 'alembic_db'); command.upgrade(c, 'head')" \
+ && python3 -c "import sqlite3; r = sqlite3.connect('user/comfyui.db').execute('select version_num from alembic_version').fetchone(); assert r and r[0], 'alembic_version is empty - migrations did not run'; print('ComfyUI DB baked at revision', r[0])"
+
 COPY handler.py /opt/serverless/handler.py
 
 WORKDIR /opt/serverless

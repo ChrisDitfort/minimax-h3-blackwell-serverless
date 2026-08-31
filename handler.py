@@ -24,6 +24,7 @@ import hashlib
 import json
 import os
 import secrets
+import shlex
 import shutil
 import signal
 import subprocess
@@ -67,6 +68,42 @@ WS_RECV_TIMEOUT = int(os.environ.get("H3_WS_RECV_TIMEOUT", "30"))
 
 OUTPUT_MODE = os.environ.get("H3_OUTPUT_MODE", "base64").strip().lower()
 
+# Generous: a 5s 1024x576 MP4 is only a few MB, but a long clip on a slow link should not
+# be abandoned after the video has already been paid for in GPU time.
+OUTPUT_UPLOAD_TIMEOUT = float(os.environ.get("H3_OUTPUT_UPLOAD_TIMEOUT", "120"))
+
+# --------------------------------------------------------------------------------------
+# FlashBoot preload (opt-in, default off)
+# --------------------------------------------------------------------------------------
+PRELOAD_ENABLED = os.environ.get("H3_FLASHBOOT_PRELOAD", "0") == "1"
+PRELOAD_TIMEOUT = int(os.environ.get("H3_FLASHBOOT_PRELOAD_TIMEOUT", "60"))
+
+# The smallest graph the node schema allows: width/height min 32 step 32, length min 5
+# step 17 (the model's 17k+5 grid). Read off MiniMaxH3ImageToVideo's own schema, not
+# guessed. Overridable in case a base-image bump tightens the limits.
+PRELOAD_WIDTH = int(os.environ.get("H3_FLASHBOOT_PRELOAD_WIDTH", "32"))
+PRELOAD_HEIGHT = int(os.environ.get("H3_FLASHBOOT_PRELOAD_HEIGHT", "32"))
+PRELOAD_LENGTH = int(os.environ.get("H3_FLASHBOOT_PRELOAD_LENGTH", "5"))
+PRELOAD_PROMPT = os.environ.get("H3_FLASHBOOT_PRELOAD_PROMPT", "preload")
+
+# These MUST match the real workflow's loader inputs byte for byte. ComfyUI keys its
+# output cache on class_type + inputs and explicitly excludes node id
+# (CacheKeySetInputSignature.include_node_id_in_input() -> False), so identical loader
+# inputs are what makes the real job reuse the objects this preload put on the GPU.
+# Defaults are the four models baked by models.tsv.
+PRELOAD_UNET = os.environ.get(
+    "H3_FLASHBOOT_PRELOAD_UNET", "minimax_h3_fl2va_pruned_int8_convrot.safetensors"
+)
+PRELOAD_CLIP = os.environ.get(
+    "H3_FLASHBOOT_PRELOAD_CLIP", "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"
+)
+PRELOAD_VIDEO_VAE = os.environ.get(
+    "H3_FLASHBOOT_PRELOAD_VIDEO_VAE", "minimax_h3_video_vae_fp16.safetensors"
+)
+PRELOAD_AUDIO_VAE = os.environ.get(
+    "H3_FLASHBOOT_PRELOAD_AUDIO_VAE", "minimax_h3_audio_vae_fp32.safetensors"
+)
+
 # ComfyUI history buckets that carry saved artefacts. SaveVideo emits ui.PreviewVideo,
 # whose as_dict() is {"images": [...], "animated": (True,)} - so MP4s land under "images",
 # which is exactly what the Cloudflare Worker already reads.
@@ -78,6 +115,443 @@ _start_lock = threading.Lock()
 
 def log(message: str) -> None:
     print(f"[handler] {message}", flush=True)
+
+
+# --------------------------------------------------------------------------------------
+# Performance instrumentation
+# --------------------------------------------------------------------------------------
+#
+# Every phase boundary below comes from something the handler can already see: its own
+# call sites, plus the `executing` / `progress` frames ComfyUI sends over the websocket it
+# is already connected to. Nothing inside ComfyUI is patched or wrapped, so this cannot
+# change what a job computes - the worst a bug in here can do is print "n/a".
+
+# Identifies this worker *process*. Two jobs logging the same proc= ran back-to-back on
+# one warm process; different values mean each paid its own cold start. On a scale-to-zero
+# endpoint that is the only way to tell from the logs alone whether a worker was actually
+# reused, which is precisely the question the cold-start work needs answered.
+PROCESS_ID = uuid.uuid4().hex[:12]
+_PROCESS_START = time.monotonic()
+
+# Set once, by whichever call to start_comfyui() actually launched ComfyUI.
+_comfy_boot_seconds: float | None = None
+_jobs_served = 0
+_jobs_lock = threading.Lock()
+
+# The per-node breakdown is a second line per job; H3_PERF_NODES=0 turns it off.
+PERF_NODES = os.environ.get("H3_PERF_NODES", "1") == "1"
+PERF_NODES_TOP = int(os.environ.get("H3_PERF_NODES_TOP", "6"))
+
+
+def _secs(value: float | None) -> str:
+    return "n/a" if value is None else f"{value:.1f}s"
+
+
+# Public progress phases. Deliberately a small, stable vocabulary: ComfyUI's own log text
+# is never forwarded, so the browser sees a contract we control rather than internals.
+PHASE_STARTING = "starting_worker"
+PHASE_COMFY_READY = "comfy_ready"
+PHASE_LOADING = "loading_models"
+PHASE_SAMPLING = "sampling"
+PHASE_DECODING = "decoding"
+PHASE_UPLOADING = "uploading"
+PHASE_COMPLETED = "completed"
+PHASE_FAILED = "failed"
+PHASE_CANCELLED = "cancelled"
+
+# Cloudflare Access sits in front of the Worker, so every call back into it - progress,
+# output upload, asset download - has to present an Access service token as well as the
+# job-scoped bearer token. The two are different things and both are required: Access
+# decides whether the request reaches the Worker at all, and the bearer token decides what
+# it is allowed to do once it gets there.
+#
+# Set CF_ACCESS_CLIENT_ID / CF_ACCESS_CLIENT_SECRET on the RunPod endpoint. Left unset,
+# the headers are simply omitted, which is correct for a Worker not behind Access.
+# Three spellings are accepted, in this order:
+#
+#   CF_ACCESS_CLIENT_ID / CF_ACCESS_CLIENT_SECRET
+#   CLOUDFLARE_ACCESS_CLIENT_ID / CLOUDFLARE_ACCESS_CLIENT_SECRET   <- Cloudflare's own
+#       convention; wrangler asks for exactly these names when it hits an Access-protected
+#       host, so this is the spelling to prefer.
+#   CLOUDFLARE_ACCESS_KEY_ID / CLOUDFLARE_SECRET_ACCESS_KEY
+#
+# The third pair is accepted only because it is easy to reach for, but be careful: those
+# names conventionally mean R2's *S3-API* credentials, which are a completely different
+# credential and will not get past Access. What belongs in all three is an Access
+# **service token** from Zero Trust -> Access -> Service Auth.
+CF_ACCESS_CLIENT_ID = (
+    os.environ.get("CF_ACCESS_CLIENT_ID")
+    or os.environ.get("CLOUDFLARE_ACCESS_CLIENT_ID")
+    or os.environ.get("CLOUDFLARE_ACCESS_KEY_ID")
+    or ""
+).strip()
+CF_ACCESS_CLIENT_SECRET = (
+    os.environ.get("CF_ACCESS_CLIENT_SECRET")
+    or os.environ.get("CLOUDFLARE_ACCESS_CLIENT_SECRET")
+    or os.environ.get("CLOUDFLARE_SECRET_ACCESS_KEY")
+    or ""
+).strip()
+
+
+def _describe_non_2xx(response) -> str:
+    """Explain a non-2xx, naming Cloudflare Access when that is what happened.
+
+    Access answers an unauthenticated call with a 302 to its login page. `requests`
+    follows redirects by default and Response.ok is merely `status_code < 400`, so both
+    the redirect and the resulting HTML login page read as success unless this is checked
+    explicitly. That is exactly how a job once reported a video it had never uploaded.
+    """
+    # Every field is read defensively: this only ever builds a log string, and must not be
+    # able to raise into the caller's error handling and have the failure counted twice.
+    status = getattr(response, "status_code", "?")
+    location = (getattr(response, "headers", None) or {}).get("Location", "") or ""
+    if status in (301, 302, 303, 307, 308):
+        if "cloudflareaccess.com" in location or "/cdn-cgi/access/login" in location:
+            # State whether we even sent a token. "Rejected" and "never sent" produce
+            # the identical 302, and the startup line that distinguishes them scrolls out
+            # of RunPod's log window - so the answer belongs in the error itself.
+            if _is_unresolved_secret_reference(CF_ACCESS_CLIENT_ID) or (
+                _is_unresolved_secret_reference(CF_ACCESS_CLIENT_SECRET)
+            ):
+                return (
+                    f"HTTP {status} to a Cloudflare Access login page. The Access service "
+                    "token is an UNRESOLVED RunPod secret reference - the value is still "
+                    "the literal '{{ RUNPOD_SECRET_... }}' placeholder, so no real "
+                    "credential was sent. Create account-level secrets with those exact "
+                    "names under RunPod Settings -> Secrets, or replace the reference with "
+                    "the value itself."
+                )
+            if not (CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET):
+                which = []
+                if not CF_ACCESS_CLIENT_ID:
+                    which.append("client id")
+                if not CF_ACCESS_CLIENT_SECRET:
+                    which.append("secret")
+                return (
+                    f"HTTP {status} to a Cloudflare Access login page, and NO Access "
+                    f"service token was sent because the {' and '.join(which)} is missing "
+                    "from this container's environment. Set CLOUDFLARE_ACCESS_KEY_ID and "
+                    "CLOUDFLARE_SECRET_ACCESS_KEY on the RunPod endpoint. This is a "
+                    "configuration problem, not an Access policy problem."
+                )
+            return (
+                f"HTTP {status} to a Cloudflare Access login page. An Access service token "
+                f"WAS sent (client id {CF_ACCESS_CLIENT_ID[:6]}...{CF_ACCESS_CLIENT_ID[-8:]}) "
+                "and Access rejected it. Check the token is valid and that a Service Auth "
+                "policy on this application allows it."
+            )
+        return f"HTTP {status} redirect to {location[:120]!r}"
+    body = str(getattr(response, "text", "") or "")[:200]
+    return f"HTTP {status}: {body}"
+
+
+def _is_2xx(response) -> bool:
+    """True only for a real success.
+
+    Deliberately not `response.ok`, which is `status_code < 400` and therefore treats a
+    302 as a success.
+    """
+    return 200 <= response.status_code < 300
+
+
+def log_callback_configuration() -> None:
+    """Say at boot whether an Access service token reached the container.
+
+    Worth its own line because of how this fails otherwise. A missing token and a rejected
+    token both end as the same 302, and the operator's own curl works because they pass the
+    headers by hand - so "it works from my machine" tells you nothing about what the worker
+    is sending. Only the variable names and the client-id shape are logged; the secret is
+    never printed, and neither is the full id.
+    """
+    if CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET:
+        shape = "ends in '.access'" if CF_ACCESS_CLIENT_ID.endswith(".access") else (
+            "does NOT end in '.access' - this may be an R2 S3 key rather than an Access "
+            "service token"
+        )
+        log(
+            f"Cloudflare Access service token: configured "
+            f"(client id {CF_ACCESS_CLIENT_ID[:6]}...{CF_ACCESS_CLIENT_ID[-8:]}, {shape})"
+        )
+    elif CF_ACCESS_CLIENT_ID or CF_ACCESS_CLIENT_SECRET:
+        missing = "secret" if CF_ACCESS_CLIENT_ID else "client id"
+        log(
+            f"WARNING: Cloudflare Access service token is HALF configured - the {missing} "
+            "is missing, so no Access headers will be sent and callbacks will be rejected."
+        )
+    else:
+        log(
+            "Cloudflare Access service token: NOT configured. Set "
+            "CLOUDFLARE_ACCESS_KEY_ID and CLOUDFLARE_SECRET_ACCESS_KEY on the endpoint if "
+            "the Worker is behind Access, or progress callbacks and the R2 upload will be "
+            "bounced to a login page."
+        )
+
+
+def _is_unresolved_secret_reference(value: str) -> bool:
+    """True if the value is a RunPod secret reference that never got substituted.
+
+    RunPod env values may be written as {{ RUNPOD_SECRET_<name> }}. If no account-level
+    secret of that name exists, RunPod passes the literal braces through instead of
+    failing - so the variable looks set, the handler sends it as a header, and Cloudflare
+    Access rejects a credential that is really a template string. Worth naming explicitly,
+    because "configured but wrong" and "configured correctly" are otherwise identical from
+    inside the container.
+    """
+    text = (value or "").strip()
+    return text.startswith("{{") and text.endswith("}}")
+
+
+def cloudflare_access_headers() -> dict:
+    """Service-token headers for Cloudflare Access, or {} when not usably configured."""
+    if _is_unresolved_secret_reference(CF_ACCESS_CLIENT_ID) or _is_unresolved_secret_reference(
+        CF_ACCESS_CLIENT_SECRET
+    ):
+        return {}
+    if CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET:
+        return {
+            "CF-Access-Client-Id": CF_ACCESS_CLIENT_ID,
+            "CF-Access-Client-Secret": CF_ACCESS_CLIENT_SECRET,
+        }
+    return {}
+
+
+PROGRESS_TIMEOUT = float(os.environ.get("H3_PROGRESS_TIMEOUT", "3"))
+# Floor between *step* events. Phase changes and the final step ignore it.
+PROGRESS_MIN_INTERVAL = float(os.environ.get("H3_PROGRESS_MIN_INTERVAL", "0.4"))
+
+
+class ProgressReporter:
+    """Best-effort progress delivery to the Cloudflare Worker.
+
+    Three properties matter more than completeness here:
+
+      * It never raises. A generation that has already cost minutes of GPU time must not
+        fail because a callback timed out.
+      * It never blocks for long. The timeout is seconds, not the default connect/read.
+      * Its cost is never charged to sampling. The caller records callback time as its own
+        [perf] field, so a slow Worker cannot inflate the sampling measurement.
+
+    The endpoint and token are job-scoped and arrive in the job payload, so nothing
+    permanent is stored in this image.
+    """
+
+    def __init__(self, job_id: str, url: str | None = None, token: str | None = None) -> None:
+        self.job_id = job_id
+        self.url = url
+        self.token = token
+        self.sent = 0
+        self.failed = 0
+        self.seconds = 0.0
+        self._last_step_at = 0.0
+        self._phase: str | None = None
+        self._warned = False
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.url)
+
+    def phase(self, phase: str, **extra) -> None:
+        """Report a phase change. Always delivered - these are the events clients act on."""
+        self._phase = phase
+        self._emit({"phase": phase, **extra})
+
+    def step(self, step: int, steps: int) -> None:
+        """Report sampler progress, coalesced so a fast sampler cannot flood the Worker."""
+        now = time.monotonic()
+        is_last = bool(steps) and step >= steps
+        if not is_last and (now - self._last_step_at) < PROGRESS_MIN_INTERVAL:
+            return
+        self._last_step_at = now
+
+        payload = {"phase": PHASE_SAMPLING, "step": step, "steps": steps}
+        if steps:
+            payload["percent"] = int(round(step / steps * 100))
+        self._emit(payload)
+
+    def _emit(self, payload: dict) -> None:
+        if not self.enabled:
+            return
+
+        body = {"jobId": self.job_id, **payload}
+        headers = {"Content-Type": "application/json", **cloudflare_access_headers()}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+
+        began = time.monotonic()
+        try:
+            # allow_redirects=False: a redirect here is never a real delivery, and
+            # following one silently turns an auth rejection into a counted success.
+            response = requests.post(
+                self.url,
+                json=body,
+                headers=headers,
+                timeout=PROGRESS_TIMEOUT,
+                allow_redirects=False,
+            )
+            if _is_2xx(response):
+                self.sent += 1
+            else:
+                self.failed += 1
+                if not self._warned:
+                    # Once per job: 20+ identical warnings would bury the log.
+                    self._warned = True
+                    log(f"WARNING: progress callback rejected - {_describe_non_2xx(response)}")
+        except Exception as error:
+            # Swallowed on purpose: Cloudflare being unreachable is not a generation error.
+            self.failed += 1
+            log(f"WARNING: progress callback failed ({type(error).__name__}: {error})")
+        finally:
+            self.seconds += time.monotonic() - began
+
+
+class JobTimer:
+    """Wall-clock marks for a single job, emitted as one [perf] line when it finishes.
+
+    Deliberately forgiving: a phase whose boundary never arrived (a dropped websocket, a
+    job that failed before sampling) reports "n/a" rather than raising. Instrumentation
+    must never be the reason a paid generation fails.
+    """
+
+    def __init__(self, workflow: dict | None = None) -> None:
+        self.start = time.monotonic()
+        self.marks: dict[str, float] = {}
+        self.spans: dict[str, float] = {}
+        self._workflow = workflow if isinstance(workflow, dict) else {}
+        self._open_node: tuple[str, float] | None = None
+        self._node_totals: dict[str, float] = {}
+        self.steps_seen = 0
+        self.steps_total: int | None = None
+        self.output_bytes: int | None = None
+        self.progress_callbacks: tuple[int, int] | None = None
+
+    # -- marks -------------------------------------------------------------------------
+
+    def mark(self, name: str) -> None:
+        """Record the first time `name` happened."""
+        self.marks.setdefault(name, time.monotonic())
+
+    def remark(self, name: str) -> None:
+        """Record the most recent time `name` happened."""
+        self.marks[name] = time.monotonic()
+
+    def add_span(self, name: str, seconds: float) -> None:
+        self.spans[name] = self.spans.get(name, 0.0) + seconds
+
+    def between(self, first: str, second: str) -> float | None:
+        a, b = self.marks.get(first), self.marks.get(second)
+        if a is None or b is None or b < a:
+            return None
+        return b - a
+
+    # -- websocket-driven phase detection ----------------------------------------------
+
+    def on_progress(self, value, total) -> None:
+        """A sampler progress frame. The first one is where sampling begins."""
+        self.mark("sampling_start")
+        self.remark("sampling_end")
+        if isinstance(total, int) and total > 0:
+            self.steps_total = total
+        if isinstance(value, int):
+            self.steps_seen = max(self.steps_seen, value)
+            # The first *completed* step carries the model-initialisation cost, which on a
+            # cold worker is most of the stall before steady-state sampling. Break it out
+            # so it is not mistaken for per-step sampler cost.
+            if value >= 1:
+                self.mark("first_step_done")
+
+    def on_node(self, node_id: str) -> None:
+        """An `executing` frame: the named node starts, so the previous one has ended."""
+        now = time.monotonic()
+        self._close_node(now)
+        self._open_node = (self._label(node_id), now)
+
+    def on_execution_end(self) -> None:
+        self._close_node(time.monotonic())
+        self.mark("execution_end")
+
+    def _close_node(self, now: float) -> None:
+        if self._open_node is None:
+            return
+        label, began = self._open_node
+        self._node_totals[label] = self._node_totals.get(label, 0.0) + (now - began)
+        self._open_node = None
+
+    def _label(self, node_id: str) -> str:
+        node = self._workflow.get(str(node_id))
+        if isinstance(node, dict):
+            class_type = node.get("class_type")
+            if class_type:
+                return str(class_type)
+        return f"node{node_id}"
+
+    # -- output ------------------------------------------------------------------------
+
+    def summary(self, *, job_index: int, status: str) -> str:
+        total = time.monotonic() - self.start
+        sampling = self.between("sampling_start", "sampling_end")
+
+        fields = [
+            f"proc={PROCESS_ID}",
+            # First job in this process, so this job paid for the cold start.
+            f"cold_process={'true' if job_index == 1 else 'false'}",
+            f"job_in_proc={job_index}",
+            f"proc_age={_secs(self.start - _PROCESS_START)}",
+            f"comfy_boot={_secs(_comfy_boot_seconds)}",
+            # ~0 means ComfyUI was already up, so its boot was NOT on this job's clock.
+            f"comfy_wait={_secs(self.spans.get('comfy_wait'))}",
+        ]
+        if "stage_image" in self.spans:
+            fields.append(f"stage_image={_secs(self.spans['stage_image'])}")
+        if "input_download" in self.spans:
+            fields.append(f"input_download={_secs(self.spans['input_download'])}")
+        fields += [
+            f"submit={_secs(self.spans.get('submit'))}",
+            # Queued -> first sampler frame: model staging, text encode, graph setup.
+            f"pre_sampling={_secs(self.between('submitted', 'sampling_start'))}",
+            f"first_step={_secs(self.between('sampling_start', 'first_step_done'))}",
+            f"sampling={_secs(sampling)}",
+            f"steps={self.steps_seen}/{self.steps_total if self.steps_total else '?'}",
+            # Last sampler frame -> workflow finished: VAE decode, audio, mux, save.
+            f"decode={_secs(self.between('sampling_end', 'execution_end'))}",
+            f"output={_secs(self.spans.get('output'))}",
+        ]
+        # Upload is broken out from `output` so a slow R2 write is never mistaken for
+        # slow inference, and callback latency is reported separately from both.
+        if "output_upload" in self.spans:
+            fields.append(f"output_upload={_secs(self.spans['output_upload'])}")
+        if self.output_bytes is not None:
+            fields.append(f"output_bytes={self.output_bytes}")
+        if self.progress_callbacks is not None:
+            sent, failed = self.progress_callbacks
+            fields.append(f"progress_callbacks={sent}/{sent + failed}")
+        if "progress_callback_time" in self.spans:
+            fields.append(f"progress_time={_secs(self.spans['progress_callback_time'])}")
+        fields += [
+            f"total={_secs(total)}",
+            f"status={status}",
+        ]
+        if sampling and self.steps_seen > 1:
+            fields.insert(-1, f"per_step={sampling / self.steps_seen:.2f}s")
+        return "[perf] " + " ".join(fields)
+
+    def node_summary(self) -> str | None:
+        if not self._node_totals:
+            return None
+        ranked = sorted(self._node_totals.items(), key=lambda kv: kv[1], reverse=True)
+        shown = ranked[: max(1, PERF_NODES_TOP)]
+        return "[perf] nodes " + " ".join(f"{name}={value:.1f}s" for name, value in shown)
+
+
+def emit_perf(timer: JobTimer, *, job_index: int, status: str) -> None:
+    """Print the timing lines. Never raises - a broken metric must not fail a job."""
+    try:
+        log(timer.summary(job_index=job_index, status=status))
+        if PERF_NODES:
+            nodes = timer.node_summary()
+            if nodes:
+                log(nodes)
+    except Exception as error:  # pragma: no cover - defensive only
+        log(f"WARNING: could not emit perf summary: {error}")
 
 
 # --------------------------------------------------------------------------------------
@@ -124,26 +598,91 @@ def log_torch_environment() -> None:
         log(f"WARNING: GPU probe failed: {error}")
 
 
-def log_attention_backend() -> None:
-    """Report whether SageAttention3 will be used, without changing the outcome."""
-    sage3 = os.environ.get("COMFY_SAGE_ATTENTION3", "0") == "1"
-    log(f"COMFY_SAGE_ATTENTION3 = {os.environ.get('COMFY_SAGE_ATTENTION3', '<unset>')}")
-    if not sage3:
+def _device_capability() -> tuple[int, int] | None:
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return None
+        return torch.cuda.get_device_capability(0)
+    except Exception:
+        return None
+
+
+def build_comfy_env() -> dict:
+    """Return the environment for the ComfyUI subprocess, with attention backend resolved.
+
+    The sageattn3 wheel in the base image is compiled for a single compute capability
+    (SAGE_SUPPORTED_CC, 12.0 / Blackwell). Importing it succeeds on any GPU, so import
+    alone proves nothing - the failure only appears when a kernel is launched, as
+    `cudaErrorNoKernelImageForDevice` on *every* attention call. That floods the log and
+    silently falls back to PyTorch attention for the whole run.
+
+    So if the scheduled GPU is not the capability the wheel was built for, turn
+    SageAttention3 off up front. ComfyUI then picks its own backend cleanly. Set
+    H3_SAGE_AUTODETECT=0 to force whatever COMFY_SAGE_ATTENTION3 says instead.
+    """
+    env = os.environ.copy()
+    requested = env.get("COMFY_SAGE_ATTENTION3", "0") == "1"
+    log(f"COMFY_SAGE_ATTENTION3 = {env.get('COMFY_SAGE_ATTENTION3', '<unset>')}")
+
+    if not requested:
         log("SageAttention3 disabled by env; ComfyUI will pick its default attention backend.")
-        return
+        return env
+
+    try:
+        import sageattn3  # noqa: F401
+    except Exception as error:
+        # ComfyUI's sage3 patch raises at import if the package is missing, which would
+        # stop ComfyUI booting at all. Disable rather than let that happen.
+        log(f"WARNING: sageattn3 is unusable ({error}); disabling SageAttention3.")
+        env["COMFY_SAGE_ATTENTION3"] = "0"
+        return env
+
+    # Version lookup is a separate, best-effort step on purpose. It keys off the
+    # *distribution* name, which need not match the module name, and a wheel installed
+    # without dist-info has no metadata at all - so a lookup failure says nothing about
+    # whether the backend works. Folding it into the import check above would disable
+    # SageAttention3 on a perfectly good Blackwell card over a missing version string.
     try:
         import importlib.metadata
 
-        import sageattn3  # noqa: F401
+        log(f"sageattn3 present, version {importlib.metadata.version('sageattn3')}")
+    except Exception:
+        log("sageattn3 present (version metadata unavailable)")
 
-        log(f"sageattn3 available, version {importlib.metadata.version('sageattn3')}")
-    except Exception as error:
-        # ComfyUI's sage3 patch raises on import if the package is missing, so surface it
-        # here first with a clear remedy rather than as an opaque ComfyUI stack trace.
+    if env.get("H3_SAGE_AUTODETECT", "1") != "1":
+        log("H3_SAGE_AUTODETECT=0; leaving SageAttention3 enabled without a capability check.")
+        return env
+
+    capability = _device_capability()
+    if capability is None:
+        log("WARNING: could not read GPU capability; leaving SageAttention3 as configured.")
+        return env
+
+    supported = env.get("SAGE_SUPPORTED_CC", "12.0")
+    try:
+        supported_major = int(float(supported))
+    except ValueError:
+        supported_major = 12
+
+    if capability[0] != supported_major:
         log(
-            f"ERROR: COMFY_SAGE_ATTENTION3=1 but sageattn3 is unusable ({error}). "
-            "ComfyUI will refuse to start. Set COMFY_SAGE_ATTENTION3=0 to fall back."
+            f"WARNING: SageAttention3 was built for compute capability {supported} but this "
+            f"worker was scheduled a {capability[0]}.{capability[1]} GPU. Disabling it - "
+            "otherwise every attention call fails with "
+            "'no kernel image is available for execution on the device' and falls back to "
+            "PyTorch attention anyway, one error per call."
         )
+        log(
+            "  This is a GPU scheduling problem: pin the RunPod endpoint to an "
+            "RTX PRO 6000 Blackwell to get SageAttention3. Generation still works without it."
+        )
+        env["COMFY_SAGE_ATTENTION3"] = "0"
+    else:
+        log(f"SageAttention3 enabled: GPU capability {capability} matches the wheel ({supported}).")
+
+    return env
 
 
 # --------------------------------------------------------------------------------------
@@ -159,13 +698,30 @@ def _comfy_is_ready() -> bool:
     return response.ok
 
 
+def parse_extra_args(raw: str) -> list[str]:
+    """Split COMFY_EXTRA_ARGS into argv, tolerating quoting and bad input.
+
+    shlex rather than str.split() so a quoted value survives ("--foo 'a b'" used to become
+    three broken tokens). If the string is unbalanced, shlex raises - fall back to a naive
+    split rather than refusing to start ComfyUI at all, since a malformed tuning flag is
+    never worth taking the worker down for.
+    """
+    if not raw or not raw.strip():
+        return []
+    try:
+        return shlex.split(raw)
+    except ValueError as error:
+        log(f"WARNING: COMFY_EXTRA_ARGS is not valid shell syntax ({error}); splitting naively.")
+        return raw.split()
+
+
 def start_comfyui() -> None:
     """Start ComfyUI once and block until it genuinely answers HTTP.
 
     Serialised behind a lock because RunPod may hand us concurrent jobs, and re-entrant
     starts would race two ComfyUI processes onto the same port.
     """
-    global _comfy_process
+    global _comfy_process, _comfy_boot_seconds
 
     with _start_lock:
         if _comfy_process is not None and _comfy_process.poll() is None and _comfy_is_ready():
@@ -174,6 +730,10 @@ def start_comfyui() -> None:
         if _comfy_process is not None and _comfy_process.poll() is not None:
             log(f"ComfyUI exited with code {_comfy_process.returncode}; restarting it.")
             _comfy_process = None
+
+        # Covers the wait even when we join a start already in flight, so comfy_boot
+        # reflects time-to-ready rather than time-since-fork.
+        boot_began = time.monotonic()
 
         if _comfy_process is None:
             for directory in (COMFY_OUTPUT_DIR, COMFY_TEMP_DIR, COMFY_INPUT_DIR):
@@ -200,11 +760,20 @@ def start_comfyui() -> None:
                 "--input-directory",
                 COMFY_INPUT_DIR,
             ]
-            extra_args = os.environ.get("COMFY_EXTRA_ARGS", "").split()
+            extra_args = parse_extra_args(os.environ.get("COMFY_EXTRA_ARGS", ""))
             command.extend(extra_args)
 
+            # Logged in full and on its own line so an A/B run can be attributed to the
+            # exact flags it used - `--highvram` in particular is invisible otherwise.
             log(f"Starting ComfyUI: {' '.join(command)} (cwd={COMFY_DIR})")
-            _comfy_process = subprocess.Popen(command, cwd=COMFY_DIR)
+            log(
+                "ComfyUI effective args: "
+                f"COMFY_EXTRA_ARGS={os.environ.get('COMFY_EXTRA_ARGS', '<unset>')!r} "
+                f"-> extra={extra_args or '[]'}"
+            )
+            # Resolved here, not at import: the GPU is only knowable once the worker is
+            # actually placed on a host.
+            _comfy_process = subprocess.Popen(command, cwd=COMFY_DIR, env=build_comfy_env())
 
         deadline = time.monotonic() + COMFY_STARTUP_TIMEOUT
         while time.monotonic() < deadline:
@@ -216,8 +785,9 @@ def start_comfyui() -> None:
                     "Check the ComfyUI log above for the underlying error."
                 )
             if _comfy_is_ready():
-                waited = COMFY_STARTUP_TIMEOUT - int(deadline - time.monotonic())
-                log(f"ComfyUI is ready after ~{waited}s")
+                elapsed = time.monotonic() - boot_began
+                _comfy_boot_seconds = elapsed
+                log(f"ComfyUI is ready after ~{elapsed:.1f}s")
                 return
             time.sleep(1)
 
@@ -285,7 +855,17 @@ def _raise_if_history_failed(history: dict, prompt_id: str) -> None:
     raise WorkflowError(f"ComfyUI reported a failed execution for prompt {prompt_id}: {status}")
 
 
-def await_execution(prompt_id: str, client_id: str, deadline: float) -> dict:
+# Node classes that mean the graph has moved past sampling into decode/encode work.
+DECODE_CLASS_HINTS = ("VAEDecode", "VAEDecodeAudio", "CreateVideo", "SaveVideo")
+
+
+def await_execution(
+    prompt_id: str,
+    client_id: str,
+    deadline: float,
+    timer: JobTimer | None = None,
+    reporter: "ProgressReporter | None" = None,
+) -> dict:
     """Follow a prompt to completion over the websocket, falling back to /history polling.
 
     A recv timeout is expected and harmless - generation frequently produces no traffic for
@@ -334,8 +914,14 @@ def await_execution(prompt_id: str, client_id: str, deadline: float) -> dict:
 
                         if event_type == "progress" and data.get("prompt_id") == prompt_id:
                             value, total = data.get("value"), data.get("max")
+                            if timer is not None:
+                                # Fed every frame, including value=0, so sampling_start is
+                                # the sampler actually beginning rather than step 1 ending.
+                                timer.on_progress(value, total)
                             if value and total:
                                 log(f"  progress {value}/{total}")
+                                if reporter is not None:
+                                    reporter.step(int(value), int(total))
                         elif event_type == "execution_error" and data.get("prompt_id") == prompt_id:
                             raise WorkflowError(
                                 "ComfyUI execution error in node "
@@ -353,6 +939,24 @@ def await_execution(prompt_id: str, client_id: str, deadline: float) -> dict:
                             and data.get("node") is None
                         ):
                             break  # legacy completion signal
+                        elif (
+                            event_type == "executing"
+                            and data.get("prompt_id") == prompt_id
+                            and timer is not None
+                        ):
+                            # A named node started, so the previous one just finished.
+                            # This is what attributes time to the text encoder, the
+                            # sampler and each VAE decode without touching ComfyUI.
+                            node_id = str(data.get("node"))
+                            timer.on_node(node_id)
+
+                            # Translate the node into a public phase. ComfyUI's own log
+                            # text is never forwarded - only this stable vocabulary.
+                            if reporter is not None:
+                                label = timer._label(node_id)
+                                if any(hint in label for hint in DECODE_CLASS_HINTS):
+                                    if reporter._phase != PHASE_DECODING:
+                                        reporter.phase(PHASE_DECODING, percent=90)
 
             # Poll /history regardless: it is the authoritative record and covers the case
             # where the websocket never connected or missed the terminal event.
@@ -365,6 +969,10 @@ def await_execution(prompt_id: str, client_id: str, deadline: float) -> dict:
             if connection is None:
                 time.sleep(1)
     finally:
+        # Closes the decode phase whichever way we left the loop. On a failure path the
+        # span is meaningless, which is what status= on the [perf] line is there to say.
+        if timer is not None:
+            timer.on_execution_end()
         if connection is not None:
             try:
                 connection.close()
@@ -536,11 +1144,23 @@ def _assert_fetchable_url(url: str) -> None:
             )
 
 
-def _download_image(url: str) -> bytes:
-    """Fetch an image over HTTPS, validating every redirect hop and capping the size."""
+def _download_image(url: str, bearer_token: str | None = None) -> bytes:
+    """Fetch an image over HTTPS, validating every redirect hop and capping the size.
+
+    `bearer_token` is the job-scoped credential for the Worker's internal asset route. It
+    is sent only on the first hop: a redirect can point anywhere, and forwarding the token
+    across it would hand a job credential to whatever host the redirect names.
+    """
     current = url
     for hop in range(MAX_IMAGE_REDIRECTS + 1):
         _assert_fetchable_url(current)
+
+        headers = {"Accept": "image/*"}
+        if bearer_token and hop == 0:
+            # Both credentials are first-hop only. A redirect can point anywhere, and
+            # forwarding either one across it would hand a credential to that host.
+            headers["Authorization"] = f"Bearer {bearer_token}"
+            headers.update(cloudflare_access_headers())
 
         # Redirects are followed manually so each destination is re-validated; letting
         # requests follow them would let a redirect land on an internal address.
@@ -549,7 +1169,7 @@ def _download_image(url: str) -> bytes:
             timeout=IMAGE_DOWNLOAD_TIMEOUT,
             stream=True,
             allow_redirects=False,
-            headers={"Accept": "image/*"},
+            headers=headers,
         )
 
         if response.is_redirect or response.is_permanent_redirect:
@@ -657,8 +1277,14 @@ def _reachable_image_loaders(workflow: dict, start_node: str) -> set[str]:
     return found
 
 
-def find_image_node(workflow: dict, explicit_id: str | None) -> str:
-    """Decide which node receives the staged image, or fail rather than guess."""
+def find_image_node(workflow: dict, explicit_id: str | None, role: str = "first_frame") -> str:
+    """Decide which node receives a staged image, or fail rather than guess.
+
+    `role` is the MiniMaxH3ImageToVideo input the image is destined for - "first_frame" or
+    "last_frame", the two optional Image inputs on that node's schema. With two keyframes
+    in one graph the workflow has two loaders, so "the only image loader" is no longer a
+    usable tiebreak and the role is what disambiguates them.
+    """
     candidates = [
         node_id
         for node_id, node in workflow.items()
@@ -687,63 +1313,64 @@ def find_image_node(workflow: dict, explicit_id: str | None) -> str:
             "for text-to-video."
         )
 
-    # Prefer a loader that actually feeds MiniMaxH3ImageToVideo.first_frame.
+    # Prefer a loader that actually feeds MiniMaxH3ImageToVideo.<role>.
     preferred: set[str] = set()
     for node_id, node in workflow.items():
         if not isinstance(node, dict) or node.get("class_type") != "MiniMaxH3ImageToVideo":
             continue
-        link = (node.get("inputs") or {}).get("first_frame")
+        link = (node.get("inputs") or {}).get(role)
         if isinstance(link, list) and len(link) == 2:
             preferred |= _reachable_image_loaders(workflow, str(link[0]))
 
     if len(preferred) == 1:
         node_id = next(iter(preferred))
-        log(f"Image node auto-detected via MiniMaxH3ImageToVideo.first_frame: #{node_id}")
+        log(f"Image node auto-detected via MiniMaxH3ImageToVideo.{role}: #{node_id}")
         return node_id
 
-    if len(candidates) == 1:
-        log(f"Image node auto-detected as the workflow's only image loader: #{candidates[0]}")
-        return candidates[0]
+    # Falling back to "the only image loader" is only safe when that loader is not
+    # already committed to a different keyframe. Otherwise a last_frame request on a
+    # first-frame graph would silently attach the image to the wrong end of the clip.
+    claimed_by_other_role: set[str] = set()
+    for other_role in KEYFRAME_ROLES:
+        if other_role == role:
+            continue
+        for node in workflow.values():
+            if not isinstance(node, dict) or node.get("class_type") != "MiniMaxH3ImageToVideo":
+                continue
+            link = (node.get("inputs") or {}).get(other_role)
+            if isinstance(link, list) and len(link) == 2:
+                claimed_by_other_role |= _reachable_image_loaders(workflow, str(link[0]))
+
+    unclaimed = [node_id for node_id in candidates if node_id not in claimed_by_other_role]
+
+    if len(unclaimed) == 1 and not preferred:
+        log(f"Image node auto-detected as the workflow's only image loader: #{unclaimed[0]}")
+        return unclaimed[0]
+
+    if not unclaimed and candidates:
+        raise ImageInputError(
+            f"No image loader is available for {role!r}: the workflow's "
+            f"{len(candidates)} loader(s) already feed another keyframe input. Add a "
+            f"loader wired to MiniMaxH3ImageToVideo.{role}."
+        )
 
     raise ImageInputError(
-        f"Could not unambiguously choose an image node: found {len(candidates)} image "
-        f"loaders ({', '.join(sorted(candidates))})"
-        + (f" and {len(preferred)} feeding first_frame" if preferred else "")
-        + ". Pass image_node_id to say which one should receive the image."
+        f"Could not unambiguously choose an image node for {role!r}: found "
+        f"{len(candidates)} image loaders ({', '.join(sorted(candidates))})"
+        + (f" and {len(preferred)} feeding {role}" if preferred else "")
+        + ". Wire the workflow so exactly one loader feeds "
+        f"MiniMaxH3ImageToVideo.{role}, or pass image_node_id (legacy) / "
+        f"assets.{role}.node_id to say which one should receive the image."
     )
 
 
-def stage_input_image(job_input: dict, workflow: dict) -> str | None:
-    """Validate, store and wire up an optional input image.
+# The keyframe roles the FL2VA node exposes, in the order they are staged. Both are
+# optional Image inputs on MiniMaxH3ImageToVideo's schema.
+KEYFRAME_ROLES = ("first_frame", "last_frame")
 
-    Returns the absolute path of the staged file (for cleanup), or None for the
-    text-to-video path where no image was supplied.
-    """
-    image_url = job_input.get("image_url")
-    image_base64 = job_input.get("image_base64")
 
-    if image_url and image_base64:
-        raise ImageInputError(
-            "Provide either image_url or image_base64, not both."
-        )
-    if not image_url and not image_base64:
-        return None  # text-to-video: unchanged behaviour
-
-    if image_url:
-        if not isinstance(image_url, str):
-            raise ImageInputError("image_url must be a string.")
-        log("Fetching input image from image_url")
-        data = _download_image(image_url)
-    else:
-        log("Decoding input image from image_base64")
-        data = _decode_base64_image(image_base64)
-
-    extension = _validate_image_bytes(data)
-
-    # Resolve the target node before writing anything, so a workflow we cannot wire up
-    # never leaves a file behind.
-    node_id = find_image_node(workflow, job_input.get("image_node_id"))
-
+def _write_staged_image(data: bytes, extension: str) -> str:
+    """Write image bytes into the ComfyUI input directory under a generated name."""
     # Generated filename only: the remote/user-supplied name is never used, which rules
     # out path traversal and collisions between concurrent jobs.
     filename = f"h3-input-{uuid.uuid4().hex}{extension}"
@@ -758,10 +1385,129 @@ def stage_input_image(job_input: dict, workflow: dict) -> str | None:
     with open(path, "wb") as handle:
         handle.write(data)
     os.chmod(path, 0o644)  # data, never executable
-
-    workflow[node_id]["inputs"][IMAGE_LOADER_FIELD] = filename
-    log(f"Staged input image as {filename} and wired it into node #{node_id}")
     return path
+
+
+def _fetch_asset_bytes(spec: dict, role: str) -> bytes:
+    """Read one asset's bytes from whichever source it declares.
+
+    `url` covers both a plain https image and the Worker's job-scoped asset route - the
+    latter simply carries a bearer token, so no Cloudflare credentials ever live in this
+    image. Exactly one source may be given.
+    """
+    url = spec.get("url")
+    data_b64 = spec.get("base64")
+
+    if url and data_b64:
+        raise ImageInputError(f"{role}: provide either url or base64, not both.")
+
+    if url:
+        if not isinstance(url, str):
+            raise ImageInputError(f"{role}: url must be a string.")
+        token = spec.get("token")
+        if token is not None and not isinstance(token, str):
+            raise ImageInputError(f"{role}: token must be a string.")
+        log(f"Fetching {role} from url")
+        return _download_image(url, bearer_token=token)
+
+    if data_b64:
+        log(f"Decoding {role} from base64")
+        return _decode_base64_image(data_b64)
+
+    raise ImageInputError(f"{role}: no url or base64 supplied.")
+
+
+def _collect_asset_specs(job_input: dict) -> dict:
+    """Normalise the legacy single-image fields and the new `assets` map into one dict.
+
+    Legacy `image_url` / `image_base64` / `image_node_id` keep working untouched and are
+    treated as a first_frame asset, which is what they always effectively were.
+    """
+    specs: dict[str, dict] = {}
+
+    assets = job_input.get("assets")
+    if assets is not None:
+        if not isinstance(assets, dict):
+            raise ImageInputError("assets must be an object keyed by role.")
+        for role, spec in assets.items():
+            if role not in KEYFRAME_ROLES:
+                raise ImageInputError(
+                    f"Unknown asset role {role!r}. Supported: {', '.join(KEYFRAME_ROLES)}."
+                )
+            if not isinstance(spec, dict):
+                raise ImageInputError(f"assets.{role} must be an object.")
+            specs[role] = spec
+
+    legacy_url = job_input.get("image_url")
+    legacy_b64 = job_input.get("image_base64")
+    if legacy_url or legacy_b64:
+        if "first_frame" in specs:
+            raise ImageInputError(
+                "Provide either the legacy image_url/image_base64 fields or "
+                "assets.first_frame, not both."
+            )
+        if legacy_url and legacy_b64:
+            raise ImageInputError("Provide either image_url or image_base64, not both.")
+        specs["first_frame"] = {
+            "url": legacy_url,
+            "base64": legacy_b64,
+            "node_id": job_input.get("image_node_id"),
+        }
+
+    return specs
+
+
+def stage_input_assets(job_input: dict, workflow: dict) -> list[str]:
+    """Validate, store and wire up every supplied keyframe.
+
+    Returns the absolute paths of the staged files, for cleanup. An empty list is the
+    text-to-video path, whose behaviour is unchanged.
+
+    Everything is resolved and validated before anything is written, so a request we
+    cannot wire up leaves no files behind.
+    """
+    specs = _collect_asset_specs(job_input)
+    if not specs:
+        return []  # text-to-video: unchanged behaviour
+
+    # Resolve every target node first - a half-staged graph is worse than a rejected one.
+    resolved: list[tuple[str, dict, str]] = []
+    for role in KEYFRAME_ROLES:
+        spec = specs.get(role)
+        if spec is None:
+            continue
+        node_id = find_image_node(workflow, spec.get("node_id"), role=role)
+        resolved.append((role, spec, node_id))
+
+    if len({node_id for _, _, node_id in resolved}) != len(resolved):
+        raise ImageInputError(
+            "Two keyframes resolved to the same image loader node. Wire the workflow so "
+            "first_frame and last_frame each have their own loader."
+        )
+
+    staged: list[str] = []
+    try:
+        for role, spec, node_id in resolved:
+            data = _fetch_asset_bytes(spec, role)
+            extension = _validate_image_bytes(data)
+            path = _write_staged_image(data, extension)
+            staged.append(path)
+            filename = os.path.basename(path)
+            workflow[node_id]["inputs"][IMAGE_LOADER_FIELD] = filename
+            log(f"Staged {role} as {filename} and wired it into node #{node_id}")
+    except Exception:
+        # Never leak files from a partially staged multi-image request.
+        for path in staged:
+            cleanup_input_image(path)
+        raise
+
+    return staged
+
+
+def stage_input_image(job_input: dict, workflow: dict) -> str | None:
+    """Backwards-compatible single-image wrapper around stage_input_assets()."""
+    staged = stage_input_assets(job_input, workflow)
+    return staged[0] if staged else None
 
 
 def cleanup_input_image(path: str | None) -> None:
@@ -820,6 +1566,94 @@ class Base64Store(OutputStore):
             "type": entry.get("type", "output"),
             "data": data,
         }
+
+
+class WorkerUploadStore(OutputStore):
+    """PUT the raw MP4 to the Cloudflare Worker, which streams it straight into R2.
+
+    The bytes go up as a normal binary body - never base64 - so nothing inflates the
+    payload by a third just to move it. Authentication is a job-scoped bearer token that
+    arrived with this job, which is why no Cloudflare credential is baked into the image.
+
+    Returns metadata only. The video itself is served later from R2 by the Worker.
+    """
+
+    def __init__(self, url: str, token: str | None, timeout: float) -> None:
+        self.url = url
+        self.token = token
+        self.timeout = timeout
+        self.uploaded_bytes = 0
+        self.upload_seconds = 0.0
+
+    def store(self, path: str, entry: dict) -> dict:
+        size = os.path.getsize(path)
+        headers = {
+            "Content-Type": "video/mp4",
+            "Content-Length": str(size),
+            **cloudflare_access_headers(),
+        }
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+
+        began = time.monotonic()
+        try:
+            # A file object streams; requests will not read it all into memory first.
+            with open(path, "rb") as handle:
+                # allow_redirects=False: on a 302 requests would re-issue as a GET without
+                # the body, so the video would silently never be sent.
+                response = requests.put(
+                    self.url,
+                    data=handle,
+                    headers=headers,
+                    timeout=self.timeout,
+                    allow_redirects=False,
+                )
+        except Exception as error:
+            raise WorkflowError(
+                f"Uploading {entry['filename']} to the output endpoint failed: {error}"
+            ) from error
+        finally:
+            self.upload_seconds += time.monotonic() - began
+
+        if not _is_2xx(response):
+            # Deliberately fatal. Reporting success here would hand the client a job that
+            # says COMPLETED with no playable video behind it.
+            raise WorkflowError(
+                f"Output upload failed for {entry['filename']} - {_describe_non_2xx(response)}"
+            )
+
+        # The Worker owns key naming; echo back whatever it reports rather than inventing
+        # a key here, so RunPod can never dictate where an object lands.
+        try:
+            body = response.json()
+        except ValueError:
+            body = None
+
+        # Require our own acknowledgement, not merely a 2xx. Anything sitting in front of
+        # the Worker - an auth gateway, a proxy, an error page - can answer 200 with HTML
+        # while storing nothing, and a job that claims a video it does not have is the
+        # single worst outcome this path can produce.
+        if not isinstance(body, dict) or not body.get("key"):
+            raise WorkflowError(
+                f"Output upload for {entry['filename']} returned HTTP "
+                f"{response.status_code} but not the Worker's JSON acknowledgement "
+                f"(expected a 'key'). Got: {response.text[:200]!r}. The upload did not "
+                "reach R2."
+            )
+
+        self.uploaded_bytes += size
+
+        result = {
+            "filename": entry["filename"],
+            "subfolder": entry.get("subfolder", ""),
+            "type": entry.get("type", "output"),
+            "size": size,
+        }
+        for field in ("key", "url", "contentType"):
+            if body.get(field):
+                result[field] = body[field]
+
+        return result
 
 
 class EncryptedR2Store(OutputStore):
@@ -1021,8 +1855,10 @@ def get_output_store() -> OutputStore:
     return _output_store
 
 
-def collect_outputs(history: dict) -> list[dict]:
-    store = get_output_store()
+def collect_outputs(history: dict, store: OutputStore | None = None) -> list[dict]:
+    # `store` is injected per job so an R2-backed request can upload through the Worker
+    # while everything else keeps using the process-wide configured store.
+    store = store if store is not None else get_output_store()
     results: list[dict] = []
     scratch = tempfile.mkdtemp(prefix="h3-out-")
     keep_outputs = os.environ.get("H3_KEEP_OUTPUTS", "0") == "1"
@@ -1063,36 +1899,109 @@ def _discard_output_file(path: str) -> None:
 # --------------------------------------------------------------------------------------
 
 
+def _spec(job_input: dict, key: str) -> dict:
+    """Read a job-scoped {url, token} block out of the job payload."""
+    value = job_input.get(key)
+    return value if isinstance(value, dict) else {}
+
+
+def build_output_store_for_job(job_input: dict) -> tuple[OutputStore, WorkerUploadStore | None]:
+    """Pick where this job's artefacts go.
+
+    A job carrying an `output` block is uploaded straight to the Worker, which streams it
+    into R2. Anything else falls back to the configured store, so existing callers that
+    know nothing about R2 keep getting base64 exactly as before.
+    """
+    output = _spec(job_input, "output")
+    url = output.get("url")
+    if url:
+        store = WorkerUploadStore(
+            url=str(url),
+            token=output.get("token"),
+            timeout=float(output.get("timeout") or OUTPUT_UPLOAD_TIMEOUT),
+        )
+        return store, store
+    return get_output_store(), None
+
+
 def handler(job: dict) -> dict:
     job_id = job.get("id", "<unknown>")
-    staged_image: str | None = None
+    staged_assets: list[str] = []
+
+    global _jobs_served
+    with _jobs_lock:
+        _jobs_served += 1
+        job_index = _jobs_served
+
+    job_input = job.get("input") or {}
+    workflow = job_input.get("workflow")
+    timer = JobTimer(workflow if isinstance(workflow, dict) else None)
+    status = "error"
+
+    # Job-scoped progress endpoint. Absent means "no realtime channel", and everything
+    # below then behaves exactly as it did before callbacks existed.
+    progress = _spec(job_input, "progress")
+    reporter = ProgressReporter(
+        job_id=str(progress.get("jobId") or job_id),
+        url=progress.get("url"),
+        token=progress.get("token"),
+    )
 
     try:
-        job_input = job.get("input") or {}
-        workflow = job_input.get("workflow")
-
         if not isinstance(workflow, dict) or not workflow:
+            status = "bad_request"
             return {"error": "input.workflow is required and must be a ComfyUI API-format object."}
 
-        # Optional first-frame image-to-video. With no image supplied this is a no-op and
-        # the text-to-video path runs exactly as before. Done before starting ComfyUI so a
-        # bad image is rejected immediately instead of after a cold-start wait.
-        staged_image = stage_input_image(job_input, workflow)
+        reporter.phase(PHASE_STARTING)
 
+        # Optional keyframes. With none supplied this is a no-op and the text-to-video
+        # path runs exactly as before. Done before starting ComfyUI so a bad image is
+        # rejected immediately instead of after a cold-start wait.
+        began = time.monotonic()
+        staged_assets = stage_input_assets(job_input, workflow)
+        if staged_assets:
+            timer.add_span("input_download", time.monotonic() - began)
+
+        # Near-zero on a warm process; on a cold one this is the ComfyUI boot itself.
+        began = time.monotonic()
         start_comfyui()
+        timer.add_span("comfy_wait", time.monotonic() - began)
+        reporter.phase(PHASE_COMFY_READY)
 
         client_id = str(uuid.uuid4())
         deadline = time.monotonic() + JOB_TIMEOUT
 
-        mode = "image-to-video" if staged_image else "text-to-video"
+        mode = f"{len(staged_assets)}-keyframe" if staged_assets else "text-to-video"
         log(f"Job {job_id}: queueing {mode} workflow with {len(workflow)} nodes")
+        began = time.monotonic()
         prompt_id = queue_prompt(workflow, client_id)
+        timer.add_span("submit", time.monotonic() - began)
+        timer.mark("submitted")
         log(f"Job {job_id}: prompt_id={prompt_id}")
 
-        history = await_execution(prompt_id, client_id, deadline)
-        images = collect_outputs(history)
+        # Everything between here and the first sampler frame is model staging.
+        reporter.phase(PHASE_LOADING)
+
+        history = await_execution(prompt_id, client_id, deadline, timer, reporter)
+
+        store, upload_store = build_output_store_for_job(job_input)
+        if upload_store is not None:
+            reporter.phase(PHASE_UPLOADING, percent=95)
+
+        began = time.monotonic()
+        images = collect_outputs(history, store=store)
+        timer.add_span("output", time.monotonic() - began)
+
+        if upload_store is not None:
+            # Reported separately so a slow R2 write is never read as slow inference.
+            timer.add_span("output_upload", upload_store.upload_seconds)
+            timer.output_bytes = upload_store.uploaded_bytes
 
         if not images:
+            status = "no_output"
+            reporter.phase(
+                PHASE_FAILED, error={"code": "no_output", "message": "workflow saved nothing"}
+            )
             return {
                 "error": (
                     "The workflow completed but produced no saved output. Ensure it ends in "
@@ -1102,18 +2011,224 @@ def handler(job: dict) -> dict:
             }
 
         log(f"Job {job_id}: returning {len(images)} artefact(s)")
-        return {"images": images, "prompt_id": prompt_id}
+        status = "ok"
+
+        result = {"images": images, "prompt_id": prompt_id}
+
+        # Only now is the job genuinely done: the upload has already succeeded, because
+        # WorkerUploadStore raises rather than returning on a failed PUT.
+        if upload_store is not None:
+            video = dict(images[0])
+            video.pop("data", None)  # metadata only; the bytes are in R2
+            result["video"] = video
+            reporter.phase(PHASE_COMPLETED, percent=100, video=video)
+        else:
+            reporter.phase(PHASE_COMPLETED, percent=100)
+
+        return result
 
     except WorkflowError as error:
         # Covers ImageInputError too: a caller-facing validation failure, not a crash.
         log(f"Job {job_id}: workflow error: {error}")
+        status = "workflow_error"
+        reporter.phase(PHASE_FAILED, error={"code": "workflow_error", "message": str(error)})
         return {"error": str(error)}
     except Exception as error:
         log(f"Job {job_id}: unhandled error: {type(error).__name__}: {error}")
+        status = "exception"
+        reporter.phase(
+            PHASE_FAILED,
+            error={"code": type(error).__name__, "message": str(error)},
+        )
         return {"error": f"{type(error).__name__}: {error}"}
     finally:
-        # Always runs, so a failed or rejected job cannot orphan an input image.
-        cleanup_input_image(staged_image)
+        # Always runs, so a failed or rejected job cannot orphan staged input images.
+        for path in staged_assets:
+            cleanup_input_image(path)
+        timer.progress_callbacks = (reporter.sent, reporter.failed)
+        if reporter.seconds:
+            timer.add_span("progress_callback_time", reporter.seconds)
+        # Emitted for failures too: a slow job that times out is exactly the one whose
+        # phase breakdown you want.
+        emit_perf(timer, job_index=job_index, status=status)
+
+
+# --------------------------------------------------------------------------------------
+# FlashBoot preload
+# --------------------------------------------------------------------------------------
+#
+# Why this graph, and why it is not loader-only.
+#
+# Everything below was read out of ComfyUI at the pinned commit (dec5d945) rather than
+# assumed, because three of its behaviours decide whether a preload can work at all:
+#
+#   1. A prompt with no OUTPUT_NODE is rejected outright - execution.validate_prompt()
+#      returns "Prompt has no outputs". A graph of four loaders and nothing else would
+#      never run. PreviewAny (comfy_extras/nodes_preview_any.py) is OUTPUT_NODE=True,
+#      takes IO.ANY and only stringifies its input, so it forces upstream execution
+#      without a decode, an encode or a file write.
+#
+#   2. Executing a loader does NOT put weights on the GPU. UNETLoader/CLIPLoader/VAELoader
+#      just build a ModelPatcher; the expensive staging happens later, inside
+#      model_management.load_models_gpu(), when a node actually uses the model. The
+#      production logs show exactly this - the loaders finish in ~0.6s, then
+#      MiniMaxH3ImageToVideo spends ~7s staging the text encoder and SamplerCustomAdvanced
+#      ~9s staging the DiT. Those two calls are the 16s of pre_sampling we are targeting,
+#      so the preload has to reach them: text encode plus one sampler step.
+#
+#   3. The saving is real only because ComfyUI reuses the objects. Its output cache is
+#      keyed on class_type + inputs with node id deliberately excluded
+#      (CacheKeySetInputSignature.include_node_id_in_input() -> False), so the real job's
+#      loaders - identical inputs - hit the cache and get back the *same* ModelPatcher
+#      instances. load_models_gpu() then finds them already in current_loaded_models
+#      (LoadedModel.__eq__ is `self.model is other.model`, i.e. identity) and skips
+#      staging entirely. Models survive the preload prompt because unload_all_models() is
+#      only called on OOM or under --disable-smart-memory, neither of which applies here.
+#
+# What is deliberately NOT preloaded: VRAM staging for the two VAEs. There is no way to
+# stage a VAE without running a decode, and decode is the expensive thing. Their loaders
+# do execute (cheap file open + ModelPatcher), so those cache entries are warm, but the
+# decode phase is untouched by this.
+
+
+def build_preload_workflow() -> dict:
+    """The cheapest graph that stages the text encoder and the DiT onto the GPU.
+
+    Loader nodes mirror the real workflow's inputs exactly - that is the whole mechanism.
+    Everything downstream is shrunk to the schema minimum (32x32, 5 frames, 1 step) and
+    terminates in PreviewAny so nothing is decoded, encoded or written to disk.
+    """
+    return {
+        # --- loaders: inputs identical to examples/fl2va-text-to-video.json ---
+        "1": {
+            "class_type": "UNETLoader",
+            "inputs": {"unet_name": PRELOAD_UNET, "weight_dtype": "default"},
+        },
+        "2": {
+            "class_type": "CLIPLoader",
+            "inputs": {"clip_name": PRELOAD_CLIP, "type": "minimax"},
+        },
+        "3": {"class_type": "VAELoader", "inputs": {"vae_name": PRELOAD_VIDEO_VAE}},
+        "4": {"class_type": "VAELoader", "inputs": {"vae_name": PRELOAD_AUDIO_VAE}},
+        # --- text encode: stages MiniMaxH3TEModel_. No first_frame/last_frame, so the
+        #     node never calls vae.encode() and the video VAE stays off the GPU. ---
+        "5": {
+            "class_type": "MiniMaxH3ImageToVideo",
+            "inputs": {
+                "clip": ["2", 0],
+                "vae": ["3", 0],
+                "prompt": PRELOAD_PROMPT,
+                "width": PRELOAD_WIDTH,
+                "height": PRELOAD_HEIGHT,
+                "length": PRELOAD_LENGTH,
+            },
+        },
+        # --- one sampler step: stages MiniMaxH3 (the DiT) ---
+        "6": {"class_type": "RandomNoise", "inputs": {"noise_seed": 0}},
+        "7": {"class_type": "BasicGuider", "inputs": {"model": ["1", 0], "conditioning": ["5", 0]}},
+        "8": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "res_multistep"}},
+        "9": {
+            "class_type": "BasicScheduler",
+            "inputs": {"model": ["1", 0], "scheduler": "simple", "steps": 1, "denoise": 1.0},
+        },
+        "10": {
+            "class_type": "SamplerCustomAdvanced",
+            "inputs": {
+                "noise": ["6", 0],
+                "guider": ["7", 0],
+                "sampler": ["8", 0],
+                "sigmas": ["9", 0],
+                "latent_image": ["5", 1],
+            },
+        },
+        # --- terminators: OUTPUT_NODEs that only stringify, so the graph is allowed to
+        #     run. Node 12 exists purely to make the audio VAE loader execute. ---
+        "11": {"class_type": "PreviewAny", "inputs": {"source": ["10", 0]}},
+        "12": {"class_type": "PreviewAny", "inputs": {"source": ["4", 0]}},
+    }
+
+
+def _interrupt_comfy() -> None:
+    """Ask ComfyUI to abandon the running prompt.
+
+    Used when the preload overruns its timeout: without this the synthetic prompt keeps
+    running and the first real job queues behind it, which would be strictly worse than
+    not preloading at all.
+    """
+    try:
+        requests.post(f"{COMFY_URL}/interrupt", timeout=10)
+        log("Preload: sent /interrupt to ComfyUI.")
+    except Exception as error:
+        log(f"WARNING: could not interrupt ComfyUI after preload timeout: {error}")
+
+
+# Which node class stands in for which component, for the preload timing line.
+_PRELOAD_COMPONENTS = (
+    ("te", "MiniMaxH3ImageToVideo"),
+    ("dit", "SamplerCustomAdvanced"),
+    ("video_vae", "VAELoader"),
+    ("unet_loader", "UNETLoader"),
+    ("clip_loader", "CLIPLoader"),
+)
+
+
+def run_flashboot_preload() -> float | None:
+    """Stage the H3 models before runpod.serverless.start(), so FlashBoot can snapshot them.
+
+    Returns the elapsed seconds, or None if the preload did not complete. Never raises: a
+    preload is an optimisation, so a failure, a timeout or a model that is not where we
+    expect it must still leave the worker able to come up and serve requests normally.
+    """
+    began = time.monotonic()
+    workflow = build_preload_workflow()
+    timer = JobTimer(workflow)
+
+    try:
+        client_id = str(uuid.uuid4())
+        deadline = time.monotonic() + PRELOAD_TIMEOUT
+        log(
+            f"Preload: queueing synthetic {PRELOAD_WIDTH}x{PRELOAD_HEIGHT} "
+            f"length={PRELOAD_LENGTH} 1-step graph ({len(workflow)} nodes), "
+            f"timeout={PRELOAD_TIMEOUT}s"
+        )
+        prompt_id = queue_prompt(workflow, client_id)
+        timer.mark("submitted")
+        await_execution(prompt_id, client_id, deadline, timer)
+
+        elapsed = time.monotonic() - began
+        loaded = [
+            name for name, node_class in _PRELOAD_COMPONENTS
+            if node_class in timer._node_totals
+        ]
+        parts = " ".join(
+            f"preload_{name}={_secs(timer._node_totals[node_class])}"
+            for name, node_class in _PRELOAD_COMPONENTS
+            if node_class in timer._node_totals
+        )
+        log(
+            f"[perf] preload proc={PROCESS_ID} status=ok total={_secs(elapsed)} "
+            f"loaded={','.join(loaded) if loaded else 'none'} {parts}".rstrip()
+        )
+        return elapsed
+
+    except WorkflowError as error:
+        elapsed = time.monotonic() - began
+        timed_out = time.monotonic() >= began + PRELOAD_TIMEOUT
+        if timed_out:
+            _interrupt_comfy()
+        log(
+            f"[perf] preload proc={PROCESS_ID} "
+            f"status={'timeout' if timed_out else 'failed'} "
+            f"total={_secs(elapsed)} error={error}"
+        )
+        return None
+    except Exception as error:
+        elapsed = time.monotonic() - began
+        log(
+            f"[perf] preload proc={PROCESS_ID} status=failed total={_secs(elapsed)} "
+            f"error={type(error).__name__}: {error}"
+        )
+        return None
 
 
 def _shutdown(signum, _frame) -> None:
@@ -1129,9 +2244,10 @@ def _shutdown(signum, _frame) -> None:
 
 def main() -> None:
     log("=== MiniMax H3 Blackwell serverless worker starting ===")
+    log(f"process_id={PROCESS_ID}")
+    log_callback_configuration()
     log(f"COMFY_DIR = {COMFY_DIR}")
     log_torch_environment()
-    log_attention_backend()
 
     # Fail fast on misconfigured output storage rather than at the end of a paid 5-minute
     # generation. Validates R2 credentials and the key-wrapping key at boot.
@@ -1146,6 +2262,27 @@ def main() -> None:
             start_comfyui()
         except Exception as error:
             log(f"WARNING: eager ComfyUI start failed ({error}); will retry on first job.")
+
+    # The preload runs after ComfyUI is ready and before the serverless loop starts, so
+    # the models are resident in the process FlashBoot snapshots. Opt-in: a miss costs a
+    # synthetic step on every cold start, which is only worth paying once the [perf] data
+    # shows workers actually being reused.
+    preload_total = None
+    if PRELOAD_ENABLED:
+        log("FlashBoot preload enabled")
+        preload_total = run_flashboot_preload()
+    else:
+        log("FlashBoot preload disabled")
+
+    startup_fields = [
+        f"proc={PROCESS_ID}",
+        f"to_serverless_ready={_secs(time.monotonic() - _PROCESS_START)}",
+        f"comfy_boot={_secs(_comfy_boot_seconds)}",
+        f"preload_enabled={'true' if PRELOAD_ENABLED else 'false'}",
+    ]
+    if PRELOAD_ENABLED:
+        startup_fields.append(f"preload_total={_secs(preload_total)}")
+    log("[perf] startup " + " ".join(startup_fields))
 
     runpod.serverless.start({"handler": handler})
 
