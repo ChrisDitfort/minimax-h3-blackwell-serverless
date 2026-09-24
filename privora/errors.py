@@ -29,6 +29,8 @@ MISSING_FRAME = "MISSING_FRAME"
 
 # -- references -------------------------------------------------------------------------
 INVALID_REFERENCE_COUNT = "INVALID_REFERENCE_COUNT"
+#: A caller-supplied user LoRA descriptor failed validation or could not be fetched.
+INVALID_LORA = "INVALID_LORA"
 INVALID_REFERENCE_TYPE = "INVALID_REFERENCE_TYPE"
 INVALID_REFERENCE_ROLE = "INVALID_REFERENCE_ROLE"
 INVALID_REFERENCE_DURATION = "INVALID_REFERENCE_DURATION"

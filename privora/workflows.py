@@ -128,6 +128,27 @@ def _model_source(graph: dict, acceleration: models.Acceleration) -> list:
     return [LORA, 0]
 
 
+def _chain_user_loras(graph: dict, model_link: list, user_loras) -> list:
+    """Chain URL-sourced user LoRAs onto the model source, in request order.
+
+    The handler stages each downloaded LoRA under a per-job directory inside the
+    lora folder and passes back its relative name here; names never escape this
+    graph, and the staging directory dies with the job.
+    """
+    for index, (lora_name, strength) in enumerate(user_loras or ()):
+        node_id = f"user_lora_{index}"
+        graph[node_id] = {
+            "class_type": "LoraLoaderModelOnly",
+            "inputs": {
+                "model": model_link,
+                "lora_name": lora_name,
+                "strength_model": float(strength),
+            },
+        }
+        model_link = [node_id, 0]
+    return model_link
+
+
 def _tail(graph: dict, model_link: list, request: GenerationRequest,
           sampling_steps: int) -> None:
     """Sampler through save. Identical for both families, which is the point."""
@@ -202,7 +223,8 @@ def _stage_image(graph: dict, staging: list, node_id: str, reference) -> list:
     return [node_id, 0]
 
 
-def build_fl2va(request: GenerationRequest, acceleration: models.Acceleration) -> WorkflowPlan:
+def build_fl2va(request: GenerationRequest, acceleration: models.Acceleration,
+                user_loras: tuple = ()) -> WorkflowPlan:
     """create and animate. One node covers all four keyframe combinations."""
     graph: dict = {}
     staging: list[dict] = []
@@ -223,11 +245,13 @@ def build_fl2va(request: GenerationRequest, acceleration: models.Acceleration) -
 
     graph[CONDITIONING] = {"class_type": "MiniMaxH3ImageToVideo", "inputs": inputs}
     sampling_steps = request.canvas.steps if request.legacy else acceleration.steps
-    _tail(graph, _model_source(graph, acceleration), request, sampling_steps)
+    _tail(graph, _chain_user_loras(graph, _model_source(graph, acceleration), user_loras),
+          request, sampling_steps)
     return WorkflowPlan(graph, staging, acceleration, sampling_steps=sampling_steps)
 
 
-def build_ref2va(request: GenerationRequest, acceleration: models.Acceleration) -> WorkflowPlan:
+def build_ref2va(request: GenerationRequest, acceleration: models.Acceleration,
+                 user_loras: tuple = ()) -> WorkflowPlan:
     """references and remix.
 
     Reference inputs use the node's API-format Autogrow paths:
@@ -292,7 +316,8 @@ def build_ref2va(request: GenerationRequest, acceleration: models.Acceleration) 
 
     graph[CONDITIONING] = {"class_type": "MiniMaxH3ReferenceToVideo", "inputs": inputs}
     sampling_steps = request.canvas.steps if request.legacy else acceleration.steps
-    _tail(graph, _model_source(graph, acceleration), request, sampling_steps)
+    _tail(graph, _chain_user_loras(graph, _model_source(graph, acceleration), user_loras),
+          request, sampling_steps)
     return WorkflowPlan(graph, staging, acceleration, sampling_steps=sampling_steps)
 
 
@@ -300,7 +325,8 @@ BUILDERS = {CREATE: build_fl2va, ANIMATE: build_fl2va}
 
 
 def build(request: GenerationRequest, inventory: models.ModelInventory,
-          generation_mode: str = models.DEFAULT_GENERATION_MODE) -> WorkflowPlan:
+          generation_mode: str = models.DEFAULT_GENERATION_MODE,
+          user_loras: tuple = ()) -> WorkflowPlan:
     """Route a validated request to its family's builder, with the mode resolved.
 
     `inventory.resolve` raises before anything is built when the requested combination is
@@ -309,4 +335,4 @@ def build(request: GenerationRequest, inventory: models.ModelInventory,
     """
     acceleration = inventory.resolve(request.family, generation_mode)
     builder = BUILDERS.get(request.mode, build_ref2va)
-    return builder(request, acceleration)
+    return builder(request, acceleration, user_loras=user_loras)

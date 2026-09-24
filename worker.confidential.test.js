@@ -619,15 +619,15 @@ test("the public key itself is the only key material in the payload", async () =
   }
 });
 
-test("the generation log names the prompt's length and digest, not the prompt", async () => {
+test("the generation log omits the prompt and prompt-derived telemetry", async () => {
   const runpod = stubRunPod();
   try {
     const { output } = await captureConsole(() =>
       worker.fetch(post("/generate", CONFIDENTIAL), makeEnv())
     );
     assert.ok(!output.includes("cinematic ocean"), "the prompt must not be logged");
-    assert.match(output, /prompt_chars=23/);
-    assert.match(output, /prompt_sha256=[0-9a-f]{16}/);
+    assert.doesNotMatch(output, /prompt_chars=/);
+    assert.doesNotMatch(output, /prompt_sha256=/);
     assert.ok(!output.includes(PUBLIC_KEY), "563 characters of public key belong nowhere near a log");
   } finally {
     runpod.restore();
@@ -1589,9 +1589,9 @@ test("preflight allows the verbs the artefact routes actually use", async () => 
   assert.match(response.headers.get("Access-Control-Allow-Methods"), /DELETE/);
 });
 
-test("capabilities advertises the privacy modes and their availability", async () => {
+test("legacy capabilities preserve the Cloudflare privacy-mode contract", async () => {
   const response = await worker.fetch(
-    new Request("https://worker.example/capabilities"),
+    new Request("https://worker.example/capabilities/legacy"),
     makeEnv()
   );
   const body = await response.json();

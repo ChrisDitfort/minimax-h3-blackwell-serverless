@@ -194,8 +194,8 @@ test("POST /generate rejects a bad request without reaching RunPod", async () =>
   }
 });
 
-test("GET /health and /capabilities respond through the real handler", async () => {
-  for (const path of ["/health", "/capabilities"]) {
+test("GET /health and /capabilities/legacy respond through the real handler", async () => {
+  for (const path of ["/health", "/capabilities/legacy"]) {
     const response = await worker.fetch(new Request(`https://worker.example${path}`), makeEnv());
     assert.equal(response.status, 200, path);
     await response.json();

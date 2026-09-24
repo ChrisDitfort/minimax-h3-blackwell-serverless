@@ -1655,7 +1655,10 @@ def _validate_image_bytes(data: bytes) -> str:
     except Exception as error:
         raise ImageInputError(f"The supplied data is not a decodable image: {error}") from error
 
-    log(f"Accepted {kind} input image ({len(data)} bytes, {width}x{height})")
+    # No image-derived metadata (size, dimensions) in worker logs: byte and pixel
+    # caps above still enforce the limits; the log records only that an image of
+    # a known type passed validation.
+    log(f"Accepted {kind} input image")
     return extension
 
 
@@ -1684,7 +1687,7 @@ def _assert_fetchable_url(url: str) -> None:
             parsed.hostname, parsed.port or default_port, proto=socket.IPPROTO_TCP
         )
     except socket.gaierror as error:
-        raise ImageInputError(f"Could not resolve image_url host: {error}") from error
+        raise ImageInputError("Could not resolve the download host.") from error
 
     for entry in resolved:
         address = ipaddress.ip_address(entry[4][0])
@@ -2652,14 +2655,155 @@ def _require_reference_source(reference, kind: str) -> None:
         )
 
 
-def _stage_image_reference(reference, job_dir: str) -> str:
-    """Reuses the hardened image path: magic bytes, Pillow decode, pixel and byte caps."""
+MAX_USER_LORA_BYTES = int(os.environ.get("H3_MAX_USER_LORA_BYTES", 2 * 1024 * 1024 * 1024))
+
+
+def _user_lora_dir(generation_id: str) -> str:
+    """A per-job directory inside ComfyUI's lora folder.
+
+    ComfyUI's loaders resolve lora names against the lora folder, so URL-sourced
+    user LoRAs must land here - but under a per-job name so nothing survives the
+    job and one caller's LoRA can never be visible to the next.
+    """
+    safe = "".join(c for c in str(generation_id) if c.isalnum() or c in "-_")[:64]
+    path = os.path.join(
+        os.path.realpath(os.path.join(COMFY_DIR, "models", "loras")),
+        "job-" + (safe or uuid.uuid4().hex) + "-lora",
+    )
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def cleanup_user_lora_dir(lora_dir) -> None:
+    """Remove a job's staged user LoRAs. Only ever touches directories we created."""
+    if not lora_dir:
+        return
+    try:
+        resolved = os.path.realpath(lora_dir)
+        root = os.path.realpath(os.path.join(COMFY_DIR, "models", "loras"))
+        if not resolved.startswith(root + os.sep) or not os.path.basename(resolved).endswith("-lora"):
+            log("WARNING: refusing to clean up unexpected lora directory " + resolved)
+            return
+        shutil.rmtree(resolved, ignore_errors=True)
+    except OSError as error:
+        log("WARNING: could not remove staged user loras: " + str(error))
+
+
+def _assert_safetensors(data: bytes) -> None:
+    """Structural check: an 8-byte little-endian header length, then a JSON header.
+
+    safetensors is the one tensor format with no code-execution escape hatch;
+    a plausible header keeps us honest that the payload is what it claims.
+    """
+    import struct as _struct
+
+    if len(data) < 12:
+        raise privora_errors.PrivoraError(privora_errors.INVALID_LORA,
+                                          "The downloaded LoRA is not a valid safetensors file.", {})
+    header_length = _struct.unpack("<Q", data[:8])[0]
+    if not 2 <= header_length <= 100_000_000 or len(data) < 8 + header_length:
+        raise privora_errors.PrivoraError(privora_errors.INVALID_LORA,
+                                          "The downloaded LoRA is not a valid safetensors file.", {})
+    if data[8:9] != b"{":
+        raise privora_errors.PrivoraError(privora_errors.INVALID_LORA,
+                                          "The downloaded LoRA is not a valid safetensors file.", {})
+
+
+def _stage_user_loras(user_loras, lora_dir: str) -> list:
+    """Download, verify and stage each URL-sourced user LoRA for this job.
+
+    Bytes exist only here and in the job's lora directory; the download URL is
+    never logged and dies with the request. Digest pins, when supplied, must
+    match exactly or the job is refused before the model is touched.
+    """
+    import hashlib
+
+    staged = []
+    for index, lora in enumerate(user_loras):
+        data = _fetch_asset_bytes(
+            {"url": lora.url}, "user lora",
+            max_bytes=MAX_USER_LORA_BYTES,
+            accept="application/octet-stream, */*",
+        )
+        if lora.sha256 and hashlib.sha256(data).hexdigest() != lora.sha256:
+            raise privora_errors.PrivoraError(
+                privora_errors.INVALID_LORA,
+                "A downloaded LoRA did not match its pinned digest.", {"index": index})
+        _assert_safetensors(data)
+        filename = f"l{index}.safetensors"
+        path = os.path.realpath(os.path.join(lora_dir, filename))
+        if os.path.dirname(path) != os.path.realpath(lora_dir):
+            raise privora_errors.PrivoraError(
+                privora_errors.INVALID_LORA, "A LoRA could not be staged safely.", {})
+        with open(path, "wb") as handle:
+            handle.write(data)
+        os.chmod(path, 0o644)  # data, never executable
+        staged.append((os.path.join(os.path.basename(lora_dir), filename), lora.strength))
+        log(f"User LoRA staged ({index + 1}/{len(user_loras)})")
+    return staged
+
+
+def _condition_keyframe_aspect(data: bytes, extension: str, canvas) -> bytes:
+    """Cover-resize + center-crop a keyframe onto the canvas aspect when they drift.
+
+    The workflow's resize node scales the longest side and the image-to-video node
+    maps the result onto the canvas, so any ratio mismatch between a keyframe and
+    the canvas shows up as a stretched first/last frame. Conditioning here keeps
+    the aspect by cropping edges instead of distorting content. Images already
+    within 2% of the canvas ratio pass through untouched (no re-encode).
+    """
+    try:
+        import io as _io
+
+        from PIL import Image
+    except Exception:
+        return data
+
+    canvas_w, canvas_h = int(canvas[0]), int(canvas[1])
+    if canvas_w <= 0 or canvas_h <= 0:
+        return data
+    canvas_ratio = float(canvas_w) / float(canvas_h)
+    with Image.open(_io.BytesIO(data)) as image:
+        width, height = image.size
+        if width <= 0 or height <= 0:
+            return data
+        ratio = float(width) / float(height)
+        if abs(ratio - canvas_ratio) / canvas_ratio <= 0.02:
+            return data
+        image.load()
+        # Scale so the image fully covers the canvas, then center-crop the excess.
+        scale = max(canvas_w / float(width), canvas_h / float(height))
+        new_w = max(1, int(round(width * scale)))
+        new_h = max(1, int(round(height * scale)))
+        resized = image.resize((new_w, new_h), Image.LANCZOS)
+        left = (new_w - canvas_w) // 2
+        top = (new_h - canvas_h) // 2
+        cropped = resized.crop((left, top, left + canvas_w, top + canvas_h))
+        buffer = _io.BytesIO()
+        if extension in (".jpg", ".jpeg"):
+            cropped.convert("RGB").save(buffer, format="JPEG")
+        elif extension == ".webp":
+            cropped.save(buffer, format="WEBP")
+        else:
+            cropped.save(buffer, format="PNG")
+        log("Keyframe aspect conditioned to canvas (cover + center-crop)")
+        return buffer.getvalue()
+
+
+def _stage_image_reference(reference, job_dir: str, canvas=None) -> str:
+    """Reuses the hardened image path: magic bytes, Pillow decode, pixel and byte caps.
+
+    Keyframes pass through aspect conditioning when `canvas` (width, height) is
+    supplied, so a mismatched keyframe is cropped rather than stretched.
+    """
     _require_reference_source(reference, "image")
     data = _fetch_asset_bytes(
         {"url": reference.url, "base64": reference.data_base64, "token": reference.token},
         "reference image",
     )
     extension = _validate_image_bytes(data)
+    if canvas is not None:
+        data = _condition_keyframe_aspect(data, extension, canvas)
     filename = "ref-" + uuid.uuid4().hex + extension
     with open(_staged_name(job_dir, filename, "image"), "wb") as handle:
         handle.write(data)
@@ -2695,8 +2839,9 @@ def _stage_media_reference(reference, kind: str, job_dir: str) -> str:
 
     info = privora_media.probe(path, kind)
     reference.duration_seconds = info.duration_seconds
-    log("Staged " + kind + " reference (" + str(len(data)) + " bytes, "
-        + format(info.duration_seconds, ".1f") + "s, " + info.codec + ")")
+    # Media-derived metadata (size, duration, codec) stays out of worker logs;
+    # the probe values above still drive the duration and aggregate checks.
+    log("Staged " + kind + " reference")
     return os.path.join(os.path.basename(job_dir), filename)
 
 
@@ -2708,14 +2853,31 @@ def build_privora_job(job_input: dict, generation_id: str) -> tuple[dict, str, d
     after an exception it did not catch.
     """
     request = privora_request.parse(job_input)
-    plan = privora_workflows.build(request, MODEL_INVENTORY, request.generation_mode)
     job_dir = _job_input_dir(generation_id)
+    lora_dir = _user_lora_dir(generation_id) if request.user_loras else None
+
+    try:
+        user_lora_names = _stage_user_loras(request.user_loras, lora_dir) if lora_dir else []
+        plan = privora_workflows.build(
+            request, MODEL_INVENTORY, request.generation_mode,
+            user_loras=tuple(user_lora_names),
+        )
+    except BaseException:
+        # A rejected download or digest must not leave staged LoRA bytes behind.
+        cleanup_user_lora_dir(lora_dir)
+        cleanup_job_dir(job_dir)
+        raise
 
     try:
         for item in plan.staging:
             reference = item["reference"]
             if reference.type == "image":
-                name = _stage_image_reference(reference, job_dir)
+                keyframe_canvas = (
+                    (request.canvas.width, request.canvas.height)
+                    if item["node"] in ("first_frame", "last_frame")
+                    else None
+                )
+                name = _stage_image_reference(reference, job_dir, canvas=keyframe_canvas)
             else:
                 name = _stage_media_reference(reference, reference.type, job_dir)
             plan.graph[item["node"]]["inputs"][item["field"]] = name
@@ -2740,7 +2902,7 @@ def build_privora_job(job_input: dict, generation_id: str) -> tuple[dict, str, d
         cleanup_job_dir(job_dir)
         raise
 
-    metadata = {**request.as_metadata(), **plan.as_metadata()}
+    metadata = {**request.as_metadata(), **plan.as_metadata(), "lora_dir": lora_dir}
     log(
         "Privora request: mode=" + request.mode + " model=" + request.family
         + " generationMode=" + str(metadata["generationMode"])
@@ -2883,6 +3045,47 @@ def build_output_store_for_job(job_input: dict) -> tuple[OutputStore, WorkerUplo
     return get_output_store(), None
 
 
+def _open_job_envelope(job_input) -> dict:
+    """Open the sealed job payload. Fail closed: an envelope without a configured
+    private key, or a malformed envelope, refuses the job rather than falling
+    back to anything observable. Jobs sent in the clear (key rollout window)
+    pass through untouched.
+    """
+    if not isinstance(job_input, dict) or "pv_envelope" not in job_input:
+        return job_input
+    private_b64 = os.environ.get("H3_JOB_PAYLOAD_PRIVATE_KEY", "").strip()
+    if not private_b64:
+        raise RuntimeError("SEALED_JOB_REFUSED: job payload is sealed but no private key is configured")
+    import base64 as _b64
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import padding as _apad
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives.serialization import load_der_private_key
+
+    def _d(value):
+        padded = value + "=" * (-len(value) % 4)
+        return _b64.urlsafe_b64decode(padded.encode())
+
+    try:
+        envelope = job_input["pv_envelope"]
+        if envelope.get("alg") != "RSA-OAEP-256+AES-256-GCM":
+            raise ValueError("unsupported algorithm")
+        private_key = load_der_private_key(_d(private_b64), password=None)
+        data_key = private_key.decrypt(
+            _d(envelope["wk"]),
+            _apad.OAEP(mgf=_apad.MGF1(hashes.SHA256()), algorithm=hashes.SHA256(), label=None),
+        )
+        plaintext = AESGCM(data_key).decrypt(_d(envelope["iv"]), _d(envelope["ct"]), None)
+        opened = json.loads(plaintext)
+        if not isinstance(opened, dict):
+            raise ValueError("envelope did not contain an object")
+        return opened
+    except RuntimeError:
+        raise
+    except Exception as error:
+        raise RuntimeError(f"SEALED_JOB_REFUSED: envelope could not be opened ({type(error).__name__})") from error
+
+
 def handler(job: dict) -> dict:
     job_id = job.get("id", "<unknown>")
     staged_assets: list[str] = []
@@ -2896,7 +3099,9 @@ def handler(job: dict) -> dict:
         _jobs_served += 1
         job_index = _jobs_served
 
-    job_input = job.get("input") or {}
+    # Ciphertext-only at rest: the envelope is opened here, in memory, and the
+    # plaintext never leaves this process (logs carry no input-derived data).
+    job_input = _open_job_envelope(job.get("input") or {})
     workflow = job_input.get("workflow")
     timer = JobTimer(workflow if isinstance(workflow, dict) else None)
     status = "error"
@@ -3029,7 +3234,7 @@ def handler(job: dict) -> dict:
             # What was actually run, not what was asked for: resolved canvas, real frame
             # count and duration, the seed used, and the generation mode with its step
             # count. A caller should never have to re-derive any of it.
-            result["generation"] = privora_metadata
+            result["generation"] = {k: v for k, v in privora_metadata.items() if k != "lora_dir"}
 
         # Only now is the job genuinely done: the upload has already succeeded, because
         # WorkerUploadStore raises rather than returning on a failed PUT.
@@ -3096,6 +3301,9 @@ def handler(job: dict) -> dict:
         # And the same for a Privora job's reference directory - on success, on rejection,
         # on timeout and on an exception nobody anticipated.
         cleanup_job_dir(job_dir)
+        # URL-sourced user LoRAs are purged on the same boundary: after the output is
+        # encrypted and uploaded, nothing job-specific may survive a warm worker.
+        cleanup_user_lora_dir(privora_metadata.get("lora_dir"))
         # Shadow ranks are stopped and swept on the same boundary as rank 0's plaintext:
         # nothing job-specific may survive into the next request on a warm worker.
         if _shadow_ranks:

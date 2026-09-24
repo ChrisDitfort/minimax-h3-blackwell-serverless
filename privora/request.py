@@ -30,6 +30,70 @@ from . import references as references_module
 from .prompt import CompiledPrompt, compile_prompt
 from .references import Reference, ReferenceSet
 
+#: User LoRAs arrive as download URLs (HuggingFace/Civitai style) and are fetched
+#: by the GPU at inference time, applied, and purged with the job. Nothing LoRA-shaped
+#: is ever stored by Privora or the Worker; the URL itself lives only in the request.
+MAX_USER_LORAS = 2
+MAX_USER_LORA_URL_CHARS = 2048
+_USER_LORA_FIELDS = frozenset({"url", "sha256", "strength"})
+_SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
+_HTTPS_URL_RE = re.compile(r"https://[A-Za-z0-9.-]+(:[0-9]+)?/\S*\Z", re.ASCII)
+
+
+@dataclass(frozen=True)
+class UserLora:
+    """One caller-supplied LoRA download URL with its application strength."""
+
+    url: str
+    strength: float = 1.0
+    #: Optional digest pin. When present the downloaded bytes must match exactly.
+    sha256: str | None = None
+
+
+def _user_loras_from(raw) -> tuple:
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise errors.PrivoraError(errors.INVALID_LORA, "loras must be a list.",
+                                  {"field": "loras"})
+    if not raw:
+        return ()
+    if len(raw) > MAX_USER_LORAS:
+        raise errors.PrivoraError(errors.INVALID_LORA,
+                                  f"At most {MAX_USER_LORAS} LoRAs may be attached.",
+                                  {"max": MAX_USER_LORAS})
+    out = []
+    for index, entry in enumerate(raw):
+        if not isinstance(entry, dict):
+            raise errors.PrivoraError(errors.INVALID_LORA,
+                                      f"loras[{index}] must be an object.",
+                                      {"index": index})
+        unknown = frozenset(entry) - _USER_LORA_FIELDS
+        if unknown:
+            raise errors.PrivoraError(errors.INVALID_LORA,
+                                      f"loras[{index}] has unknown fields.",
+                                      {"index": index, "fields": sorted(unknown)})
+        url = str(entry.get("url") or "").strip()
+        if len(url) > MAX_USER_LORA_URL_CHARS or not _HTTPS_URL_RE.match(url):
+            raise errors.PrivoraError(errors.INVALID_LORA,
+                                      f"loras[{index}].url must be an https download URL.",
+                                      {"index": index})
+        sha256 = entry.get("sha256")
+        if sha256 is not None:
+            sha256 = str(sha256).strip().lower()
+            if not _SHA256_RE.match(sha256):
+                raise errors.PrivoraError(errors.INVALID_LORA,
+                                          f"loras[{index}].sha256 must be 64 hex characters.",
+                                          {"index": index})
+        strength = entry.get("strength", 1.0)
+        if not isinstance(strength, (int, float)) or not 0 <= float(strength) <= 1:
+            raise errors.PrivoraError(errors.INVALID_LORA,
+                                      f"loras[{index}].strength must be between 0 and 1.",
+                                      {"index": index})
+        out.append(UserLora(url=url, strength=float(strength), sha256=sha256))
+    return tuple(out)
+
+
 CREATE = "create"
 ANIMATE = "animate"
 REFERENCES = "references"
@@ -45,7 +109,7 @@ CANONICAL_FIELDS = frozenset(
         "mode", "prompt", "quality", "aspectRatio", "duration", "seed",
         "generationMode", "firstFrame", "lastFrame", "references",
         "referenceFidelity", "camera", "style", "privacy", "encryption",
-        "progress", "output",
+        "loras", "progress", "output",
     }
 )
 _SAFE_FIELD_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,63}\Z")
@@ -89,6 +153,8 @@ class GenerationRequest:
     encryption: dict = field(default_factory=dict)
     output: dict = field(default_factory=dict)
     progress: dict = field(default_factory=dict)
+    #: URL-addressed user LoRAs; staged and purged per job by the handler.
+    user_loras: tuple = ()
     #: True when the request arrived in the pre-rebuild schema.
     legacy: bool = False
 
@@ -372,6 +438,7 @@ def parse(payload: dict, *, max_references: int = references_module.PRODUCT_MAX_
         last_frame=last_frame,
         ref_image_size=references_module.resolve_fidelity(payload.get("referenceFidelity")),
         generation_mode=models_module.parse_generation_mode(payload.get("generationMode")),
+        user_loras=_user_loras_from(payload.get("loras")),
         privacy=payload.get("privacy") or {},
         encryption=payload.get("encryption") or {},
         output=payload.get("output") or {},

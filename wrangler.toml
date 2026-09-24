@@ -7,11 +7,9 @@
 #   * The R2 binding is H3_OUTPUTS, not a name of our choosing. worker.js
 #     reads env.H3_OUTPUTS to match.
 #
-#   * RUNPOD_ENDPOINT_ID and RUNPOD_BLACKWELL_ENDPOINT_ID are plain vars that
-#     were set in the dashboard. `wrangler deploy` replaces the entire binding
-#     set with whatever this file declares, so omitting them here would delete
-#     them from the live Worker and break every request. They are restated
-#     below for exactly that reason.
+#   * The RunPod endpoint IDs are plain vars. `wrangler deploy` replaces the
+#     entire binding set with whatever this file declares, so every existing ID
+#     is restated unchanged and the cached-model canary is added separately.
 #
 # Secrets are NOT declared here - wrangler preserves existing secrets across a
 # deploy, and putting their values in a committed file would leak them.
@@ -28,8 +26,19 @@ compatibility_date = "2026-08-25"
 # account_id is intentionally omitted; wrangler infers it from the logged-in
 # account (899c4111fb42559764b1bd1118d8cf79).
 
+# Terminal-status sweep: RunPod purges completed job records after ~30 minutes,
+# so the worker snapshots finished jobs (executionTime feeds runtime billing)
+# even when no client polls in time.
+[triggers]
+crons = ["*/2 * * * *"]
+
 [observability]
 enabled = true
+
+# Exposes the immutable Cloudflare Worker version ID/tag through /health so a
+# version-override smoke can prove which zero-traffic candidate answered.
+[version_metadata]
+binding = "CF_VERSION_METADATA"
 
 # --- R2 -------------------------------------------------------------------
 # Binding name comes from the live deployment. worker.js::requireBucket()
@@ -52,11 +61,27 @@ tag = "v1"
 new_sqlite_classes = ["JobChannel"]
 
 # --- Plain vars -----------------------------------------------------------
-# The two RunPod endpoint ids are reproduced from the live deployment so this
-# deploy does not remove them. Their API keys stay as secrets.
+# 2026-09-21: the canary endpoint (f09dlw2l0cbcgt) is the ONLY RunPod endpoint.
+# All three backend vars point at it; the legacy (xa6b4vs5gdva3r) and original
+# blackwell (d0p4f4hgxyqsy2) endpoints are retired and deleted from RunPod.
+# All RUNPOD_*_API_KEY secrets hold the canary endpoint key.
 [vars]
-RUNPOD_ENDPOINT_ID = "xa6b4vs5gdva3r"
-RUNPOD_BLACKWELL_ENDPOINT_ID = "d0p4f4hgxyqsy2"
+RUNPOD_ENDPOINT_ID = "f09dlw2l0cbcgt"
+RUNPOD_BLACKWELL_ENDPOINT_ID = "f09dlw2l0cbcgt"
+RUNPOD_CACHED_CANARY_ENDPOINT_ID = "f09dlw2l0cbcgt"
+
+# Existing direct-presign configuration used only by the canonical reference
+# asset routes. These are non-secret routing values; the paired S3 credentials
+# remain Worker secrets and are never committed.
+R2_ACCOUNT_ID = "899c4111fb42559764b1bd1118d8cf79"
+
+# Job payload sealing: the Worker holds the public half and seals every RunPod
+# job input; the matching private key lives only in the RunPod endpoint env
+# (H3_JOB_PAYLOAD_PRIVATE_KEY). Public value - safe to commit.
+JOB_PAYLOAD_PUBLIC_KEY = "MIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEAt2AbtCQuHXJ2FgQ0ZWFkp_H7QcCvT9jlh9QUFQLFTGcSAn8prSHBqUxQk2u6PxMfYKVUAd83cq5tAXCUs-sZ8GffKwltZhuS0UH1I1po8JhBO-KeqeOgaLYLNyZTRQ6bTZtnnGo2aEubw8keDgROQWUntp1ooH-mb9rV7zyNtl_7JxWr5NKZM1GeOUauQHdPhTPHrj5azCZwM8h2u37nIUVODHaDFQHTgXfPByqXDrzjG5-YoRkCJBTEiluPS9JMdvNsiaASK4yjTcg_zSUgREV4RQ9aY6bevlHUgA4qYPB692iAmUoT7MdnPV1SdBpQYsSyVyMyqnWInlaKg702rkiePWvH0WgPUZXWd3I02aT_JILBm2yrRlqzebAci2nGRZeVYz2FhaFV3mJIB73FV_JwhntMRV6HlWsCxXE7PctvMZt5-_4u70WBb3ZDhQ0RXFe52S3bS-e_zW3Z5dlceHOptgL895lCEwUwPwK_4M9SsMHw-vq9up0XacTyUznJAgMBAAE"
+R2_BUCKET_NAME = "minimax-h3-private-output"
+R2_PRESIGN_GET_TTL_SECONDS = "1800"
+R2_PRESIGN_PUT_TTL_SECONDS = "1200"
 
 # Lifetime of the job-scoped callback tokens handed to RunPod. Long enough to
 # cover a slow cold start plus a full generation, short enough that a leaked
@@ -77,3 +102,5 @@ JOB_TOKEN_TTL_SECONDS = "3600"
 #
 #   RUNPOD_API_KEY               already set
 #   RUNPOD_BLACKWELL_API_KEY     already set
+#   RUNPOD_CACHED_CANARY_API_KEY optional; when absent, the canary explicitly
+#                                falls back to RUNPOD_API_KEY for the same account

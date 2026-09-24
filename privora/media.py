@@ -32,7 +32,7 @@ from . import errors, references as references_module
 
 #: Byte ceilings. Generous enough for a 15s reference, small enough that a hostile upload
 #: cannot fill the container's disk before validation runs.
-MAX_VIDEO_BYTES = int(os.environ.get("H3_MAX_REF_VIDEO_BYTES", str(256 * 1024 * 1024)))
+MAX_VIDEO_BYTES = int(os.environ.get("H3_MAX_REF_VIDEO_BYTES", str(200 * 1024 * 1024)))
 MAX_AUDIO_BYTES = int(os.environ.get("H3_MAX_REF_AUDIO_BYTES", str(64 * 1024 * 1024)))
 
 #: A probe that has not answered in this long is a malformed file, not a slow one.
