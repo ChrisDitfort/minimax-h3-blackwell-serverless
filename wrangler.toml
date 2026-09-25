@@ -75,10 +75,6 @@ RUNPOD_CACHED_CANARY_ENDPOINT_ID = "f09dlw2l0cbcgt"
 # remain Worker secrets and are never committed.
 R2_ACCOUNT_ID = "899c4111fb42559764b1bd1118d8cf79"
 
-# Job payload sealing: the Worker holds the public half and seals every RunPod
-# job input; the matching private key lives only in the RunPod endpoint env
-# (H3_JOB_PAYLOAD_PRIVATE_KEY). Public value - safe to commit.
-JOB_PAYLOAD_PUBLIC_KEY = "MIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEAt2AbtCQuHXJ2FgQ0ZWFkp_H7QcCvT9jlh9QUFQLFTGcSAn8prSHBqUxQk2u6PxMfYKVUAd83cq5tAXCUs-sZ8GffKwltZhuS0UH1I1po8JhBO-KeqeOgaLYLNyZTRQ6bTZtnnGo2aEubw8keDgROQWUntp1ooH-mb9rV7zyNtl_7JxWr5NKZM1GeOUauQHdPhTPHrj5azCZwM8h2u37nIUVODHaDFQHTgXfPByqXDrzjG5-YoRkCJBTEiluPS9JMdvNsiaASK4yjTcg_zSUgREV4RQ9aY6bevlHUgA4qYPB692iAmUoT7MdnPV1SdBpQYsSyVyMyqnWInlaKg702rkiePWvH0WgPUZXWd3I02aT_JILBm2yrRlqzebAci2nGRZeVYz2FhaFV3mJIB73FV_JwhntMRV6HlWsCxXE7PctvMZt5-_4u70WBb3ZDhQ0RXFe52S3bS-e_zW3Z5dlceHOptgL895lCEwUwPwK_4M9SsMHw-vq9up0XacTyUznJAgMBAAE"
 R2_BUCKET_NAME = "minimax-h3-private-output"
 R2_PRESIGN_GET_TTL_SECONDS = "1800"
 R2_PRESIGN_PUT_TTL_SECONDS = "1200"
