@@ -544,7 +544,7 @@ class CanonicalFieldTests(unittest.TestCase):
             "mode", "prompt", "quality", "aspectRatio", "duration", "seed",
             "generationMode", "firstFrame", "lastFrame", "references",
             "referenceFidelity", "camera", "style", "privacy", "encryption",
-            "progress", "output",
+            "loras", "progress", "output",
         })
 
     def test_a_likely_misspelling_is_rejected_instead_of_falling_back(self):

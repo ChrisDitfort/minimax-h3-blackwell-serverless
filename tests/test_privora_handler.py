@@ -329,7 +329,7 @@ class StagingFailureTests(unittest.TestCase):
         }
         calls = 0
 
-        def stage(reference, job_dir):
+        def stage(reference, job_dir, canvas=None):
             nonlocal calls
             calls += 1
             if calls == 2:
@@ -355,7 +355,7 @@ class StagingFailureTests(unittest.TestCase):
             WithInventory(),
             mock.patch.object(
                 handler, "_stage_image_reference",
-                side_effect=lambda reference, job_dir: self._write_stage(
+                side_effect=lambda reference, job_dir, canvas=None: self._write_stage(
                     reference, "image", job_dir
                 ),
             ),
@@ -384,7 +384,7 @@ class StagingFailureTests(unittest.TestCase):
             WithInventory(),
             mock.patch.object(
                 handler, "_stage_image_reference",
-                side_effect=lambda reference, job_dir: self._write_stage(
+                side_effect=lambda reference, job_dir, canvas=None: self._write_stage(
                     reference, "image", job_dir
                 ),
             ),

@@ -2027,7 +2027,7 @@ const canonicalInput = {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${config.apiKey}` },
     body: JSON.stringify({
-      input: await sealJobInput(env, canonicalInput),
+      input: canonicalInput,
       policy: { executionTimeout: isLongRunningTier ? 15e5 : 6e5, ttl: 18e5 }
     })
   });
@@ -2128,7 +2128,7 @@ async function generateVideo(request, env, headers, url) {
       Authorization: `Bearer ${config.apiKey}`
     },
     body: JSON.stringify({
-      input: await sealJobInput(env, buildRunPodInput(backend, workflow, settings, callbacks, privacy)),
+      input: buildRunPodInput(backend, workflow, settings, callbacks, privacy),
       policy: { executionTimeout: 6e5, ttl: 18e5 }
     })
   });

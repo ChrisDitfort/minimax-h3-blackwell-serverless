@@ -66,8 +66,8 @@ new_sqlite_classes = ["JobChannel"]
 # blackwell (d0p4f4hgxyqsy2) endpoints are retired and deleted from RunPod.
 # All RUNPOD_*_API_KEY secrets hold the canary endpoint key.
 [vars]
-RUNPOD_ENDPOINT_ID = "f09dlw2l0cbcgt"
-RUNPOD_BLACKWELL_ENDPOINT_ID = "f09dlw2l0cbcgt"
+RUNPOD_ENDPOINT_ID = "xa6b4vs5gdva3r"
+RUNPOD_BLACKWELL_ENDPOINT_ID = "d0p4f4hgxyqsy2"
 RUNPOD_CACHED_CANARY_ENDPOINT_ID = "f09dlw2l0cbcgt"
 
 # Existing direct-presign configuration used only by the canonical reference
