@@ -20,7 +20,7 @@ concurrency:
 env:
   IMAGE_NAME: ghcr.io/chrisditfort/privora-h3-runpod-worker
   SLIM_SOURCE_BRANCH: hf-cached-models-slim
-  SLIM_SOURCE_REVISION: bd408e8fe651fe6ca3eddfdc66e6a1e36e84c0a2
+  SLIM_SOURCE_REVISION: 470b907ae37abff249476c618fb829556b2286eb
   RESOLVER_BASE_REVISION: 84eace72eaf872a0b1fa380c2ef5d2025e857503
   BASE_IMAGE_DIGEST: sha256:4fdcd50e8e5f54f8329933c66e2eac17680cbac82d43c1a74d00465e9413a3e1
   H3_MODEL_REPO: CDitfort/privora-minimax-h3-models
