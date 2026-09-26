@@ -4,9 +4,9 @@ import assert from "node:assert/strict";
 import worker from "./worker.js";
 
 const BUILD = Object.freeze({
-  sourceCommit: "668f146b1a6a6ac23d0fc99ef13a200a35786b77",
-  imageTag: "cached-models-19",
-  buildId: "35968520283-1"
+  sourceCommit: "470b907ae37abff249476c618fb829556b2286eb",
+  imageTag: "cached-models-21",
+  buildId: "36212956644-1"
 });
 
 const CAPABILITIES = Object.freeze({

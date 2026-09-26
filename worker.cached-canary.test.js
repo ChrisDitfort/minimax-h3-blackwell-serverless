@@ -17,16 +17,16 @@ const ENDPOINTS = Object.freeze({
 });
 
 const BLACKWELL_BUILD = Object.freeze({
-  sourceCommit: "668f146b1a6a6ac23d0fc99ef13a200a35786b77",
-  imageTag: "cached-models-19",
-  buildId: "35968520283-1"
+  sourceCommit: "470b907ae37abff249476c618fb829556b2286eb",
+  imageTag: "cached-models-21",
+  buildId: "36212956644-1"
 });
 
 const CANARY_APPLICATION = Object.freeze({
   sourceCommit: "bd408e8fe651fe6ca3eddfdc66e6a1e36e84c0a2",
   imageRepository: "registry.digitalocean.com/minimax-h3-image/privora-h3-runpod-worker",
   imageTag: "cached-models-canary",
-  imageDigest: "sha256:df68e86bbf0250b863e5d8bf491acee99dab2ca99436077469fbec0e2ab8b15c",
+  imageDigest: "sha256:6422784683b47142e03a7b9fb48cf6d4f6a5de6aec4cd8984fbd1849af47d93a",
   buildId: "cached-models-test-build",
   comfyuiRevision: "dec5d9450a5290bcf63430409ea41018e67f41c3"
 });

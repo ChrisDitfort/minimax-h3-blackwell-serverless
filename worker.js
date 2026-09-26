@@ -22,16 +22,18 @@ var CANONICAL_FIELDS = Object.freeze([
   "output"
 ]);
 var EXPECTED_H3_BUILD = Object.freeze({
-  sourceCommit: "668f146b1a6a6ac23d0fc99ef13a200a35786b77",
-  imageTag: "cached-models-19",
-  buildId: "35968520283-1"
+  sourceCommit: "470b907ae37abff249476c618fb829556b2286eb",
+  imageTag: "cached-models-21",
+  buildId: "36212956644-1"
 });
+// Rollback (cached-models-19): "668f146b1a6a6ac23d0fc99ef13a200a35786b77" / "cached-models-19" / "35968520283-1",
+// digest sha256:df68e86bbf0250b863e5d8bf491acee99dab2ca99436077469fbec0e2ab8b15c.
 // Rollback (cached-models-18): "dbb960222fa6942a7c8b3701c4b7fb5b2ec676c3" / "cached-models-18" / "35722315664-1",
 // digest sha256:f502e6d89373af6657da2313b82bbc31939b1486e2753cc70da8f637e98a00c4.
 var EXPECTED_CACHED_CANARY_RELEASE = Object.freeze({
   applicationRelease: Object.freeze({
     imageRepository: "registry.digitalocean.com/minimax-h3-image/privora-h3-runpod-worker",
-    imageDigest: "sha256:df68e86bbf0250b863e5d8bf491acee99dab2ca99436077469fbec0e2ab8b15c"
+    imageDigest: "sha256:6422784683b47142e03a7b9fb48cf6d4f6a5de6aec4cd8984fbd1849af47d93a"
   }),
   modelRelease: Object.freeze({
     repository: "CDitfort/privora-minimax-h3-models",
